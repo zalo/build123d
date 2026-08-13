@@ -136,7 +136,7 @@ from OCP.GeomAPI import (
     GeomAPI_PointsToBSpline,
     GeomAPI_ProjectPointOnCurve,
 )
-from OCP.GeomConvert import GeomConvert_CompCurveToBSplineCurve
+from OCP.GeomConvert import GeomConvert, GeomConvert_CompCurveToBSplineCurve
 from OCP.GeomFill import (
     GeomFill_CorrectedFrenet,
     GeomFill_Frenet,
@@ -219,6 +219,11 @@ from build123d.geometry import (
     logger,
 )
 
+from .canonical import (
+    CANONICAL_SAMPLES,
+    CanonicalForm,
+    canonical_form as _canonical_form,
+)
 from .constrained_lines import (
     _make_2tan_lines,
     _make_2tan_on_arcs,
@@ -683,6 +688,82 @@ class Mixin1D(Shape[TOPODS]):
         else:  # center_of == CenterOf.BOUNDING_BOX:
             middle = self.bounding_box().center()
         return middle
+
+    def canonical(self) -> Edge | Wire:
+        """canonical
+
+        Return this shape with a *canonical* parametrisation: the same geometry,
+        but with a start point and a traversal direction that are determined by
+        the geometry alone instead of by the CAD kernel's construction history.
+
+        Free edges - the ones produced by :meth:`~topology.Shape.cut`,
+        :meth:`~topology.Shape.intersect`, ``section`` or ``project_to_shape``
+        rather than drawn by the user - inherit the seam, direction and
+        parameter range that the kernel found convenient. Those depend on the
+        parametric frames of the surfaces involved (which meridian of a sphere
+        is ``u = 0``), on the seed point of the surface/surface intersector and
+        on the order the boolean assembler visited the faces of the result, so
+        two geometrically identical solids can yield section edges that start in
+        different places and run in opposite directions. Anything measured from
+        ``position_at(0)``, ``tangent_at`` or ``Axis(edge)`` then moves with
+        them.
+
+        The canonical form is defined as:
+
+        * open shapes start at the lexicographically smaller end point,
+        * closed shapes start at the lexicographically smallest point of the
+          loop (the midpoint of its extremal band, see
+          :mod:`~topology.canonical`) and wind counter-clockwise about the
+          dominant axis of their area vector,
+        * positions are normalised arc length, as ``position_at`` already does.
+
+        Returns:
+            Edge | Wire: same geometry, canonical parametrisation. Open shapes
+            keep their type; a closed shape that has to be re-seamed is returned
+            as a single Edge, because a closed ``Wire`` has no distinguished
+            start point for ``position_at`` to key off.
+
+        Example:
+            >>> # a text path on a sphere that does not depend on how the
+            >>> # sphere happens to be parametrised
+            >>> arch = sphere.cut(cylinder).edges().sort_by(Axis.Z)[0].canonical()
+        """
+        form = self.canonical_form()
+
+        if not form.closed:
+            return self if form.sign > 0 else _reverse_1d(self)
+
+        if form.sign > 0 and form.start <= TOLERANCE / max(self.length, TOLERANCE):
+            return self  # already canonical: keep the original curve type
+
+        seam = self.position_at(form.start)
+        direction = self.tangent_at(form.start) * form.sign
+        ordered = _walk_loop(_split_1d_at_point(self, seam), seam, direction)
+        return _concatenate_edges(ordered)
+
+    def canonical_form(self, samples: int = CANONICAL_SAMPLES) -> CanonicalForm:
+        """canonical_form
+
+        The canonical start position and direction of this shape, without
+        rebuilding it - see :meth:`canonical`.
+
+        Args:
+            samples (int, optional): arc length samples used by the seam search.
+                Defaults to ``CANONICAL_SAMPLES``.
+
+        Returns:
+            CanonicalForm: canonical start (normalised) and direction sign
+        """
+        length = self.length
+        if length <= TOLERANCE:
+            return CanonicalForm(0.0, 1, False)
+        closed = (self.position_at(0) - self.position_at(1)).length <= TOLERANCE
+        return _canonical_form(
+            lambda distance: self.position_at(min(max(distance / length, 0.0), 1.0)),
+            length,
+            closed,
+            samples=samples,
+        )
 
     def common_plane(
         self, *lines: Edge | Wire | None, tolerance: float = TOLERANCE
@@ -2352,7 +2433,13 @@ class Edge(Mixin1D[TopoDS_Edge]):
         Returns:
             Edge: linear Edge between two Edges
         """
-        flip = Axis(first).is_opposite(Axis(second))
+        # The direction and start point of the two reference Edges are
+        # incidental - a section Edge starts wherever the kernel's intersector
+        # happened to seam it - so pair the ends up canonically instead of
+        # relying on the construction history (the is_opposite() flip below is
+        # kept for reference Edges that are not parallel).
+        first, second = first.canonical(), second.canonical()
+        flip = Axis(first, canonical=True).is_opposite(Axis(second, canonical=True))
         pnts = [
             Edge.make_line(
                 first.position_at(i), second.position_at(1 - i if flip else i)
@@ -4606,6 +4693,84 @@ class Wire(Mixin1D[TopoDS_Wire]):
                     trimmed_edges.append(edge.trim(u0, u1))
 
         return Wire(trimmed_edges)
+
+
+def _reverse_1d(shape: Edge | Wire) -> Edge | Wire:
+    """A copy of an Edge or Wire that is traversed in the opposite direction."""
+    if isinstance(shape, Wire):
+        reversed_wire = Wire(TopoDS.Wire_s(shape.wrapped.Reversed()))
+        reversed_wire.label = shape.label
+        return reversed_wire
+    return shape.reversed()
+
+
+def _split_1d_at_point(shape: Edge | Wire, point: Vector) -> list[Edge]:
+    """The Edges of ``shape``, with the one that contains ``point`` split there."""
+    pieces: list[Edge] = []
+    for edge in shape.edges():
+        ends_at_point = min(
+            (edge.position_at(0) - point).length, (edge.position_at(1) - point).length
+        )
+        if ends_at_point > TOLERANCE and edge.distance_to(point) <= TOLERANCE:
+            parameter = edge.param_at_point(point)
+            if TOLERANCE < parameter * edge.length < edge.length - TOLERANCE:
+                pieces.extend([edge.trim(0.0, parameter), edge.trim(parameter, 1.0)])
+                continue
+        pieces.append(edge)
+    return pieces
+
+
+def _walk_loop(pieces: list[Edge], start: Vector, direction: Vector) -> list[Edge]:
+    """Order and orient ``pieces`` into a chain that leaves ``start`` heading
+    along ``direction``, purely by matching end points."""
+    remaining = list(pieces)
+    # the requested start comes from a sampled parameter, so allow a gap that
+    # scales with the size of the loop
+    gap_tolerance = max(TOLERANCE, 1e-6 * sum(piece.length for piece in pieces))
+    ordered: list[Edge] = []
+    position, heading = start, direction
+    while remaining:
+        best, best_score, flip = None, None, False
+        for candidate in remaining:
+            for reverse in (False, True):
+                edge = candidate.reversed() if reverse else candidate
+                score = (
+                    (edge.position_at(0) - position).length,
+                    -edge.tangent_at(0).dot(heading),
+                )
+                if best_score is None or score < best_score:
+                    best, best_score, flip = candidate, score, reverse
+        if best is None or best_score[0] > gap_tolerance:
+            return pieces  # not a connected chain - keep the input order
+        edge = best.reversed() if flip else best
+        ordered.append(edge)
+        remaining.remove(best)
+        position, heading = edge.position_at(1), edge.tangent_at(1)
+    return ordered
+
+
+def _concatenate_edges(edges: list[Edge]) -> Edge:
+    """A single Edge whose curve is the concatenation of ``edges``, in order.
+
+    Used to give a re-seamed closed loop an unambiguous start point: a closed
+    ``TopoDS_Wire`` carries no distinguished first edge, while an Edge's curve
+    parametrisation does.
+    """
+
+    def bspline_of(edge: Edge) -> Geom_BSplineCurve:
+        first, last = BRep_Tool.Range_s(edge.wrapped)
+        curve = BRep_Tool.Curve_s(edge.wrapped, first, last)
+        bspline = GeomConvert.CurveToBSplineCurve_s(Geom_TrimmedCurve(curve, first, last))
+        if edge.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+            bspline.Reverse()
+        return bspline
+
+    if len(edges) == 1:
+        return Edge(BRepBuilderAPI_MakeEdge(bspline_of(edges[0])).Edge())
+    builder = GeomConvert_CompCurveToBSplineCurve(bspline_of(edges[0]))
+    for edge in edges[1:]:
+        builder.Add(bspline_of(edge), TOLERANCE, True)
+    return Edge(BRepBuilderAPI_MakeEdge(builder.BSplineCurve()).Edge())
 
 
 def edges_to_wires(edges: Iterable[Edge], tol: float = 1e-6) -> ShapeList[Wire]:
