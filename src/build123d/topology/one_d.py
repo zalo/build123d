@@ -2423,7 +2423,11 @@ class Edge(Mixin1D[TopoDS_Edge]):
         Returns:
             Edge: linear Edge between two Edges
         """
-        flip = Axis(first).is_opposite(Axis(second))
+        # The direction and start point of the reference Edges are incidental -
+        # a section Edge starts wherever the intersector seamed it - so pair
+        # their ends up canonically instead of by construction history.
+        first, second = first.canonical(), second.canonical()
+        flip = Axis(first, canonical=True).is_opposite(Axis(second, canonical=True))
         pnts = [
             Edge.make_line(
                 first.position_at(i), second.position_at(1 - i if flip else i)

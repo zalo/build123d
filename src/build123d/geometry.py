@@ -638,6 +638,8 @@ class Axis(metaclass=AxisMeta):
         direction (VectorLike): direction
         end_point (VectorLike): point used with origin to define direction
         edge (Edge): origin & direction defined by start of edge
+        canonical (bool): with ``edge``, take the origin and direction from the
+            edge's canonical traversal. Defaults to False.
         location (Location): location to convert to axis
 
     Attributes:
@@ -667,8 +669,15 @@ class Axis(metaclass=AxisMeta):
         """Axis: point and end point"""
 
     @overload
-    def __init__(self, edge: Edge) -> None:
-        """Axis: start of Edge"""
+    def __init__(self, edge: Edge, *, canonical: bool = False) -> None:
+        """Axis: start of Edge
+
+        By default the origin and direction are read from the underlying curve at
+        its first parameter, which depends on the Edge's construction history and
+        disagrees with ``edge.position_at(0)``/``tangent_at(0)`` when the Edge is
+        REVERSED.  ``canonical=True`` uses the Edge's canonical traversal (see
+        ``Mixin1D.canonical``), so identical geometry gives identical Axes.
+        """
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         # pylint: disable=too-many-branches, too-many-locals
@@ -679,6 +688,7 @@ class Axis(metaclass=AxisMeta):
         end_point = kwargs.pop("end_point", None)
         edge = kwargs.pop("edge", None)
         location = kwargs.pop("location", None)
+        canonical = kwargs.pop("canonical", False)
 
         # Handle unexpected kwargs
         if kwargs:
@@ -711,14 +721,19 @@ class Axis(metaclass=AxisMeta):
             if not (hasattr(edge, "wrapped") and isinstance(edge.wrapped, TopoDS_Edge)):
                 raise ValueError(f"Invalid edge argument: {edge}")
 
-            topods_edge: TopoDS_Edge = edge.wrapped  # type: ignore[annotation-unchecked]
-            curve = BRep_Tool.Curve_s(topods_edge, float(), float())
-            param_min, _ = BRep_Tool.Range_s(topods_edge)
-            origin_pnt = gp_Pnt()
-            tangent_vec = gp_Vec()
-            curve.D1(param_min, origin_pnt, tangent_vec)
-            origin = Vector(origin_pnt)
-            direction = Vector(gp_Dir(tangent_vec))
+            if canonical:
+                canonical_edge = edge.canonical()
+                origin = canonical_edge.position_at(0)
+                direction = canonical_edge.tangent_at(0)
+            else:
+                topods_edge: TopoDS_Edge = edge.wrapped  # type: ignore[annotation-unchecked]
+                curve = BRep_Tool.Curve_s(topods_edge, float(), float())
+                param_min, _ = BRep_Tool.Range_s(topods_edge)
+                origin_pnt = gp_Pnt()
+                tangent_vec = gp_Vec()
+                curve.D1(param_min, origin_pnt, tangent_vec)
+                origin = Vector(origin_pnt)
+                direction = Vector(gp_Dir(tangent_vec))
 
         # Convert location to axis
         if location is not None:
