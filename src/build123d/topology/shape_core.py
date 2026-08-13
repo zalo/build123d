@@ -146,6 +146,7 @@ from build123d.build_enums import CenterOf, GeomType, Keep, SortBy, Transition, 
 from build123d.geometry import (
     DEG2RAD,
     TOLERANCE,
+    TOL_DIGITS,
     Axis,
     BoundBox,
     Color,
@@ -3544,16 +3545,25 @@ class ShapeList(list[T]):
         self,
         sort_by: Callable[[T], K] | Axis | Edge | Wire | SortBy | property = Axis.Z,
         reverse: bool = False,
+        tie_break: bool = False,
     ) -> ShapeList[T]:
         """sort by
 
         Sort objects by provided criteria. Note that not all sort_by criteria apply to all
         objects.
 
+        Objects that tie on the criteria keep their incoming order, which is what
+        makes chained sorts such as ``sort_by(SortBy.RADIUS).sort_by(Axis.Z)``
+        work.  For shapes that came out of a boolean operation that incoming order
+        is the CAD kernel's traversal order, i.e. a function of construction
+        history; ``tie_break=True`` orders tied objects by geometry instead.
+
         Args:
             sort_by (Callable[[T], K] | Axis | Edge | Wire | SortBy | property,
                 optional): sort criteria. Defaults to Axis.Z.
             reverse (bool, optional): flip order of sort. Defaults to False.
+            tie_break (bool, optional): order tied objects by geometry rather than
+                by their incoming order. Defaults to False.
 
         Raises:
             ValueError: Cannot sort by an empty axis
@@ -3564,12 +3574,14 @@ class ShapeList(list[T]):
             ShapeList: sorted list of objects
         """
 
+        candidates = sorted(self, key=_geometric_key) if tie_break else list(self)
+
         if callable(sort_by):
             # If a callable is provided, use it directly as the key
-            objects = sorted(self, key=sort_by, reverse=reverse)
+            objects = sorted(candidates, key=sort_by, reverse=reverse)
 
         elif isinstance(sort_by, property):
-            objects = sorted(self, key=sort_by.__get__, reverse=reverse)
+            objects = sorted(candidates, key=sort_by.__get__, reverse=reverse)
 
         elif isinstance(sort_by, Axis):
             if sort_by.wrapped is None:
@@ -3577,7 +3589,7 @@ class ShapeList(list[T]):
             assert sort_by.location is not None
             axis_as_location = sort_by.location.inverse()
             objects = sorted(
-                self,
+                candidates,
                 key=lambda o: tcast(
                     Location, (axis_as_location * Location(o.center()))
                 ).position.Z,
@@ -3597,18 +3609,18 @@ class ShapeList(list[T]):
 
             # pylint: disable=unnecessary-lambda
             objects = sorted(
-                self, key=lambda o: u_of_closest_center(o), reverse=reverse
+                candidates, key=lambda o: u_of_closest_center(o), reverse=reverse
             )
 
         elif isinstance(sort_by, SortBy):
             if sort_by == SortBy.LENGTH:
                 objects = sorted(
-                    self,
+                    candidates,
                     key=lambda obj: obj.length,
                     reverse=reverse,
                 )
             elif sort_by == SortBy.RADIUS:
-                with_radius = [obj for obj in self if hasattr(obj, "radius")]
+                with_radius = [obj for obj in candidates if hasattr(obj, "radius")]
                 objects = sorted(
                     with_radius,
                     key=lambda obj: obj.radius,  # type: ignore
@@ -3616,19 +3628,19 @@ class ShapeList(list[T]):
                 )
             elif sort_by == SortBy.DISTANCE:
                 objects = sorted(
-                    self,
+                    candidates,
                     key=lambda obj: obj.center().length,
                     reverse=reverse,
                 )
             elif sort_by == SortBy.AREA:
-                with_area = [obj for obj in self if hasattr(obj, "area")]
+                with_area = [obj for obj in candidates if hasattr(obj, "area")]
                 objects = sorted(
                     with_area,
                     key=lambda obj: obj.area,  # type: ignore
                     reverse=reverse,
                 )
             elif sort_by == SortBy.VOLUME:
-                with_volume = [obj for obj in self if hasattr(obj, "volume")]
+                with_volume = [obj for obj in candidates if hasattr(obj, "volume")]
                 objects = sorted(
                     with_volume,
                     key=lambda obj: obj.volume,  # type: ignore
@@ -3800,6 +3812,29 @@ def _topods_bool_op(
         result = unwrap_topods_compound(result, True)
 
     return result
+
+
+def _geometric_key(shape: Shape | Vector) -> tuple:
+    """A deterministic, purely geometric ordering key.
+
+    Sorted vertex positions, then the center for shapes that share their vertices
+    (two arcs spanning the same end points), rounded to TOL_DIGITS so geometry
+    that agrees to within tolerance always sorts the same way.  Used by
+    ShapeList.sort_by(tie_break=True).
+    """
+    if isinstance(shape, Vector):  # a ShapeList can also hold plain Vectors
+        return (tuple(round(c, TOL_DIGITS) for c in (shape.X, shape.Y, shape.Z)), ())
+    positions = []
+    explorer = TopExp_Explorer(shape.wrapped, ta.TopAbs_VERTEX)
+    while explorer.More():
+        point = BRep_Tool.Pnt_s(TopoDS.Vertex_s(explorer.Current()))
+        positions.append(tuple(round(c, TOL_DIGITS) for c in point.Coord()))
+        explorer.Next()
+    center = shape.center()
+    return (
+        tuple(sorted(positions)),
+        tuple(round(c, TOL_DIGITS) for c in (center.X, center.Y, center.Z)),
+    )
 
 
 def _topods_entities(shape: TopoDS_Shape, topo_type: Shapes) -> list[TopoDS_Shape]:
