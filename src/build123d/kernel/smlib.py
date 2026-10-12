@@ -59,7 +59,7 @@ from OCP.BRep import BRep_Builder
 from OCP.BRepTools import BRepTools, BRepTools_History
 from OCP.TopoDS import TopoDS_Shape
 
-from build123d.kernel.base import BoolOp, JoinKind, Point, TopoKind
+from build123d.kernel.base import BoolOp, JoinKind, TopoKind
 from build123d.kernel.occt import OcctKernel
 
 _FINGERPRINT_DIGITS = 4

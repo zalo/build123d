@@ -319,7 +319,7 @@ def _splice_wire_fillet_corner(
         edge_idx = corner.connected_edge_indices[i]
         if trimmed is None:
             indices_to_remove.add(edge_idx)
-            history.wrapped.Remove(corner.connected_edges[i].wrapped)
+            history.remove(corner.connected_edges[i].wrapped)
             continue
 
         if not kernel.same_orientation(trimmed, corner.connected_edges[i].wrapped):
@@ -349,15 +349,15 @@ def _splice_wire_fillet_corner(
     wire, placed_edges = kernel.make_wire_placed(all_topods_edges)
     for placed, source in zip(placed_edges, sources):
         if source is None:
-            history.wrapped.AddGenerated(corner_vertex, placed)
+            history.add_generated(corner_vertex, placed)
             for arc_end in tracked_subshapes([placed]):
                 if kernel.is_kind(arc_end, TopoKind.VERTEX):
-                    history.wrapped.AddGenerated(corner_vertex, arc_end)
+                    history.add_generated(corner_vertex, arc_end)
         else:
             if not kernel.is_same(placed, source):
-                history.wrapped.AddModified(source, placed)
+                history.add_modified(source, placed)
             _record_matching_vertices(history, source, placed)
-    history.wrapped.Remove(corner_vertex)
+    history.remove(corner_vertex)
     return Wire(wire)._made_by(history)
 
 
@@ -413,7 +413,7 @@ def _joined_wire(
         if min(distances) > TOLERANCE:
             continue  # pragma: no cover - MakeWire keeps every edge it is given
         if not match.wrapped.IsSame(source.wrapped):
-            history.wrapped.AddModified(source.wrapped, match.wrapped)
+            history.add_modified(source.wrapped, match.wrapped)
         _record_matching_vertices(history, source.wrapped, match.wrapped)
     return wire._made_by(history)
 
@@ -433,7 +433,7 @@ def _record_matching_vertices(
             if kernel.is_same(new, old):
                 break
             if (Vector(kernel.vertex_point(new)) - old_point).length < TOLERANCE:
-                history.wrapped.AddModified(old, new)
+                history.add_modified(old, new)
                 break
 
 

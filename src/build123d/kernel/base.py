@@ -1205,6 +1205,26 @@ class Kernel(KernelGeometry):
         ``glue`` speeds up shapes that only touch; ``fuzzy`` is a merge tolerance.
         """
 
+    # ---- operation records ----------------------------------------------------
+
+    @abstractmethod
+    def record_modified(self, record: Any, shape: Handle) -> list[Handle]:
+        """What ``record`` (the opaque history an operation handed back) says
+        the input sub-shape ``shape`` was rebuilt into; empty when untouched
+        or when the record has no answer."""
+
+    @abstractmethod
+    def record_generated(self, record: Any, shape: Handle) -> list[Handle]:
+        """What ``record`` says was created from the input sub-shape ``shape``."""
+
+    @abstractmethod
+    def record_removed(self, record: Any, shape: Handle) -> bool:
+        """Whether ``record`` says the input sub-shape ``shape`` was removed."""
+
+    @abstractmethod
+    def sewn_shape(self, record: Any) -> Handle:
+        """The result of the sewing whose record this is."""
+
     @abstractmethod
     def section(self, a: Handle, b: Handle) -> tuple[Handle, Any]:
         """The vertices and edges where ``a`` and ``b`` meet, with the pcurves

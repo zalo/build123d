@@ -53,7 +53,7 @@ from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
-from OCP.BRepTools import BRepTools
+from OCP.BRepTools import BRepTools, BRepTools_History
 from OCP.collections import List_TopoDS_Shape
 from OCP.GProp import GProp_GProps
 from OCP.ShapeFix import ShapeFix_Shape
@@ -2017,6 +2017,59 @@ class OcctKernel(_OcctGeometry, Kernel):
         operation.SetRunParallel(True)
         operation.Build()
         return self.downcast(operation.Shape()), operation.History()
+
+    # ---- operation records ----------------------------------------------------
+
+    @staticmethod
+    def _answers(
+        query: Callable[[TopoDS_Shape], Any], shape: TopoDS_Shape
+    ) -> list[TopoDS_Shape]:
+        """What an algorithm says about one sub-shape, or nothing if it will not say."""
+        # OCP binds each OCCT failure straight to Exception, with no common base:
+        # BRepFilletAPI_MakeFillet2d raises Standard_Failure on one build and
+        # Standard_TypeMismatch on another when asked about a vertex or a face
+        try:
+            return list(query(shape))
+        except Exception:  # pylint: disable=broad-exception-caught
+            return []
+
+    def record_modified(self, record: Any, shape: TopoDS_Shape) -> list[TopoDS_Shape]:
+        if isinstance(record, BRepTools_History):
+            if not BRepTools_History.IsSupportedType_s(shape):
+                return []
+            return list(record.Modified(shape))
+        if isinstance(record, BRepBuilderAPI_Sewing):
+            if shape.ShapeType() == ta.TopAbs_FACE:
+                return [record.Modified(shape)] if record.IsModified(shape) else []
+            return (
+                [record.ModifiedSubShape(shape)]
+                if record.IsModifiedSubShape(shape)
+                else []
+            )
+        return self._answers(record.Modified, shape)
+
+    def record_generated(self, record: Any, shape: TopoDS_Shape) -> list[TopoDS_Shape]:
+        if isinstance(record, BRepTools_History):
+            if not BRepTools_History.IsSupportedType_s(shape):
+                return []
+            return list(record.Generated(shape))
+        if isinstance(record, BRepBuilderAPI_Sewing):
+            return []
+        return [
+            s
+            for s in self._answers(record.Generated, shape)
+            if BRepTools_History.IsSupportedType_s(s)
+        ]
+
+    def record_removed(self, record: Any, shape: TopoDS_Shape) -> bool:
+        if isinstance(record, BRepTools_History):
+            return BRepTools_History.IsSupportedType_s(shape) and record.IsRemoved(
+                shape
+            )
+        return False
+
+    def sewn_shape(self, record: Any) -> TopoDS_Shape:
+        return record.SewedShape()
 
     def section(self, a: TopoDS_Shape, b: TopoDS_Shape) -> tuple[TopoDS_Shape, Any]:
         section = BRepAlgoAPI_Section(a, b)

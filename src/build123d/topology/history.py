@@ -8,14 +8,19 @@ date: September 10, 2026
 desc:
     What an operation did to the sub-shapes of its inputs, as the kernel
     reports it: which sub-shapes it left alone, which it rebuilt (modified),
-    which it created from another (generated) and which it removed. Wraps
-    OCCT's BRepTools_History so the record from one operation can be merged
-    with the next and the chain read from the original inputs to the final
-    result.
+    which it created from another (generated) and which it removed. The
+    record from one operation can be merged with the next and the chain read
+    from the original inputs to the final result.
 
     The builders use this to answer Select.LAST and Select.NEW without
     comparing shapes before and after: a face the operation only trimmed is
     a modified face, not a new one.
+
+    A record is a stack of layers. A layer is either the opaque record a
+    kernel operation handed back, read through the kernel facade on demand,
+    or a set of answers kept in Python. Layers compose: a sub-shape modified
+    by one operation into another, which the next operation modified again,
+    maps to the final shape.
 
 license:
 
@@ -37,62 +42,61 @@ license:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Iterable
-from typing import Protocol
+from collections.abc import Hashable, Iterable
+from typing import Any
 
-import OCP.TopAbs as ta
-from OCP.BRepAlgoAPI import BRepAlgoAPI_BuilderAlgo
-from OCP.BRepBuilderAPI import BRepBuilderAPI_Sewing
-from OCP.BRepTools import BRepTools_History
-from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
-from OCP.TopExp import TopExp
-from OCP.TopLoc import TopLoc_Location
-from OCP.TopoDS import TopoDS_Shape
-from OCP.collections import (
-    DataMap_TopoDS_Shape_TopoDS_Shape_TopTools_ShapeMapHasher,
-    IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher,
-    List_TopoDS_Shape,
-    Map_TopoDS_Shape_TopTools_ShapeMapHasher,
-)
 from typing_extensions import Self
 
-from .kernel import list_shapes
+from build123d.kernel import Handle, TopoKind, kernel
 
-# The sub-shape types BRepTools_History records; wires, shells and compounds
-# are containers and are not tracked
-TRACKED_TYPES = (ta.TopAbs_VERTEX, ta.TopAbs_EDGE, ta.TopAbs_FACE, ta.TopAbs_SOLID)
-
-
-class MakeShapeLike(Protocol):
-    """The history interface every BRepBuilderAPI_MakeShape descendant has."""
-
-    # pylint: disable=invalid-name,missing-function-docstring
-    def Generated(self, shape: TopoDS_Shape, /) -> List_TopoDS_Shape: ...
-    def Modified(self, shape: TopoDS_Shape, /) -> List_TopoDS_Shape: ...
+TRACKED_KINDS = (TopoKind.VERTEX, TopoKind.EDGE, TopoKind.FACE, TopoKind.SOLID)
+"""The sub-shape kinds a record follows; wires, shells and compounds are
+containers and are not tracked."""
 
 
-def _answers(
-    query: Callable[[TopoDS_Shape], List_TopoDS_Shape], shape: TopoDS_Shape
-) -> list[TopoDS_Shape]:
-    """What an algorithm says about one sub-shape, or nothing if it will not say."""
-    # OCP binds each OCCT failure straight to Exception, with no common base:
-    # BRepFilletAPI_MakeFillet2d raises Standard_Failure on one build and
-    # Standard_TypeMismatch on another when asked about a vertex or a face
-    try:
-        return list_shapes(query(shape))
-    except Exception:  # pylint: disable=broad-exception-caught
+def tracked_subshapes(shapes: Iterable[Handle | None]) -> list[Handle]:
+    """Every distinct vertex, edge, face and solid of the given shapes."""
+    found: dict[Hashable, Handle] = {}
+    for shape in shapes:
+        if kernel.is_null(shape):
+            continue
+        for kind in TRACKED_KINDS:
+            for sub in kernel.sub_shapes(shape, kind):
+                found.setdefault(kernel.hash_key(sub), sub)
+    return list(found.values())
+
+
+class _Layer:
+    """One operation's answers: what each tracked sub-shape became."""
+
+    def __init__(self, record: Any = None):
+        self.record = record
+        self.modified: dict[Hashable, list[Handle]] = {}
+        self.generated: dict[Hashable, list[Handle]] = {}
+        self.removed: set[Hashable] = set()
+
+    def modified_of(self, shape: Handle) -> list[Handle]:
+        found = self.modified.get(kernel.hash_key(shape))
+        if found is not None:
+            return list(found)
+        if self.record is not None:
+            return kernel.record_modified(self.record, shape)
         return []
 
+    def generated_of(self, shape: Handle) -> list[Handle]:
+        found = self.generated.get(kernel.hash_key(shape))
+        if found is not None:
+            return list(found)
+        if self.record is not None:
+            return kernel.record_generated(self.record, shape)
+        return []
 
-def tracked_subshapes(shapes: Iterable[TopoDS_Shape]) -> list[TopoDS_Shape]:
-    """Every distinct vertex, edge, face and solid of the given shapes."""
-    found = IndexedMap_TopoDS_Shape_TopTools_ShapeMapHasher()
-    for shape in shapes:
-        if shape is None or shape.IsNull():
-            continue
-        for shape_type in TRACKED_TYPES:
-            TopExp.MapShapes_s(shape, shape_type, found)
-    return [found(i + 1) for i in range(found.Extent())]
+    def is_removed(self, shape: Handle) -> bool:
+        if kernel.hash_key(shape) in self.removed:
+            return True
+        if self.record is not None:
+            return kernel.record_removed(self.record, shape)
+        return False
 
 
 class ShapeHistory:
@@ -102,9 +106,9 @@ class ShapeHistory:
     result: untouched (it is still there, unchanged), modified (rebuilt into
     one or more sub-shapes of the same kind), generating (a sub-shape of
     another kind was made from it, as a face is made from an edge by an
-    extrusion) or removed. Booleans and ``ShapeUpgrade_UnifySameDomain``
-    hand over a complete record; other algorithms answer per sub-shape and
-    :meth:`from_algorithm` collects those answers.
+    extrusion) or removed. Booleans and ``clean`` hand over a complete
+    record; other algorithms answer per sub-shape and :meth:`from_algorithm`
+    collects those answers.
 
     Records chain with :meth:`merge`, so that after a fuse and a clean a face
     of the original input still maps to the face it became.
@@ -117,109 +121,106 @@ class ShapeHistory:
 
     def __init__(
         self,
-        history: BRepTools_History | None = None,
-        before: Iterable[TopoDS_Shape] = (),
-        brought: Iterable[TopoDS_Shape] = (),
+        record: Any = None,
+        before: Iterable[Handle] = (),
+        brought: Iterable[Handle] = (),
     ):
-        self.wrapped = BRepTools_History() if history is None else history
-        self.before: list[TopoDS_Shape] = list(before)
-        self.brought: list[TopoDS_Shape] = list(brought)
+        self.layers: list[_Layer] = [_Layer(record)]
+        self.before: list[Handle] = list(before)
+        self.brought: list[Handle] = list(brought)
         self._traces: tuple[Trace, Trace] | None = None
+        self._produced: set[Hashable] | None = None
 
     # ---- Constructors ----
 
     @classmethod
     def from_boolean(
         cls,
-        operation: BRepAlgoAPI_BuilderAlgo,
-        before: Iterable[TopoDS_Shape] = (),
-        brought: Iterable[TopoDS_Shape] = (),
+        record: Any,
+        before: Iterable[Handle] = (),
+        brought: Iterable[Handle] = (),
     ) -> ShapeHistory:
         """The record a boolean operation (or splitter) kept while building."""
-        return cls(operation.History(), before, brought)
+        return cls(record, before, brought)
 
     @classmethod
-    def from_unify(cls, upgrader: ShapeUpgrade_UnifySameDomain) -> ShapeHistory:
+    def from_unify(cls, record: Any) -> ShapeHistory:
         """The record of a ``clean``."""
-        return cls(upgrader.History())
+        return cls(record)
 
     @classmethod
     def from_algorithm(
         cls,
-        algorithm: MakeShapeLike,
-        inputs: Iterable[TopoDS_Shape],
-        result: TopoDS_Shape,
+        algorithm: Any,
+        inputs: Iterable[Handle],
+        result: Handle,
     ) -> ShapeHistory:
-        """Collect the per-sub-shape answers of a ``BRepBuilderAPI_MakeShape``.
+        """Collect the per-sub-shape answers of a kernel algorithm.
 
-        ``IsDeleted`` is not consulted: several algorithms answer it for the
-        sub-shape kinds they track and guess for the rest, so a sub-shape is
-        removed when it is neither still in ``result`` nor modified into
-        something that is. An algorithm that raises when asked about a kind it
-        does not track (``BRepFilletAPI_MakeFillet2d`` only answers for edges)
-        is taken to have no answer for it.
+        A sub-shape is removed when it is neither still in ``result`` nor
+        modified into something that is; the algorithm's own opinion on
+        deletion is not consulted, as several guess for the kinds they do not
+        track. An algorithm that will not answer for a kind is taken to have
+        no answer for it.
         """
         inputs = list(inputs)
         history = cls(before=inputs)
-        present = Map_TopoDS_Shape_TopTools_ShapeMapHasher()
-        for sub in tracked_subshapes([result]):
-            present.Add(sub)
+        layer = history.layers[0]
+        present = {kernel.hash_key(sub) for sub in tracked_subshapes([result])}
         for sub in tracked_subshapes(inputs):
-            modified = _answers(algorithm.Modified, sub)
-            for shape in modified:
-                history.wrapped.AddModified(sub, shape)
-            for shape in _answers(algorithm.Generated, sub):
-                if BRepTools_History.IsSupportedType_s(shape):
-                    history.wrapped.AddGenerated(sub, shape)
-            if not modified and not present.Contains(sub):
-                history.wrapped.Remove(sub)
+            key = kernel.hash_key(sub)
+            modified = kernel.record_modified(algorithm, sub)
+            if modified:
+                layer.modified[key] = modified
+            generated = kernel.record_generated(algorithm, sub)
+            if generated:
+                layer.generated[key] = generated
+            if not modified and key not in present:
+                layer.removed.add(key)
         return history
 
     @classmethod
-    def from_sewing(
-        cls, sewing: BRepBuilderAPI_Sewing, inputs: Iterable[TopoDS_Shape]
-    ) -> ShapeHistory:
+    def from_sewing(cls, sewing: Any, inputs: Iterable[Handle]) -> ShapeHistory:
         """The record of sewing faces into a shell.
 
-        Sewing reports faces it rebuilt through ``Modified`` and the edges and
-        vertices it merged through ``ModifiedSubShape``; a face it dropped as a
-        duplicate is neither, and is recorded as removed.
+        Sewing reports the faces it rebuilt and the edges and vertices it
+        merged; a face it dropped as a duplicate is neither, and is recorded
+        as removed.
         """
         inputs = list(inputs)
         history = cls(before=inputs)
-        present = Map_TopoDS_Shape_TopTools_ShapeMapHasher()
-        for sub in tracked_subshapes([sewing.SewedShape()]):
-            present.Add(sub)
+        layer = history.layers[0]
+        present = {
+            kernel.hash_key(sub)
+            for sub in tracked_subshapes([kernel.sewn_shape(sewing)])
+        }
         for sub in tracked_subshapes(inputs):
-            if sub.ShapeType() == ta.TopAbs_FACE:
-                if sewing.IsModified(sub):
-                    history.wrapped.AddModified(sub, sewing.Modified(sub))
-                elif not present.Contains(sub):
-                    history.wrapped.Remove(sub)
-            elif sewing.IsModifiedSubShape(sub):
-                history.wrapped.AddModified(sub, sewing.ModifiedSubShape(sub))
-            elif not present.Contains(sub):
-                history.wrapped.Remove(sub)
+            key = kernel.hash_key(sub)
+            modified = kernel.record_modified(sewing, sub)
+            if modified:
+                layer.modified[key] = modified
+            elif key not in present:
+                layer.removed.add(key)
         return history
 
     @classmethod
-    def from_relocation(cls, before: TopoDS_Shape, after: TopoDS_Shape) -> ShapeHistory:
+    def from_relocation(cls, before: Handle, after: Handle) -> ShapeHistory:
         """The record of moving a shape: each sub-shape modified into its moved self.
 
-        A move keeps every TShape and changes only Locations, so the pairing is
-        by TShape. Sub-shapes whose Location did not change are left untouched.
+        A move keeps every underlying entity and changes only placements, so
+        the pairing is by entity. Sub-shapes whose placement did not change
+        are left untouched.
         """
         history = cls(before=[before])
-        identity = TopLoc_Location()
-        placed = DataMap_TopoDS_Shape_TopoDS_Shape_TopTools_ShapeMapHasher()
+        layer = history.layers[0]
+        identity = kernel.identity_location()
+        placed: dict[Hashable, Handle] = {}
         for sub in tracked_subshapes([after]):
-            placed.Bind(sub.Located(identity), sub)
+            placed[kernel.hash_key(kernel.located(sub, identity))] = sub
         for sub in tracked_subshapes([before]):
-            key = sub.Located(identity)
-            if placed.IsBound(key):
-                moved = placed.Find(key)
-                if not moved.IsSame(sub):
-                    history.wrapped.AddModified(sub, moved)
+            moved = placed.get(kernel.hash_key(kernel.located(sub, identity)))
+            if moved is not None and not kernel.is_same(moved, sub):
+                layer.modified[kernel.hash_key(sub)] = [moved]
         return history
 
     @classmethod
@@ -249,36 +250,63 @@ class ShapeHistory:
             before=[s for h in found for s in h.before],
             brought=[s for h in found for s in h.brought],
         )
-        for history in found:
-            merged.merge(history)
+        merged.layers = [layer for history in found for layer in history.layers]
         return merged
 
     # ---- Instance Methods ----
 
-    def add_modified(self, before: TopoDS_Shape, after: TopoDS_Shape) -> Self:
+    def add_modified(self, before: Handle, after: Handle) -> Self:
         """Record that ``before`` was rebuilt into ``after``.
 
-        For what an algorithm did but does not say: ``BRepFilletAPI_MakeFillet2d``
-        rebuilds the face it works on without reporting it.
+        For what an algorithm did but does not say: a 2D fillet rebuilds the
+        face it works on without reporting it.
         """
-        if BRepTools_History.IsSupportedType_s(before):
-            self.wrapped.AddModified(before, after)
+        if kernel.kind(before) in TRACKED_KINDS:
+            self.layers[-1].modified.setdefault(kernel.hash_key(before), []).append(
+                after
+            )
+            self._traces = None
+            self._produced = None
         return self
+
+    def add_generated(self, source: Handle, made: Handle) -> Self:
+        """Record that ``made`` was created from ``source``."""
+        if kernel.kind(source) in TRACKED_KINDS:
+            self.layers[-1].generated.setdefault(kernel.hash_key(source), []).append(
+                made
+            )
+            self._traces = None
+            self._produced = None
+        return self
+
+    def remove(self, shape: Handle) -> Self:
+        """Record that ``shape`` did not survive the operation."""
+        if kernel.kind(shape) in TRACKED_KINDS:
+            self.layers[-1].removed.add(kernel.hash_key(shape))
+            self._traces = None
+            self._produced = None
+        return self
+
+    def has_modified(self) -> bool:
+        """Does the record say any sub-shape was rebuilt?"""
+        return any(layer.modified for layer in self.layers) or any(
+            layer.record is not None for layer in self.layers
+        )
 
     def merge(self, later: ShapeHistory | None) -> Self:
         """Extend this record with the operation that came after it."""
         if later is not None:
-            self.wrapped.Merge(later.wrapped)
+            self.layers.extend(later.layers)
             self._traces = None
+            self._produced = None
         return self
 
-    def with_inputs(
-        self, before: Iterable[TopoDS_Shape], brought: Iterable[TopoDS_Shape]
-    ) -> Self:
+    def with_inputs(self, before: Iterable[Handle], brought: Iterable[Handle]) -> Self:
         """Say which inputs were already there and which were brought in."""
         self.before = list(before)
         self.brought = list(brought)
         self._traces = None
+        self._produced = None
         return self
 
     def _from(self) -> tuple[Trace, Trace]:
@@ -287,7 +315,7 @@ class ShapeHistory:
             self._traces = (Trace(self, self.before), Trace(self, self.brought))
         return self._traces
 
-    def is_last(self, shape: TopoDS_Shape) -> bool:
+    def is_last(self, shape: Handle) -> bool:
         """Did the operation bring this sub-shape of the result in, or create it?
 
         A sub-shape that descends from something brought in, untouched or
@@ -301,7 +329,7 @@ class ShapeHistory:
             return True
         return not (from_before.is_untouched(shape) or from_before.is_modified(shape))
 
-    def is_new(self, shape: TopoDS_Shape) -> bool:
+    def is_new(self, shape: Handle) -> bool:
         """Did this sub-shape of the result exist in no input, in any form?"""
         from_before, from_brought = self._from()
         for trace in (from_brought, from_before):
@@ -309,25 +337,99 @@ class ShapeHistory:
                 return False
         return True
 
-    def modified(self, shape: TopoDS_Shape) -> list[TopoDS_Shape]:
+    def _intermediates(self) -> set[Hashable]:
+        """The sub-shapes some layer made from the inputs: results of one
+        operation that the next one consumed. Only original inputs are
+        answered for; an intermediate queried directly is unknown, as it is
+        to a kernel record merged across operations."""
+        if self._produced is None:
+            produced: set[Hashable] = set()
+            current = tracked_subshapes(self.before + self.brought)
+            for layer in self.layers:
+                following: list[Handle] = []
+                for item in current:
+                    if layer.is_removed(item):
+                        continue
+                    became = layer.modified_of(item) + layer.generated_of(item)
+                    for made in became:
+                        produced.add(kernel.hash_key(made))
+                    following.extend(layer.modified_of(item) or [item])
+                current = following
+            self._produced = produced
+        return self._produced
+
+    def _follow(self, shape: Handle) -> tuple[list[Handle], bool, bool]:
+        """Where ``shape`` ends up through every layer: the shapes it became,
+        whether any layer changed it, and whether it was removed."""
+        if kernel.hash_key(shape) in self._intermediates():
+            return [shape], False, False
+        current = [shape]
+        changed = False
+        for layer in self.layers:
+            following: list[Handle] = []
+            for item in current:
+                if layer.is_removed(item):
+                    changed = True
+                    continue
+                became = layer.modified_of(item)
+                if became:
+                    changed = True
+                    following.extend(became)
+                else:
+                    following.append(item)
+            current = following
+        return current, changed, changed and not current
+
+    def modified(self, shape: Handle) -> list[Handle]:
         """What an input sub-shape was rebuilt into, if anything."""
-        if not BRepTools_History.IsSupportedType_s(shape):
+        if kernel.kind(shape) not in TRACKED_KINDS:
             return []
-        return list_shapes(self.wrapped.Modified(shape))
+        final, changed, _ = self._follow(shape)
+        return final if changed else []
 
-    def generated(self, shape: TopoDS_Shape) -> list[TopoDS_Shape]:
+    def generated(self, shape: Handle) -> list[Handle]:
         """What was made from an input sub-shape, if anything."""
-        if not BRepTools_History.IsSupportedType_s(shape):
+        if kernel.kind(shape) not in TRACKED_KINDS:
             return []
-        return list_shapes(self.wrapped.Generated(shape))
+        if kernel.hash_key(shape) in self._intermediates():
+            return []
+        made: list[Handle] = []
+        current = [shape]
+        for index, layer in enumerate(self.layers):
+            for item in current:
+                for product in layer.generated_of(item):
+                    # what later operations made of the product
+                    survivors = [product]
+                    for after in self.layers[index + 1 :]:
+                        survivors = [
+                            s
+                            for item2 in survivors
+                            if not after.is_removed(item2)
+                            for s in (after.modified_of(item2) or [item2])
+                        ]
+                    made.extend(survivors)
+            following: list[Handle] = []
+            for item in current:
+                if layer.is_removed(item):
+                    continue
+                following.extend(layer.modified_of(item) or [item])
+            current = following
+        seen: set[Hashable] = set()
+        unique = []
+        for item in made:
+            key = kernel.hash_key(item)
+            if key not in seen:
+                seen.add(key)
+                unique.append(item)
+        return unique
 
-    def is_removed(self, shape: TopoDS_Shape) -> bool:
+    def is_removed(self, shape: Handle) -> bool:
         """Was an input sub-shape removed by the operation?"""
-        return BRepTools_History.IsSupportedType_s(shape) and self.wrapped.IsRemoved(
-            shape
-        )
+        if kernel.kind(shape) not in TRACKED_KINDS:
+            return False
+        return self._follow(shape)[2]
 
-    def trace(self, inputs: Iterable[TopoDS_Shape]) -> Trace:
+    def trace(self, inputs: Iterable[Handle]) -> Trace:
         """Index the record from the result's side for the given inputs."""
         return Trace(self, inputs)
 
@@ -340,32 +442,30 @@ class Trace:
     modified from one, or was generated from one.
     """
 
-    def __init__(self, history: ShapeHistory, inputs: Iterable[TopoDS_Shape]):
-        self.untouched = Map_TopoDS_Shape_TopTools_ShapeMapHasher()
-        self.modified_from = DataMap_TopoDS_Shape_TopoDS_Shape_TopTools_ShapeMapHasher()
-        self.generated_from = (
-            DataMap_TopoDS_Shape_TopoDS_Shape_TopTools_ShapeMapHasher()
-        )
+    def __init__(self, history: ShapeHistory, inputs: Iterable[Handle]):
+        self.untouched: set[Hashable] = set()
+        self.modified_from: dict[Hashable, Handle] = {}
+        self.generated_from: dict[Hashable, Handle] = {}
         for sub in tracked_subshapes(inputs):
-            self.untouched.Add(sub)
+            self.untouched.add(kernel.hash_key(sub))
             for shape in history.modified(sub):
-                self.modified_from.Bind(shape, sub)
+                self.modified_from[kernel.hash_key(shape)] = sub
             for shape in history.generated(sub):
-                self.generated_from.Bind(shape, sub)
+                self.generated_from[kernel.hash_key(shape)] = sub
 
-    def is_untouched(self, shape: TopoDS_Shape) -> bool:
+    def is_untouched(self, shape: Handle) -> bool:
         """Was this result sub-shape an input sub-shape, unchanged?"""
-        return self.untouched.Contains(shape)
+        return kernel.hash_key(shape) in self.untouched
 
-    def is_modified(self, shape: TopoDS_Shape) -> bool:
+    def is_modified(self, shape: Handle) -> bool:
         """Was this result sub-shape rebuilt from an input sub-shape?"""
-        return self.modified_from.IsBound(shape)
+        return kernel.hash_key(shape) in self.modified_from
 
-    def is_generated(self, shape: TopoDS_Shape) -> bool:
+    def is_generated(self, shape: Handle) -> bool:
         """Was this result sub-shape made from an input sub-shape of another kind?"""
-        return self.generated_from.IsBound(shape)
+        return kernel.hash_key(shape) in self.generated_from
 
-    def is_descendant(self, shape: TopoDS_Shape) -> bool:
+    def is_descendant(self, shape: Handle) -> bool:
         """Did this result sub-shape come from the inputs in any way?"""
         return (
             self.is_untouched(shape)
