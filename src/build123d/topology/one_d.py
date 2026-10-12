@@ -96,8 +96,6 @@ from OCP.GC import (
 )
 from OCP.GCPnts import (
     GCPnts_AbscissaPoint,
-    GCPnts_QuasiUniformDeflection,
-    GCPnts_UniformDeflection,
 )
 from OCP.Geom import (
     Geom_BezierCurve,
@@ -119,9 +117,6 @@ from OCP.GeomAbs import (
     GeomAbs_C0,
     GeomAbs_C1,
     GeomAbs_C2,
-    GeomAbs_C3,
-    GeomAbs_Circle,
-    GeomAbs_CN,
     GeomAbs_G1,
     GeomAbs_G2,
     GeomAbs_JoinType,
@@ -130,7 +125,6 @@ from OCP.GeomAdaptor import GeomAdaptor_Curve
 from OCP.GeomAPI import (
     GeomAPI_Interpolate,
     GeomAPI_PointsToBSpline,
-    GeomAPI_ProjectPointOnCurve,
 )
 from OCP.GeomConvert import (
     GeomConvert_ApproxCurve,
@@ -673,13 +667,13 @@ class Mixin1D(Shape[TOPODS]):
           ValueError: if kernel can not reduce the shape to a circular edge
 
         """
-        geom = self.geom_adaptor()
-        if isinstance(geom, BRepAdaptor_CompCurve):
+        if kernel.is_kind(self.wrapped, TopoKind.WIRE):
             # Wire: delegate to the first edge (CompCurve reports OtherCurve)
             return self.edges().first.radius
-        if geom.GetType() != GeomAbs_Circle:
+        curve = kernel.curve_of(self.wrapped)
+        if curve.geom_type != "CIRCLE":
             raise ValueError("Shape could not be reduced to a circle")
-        return geom.Circle().Radius()
+        return curve.circle()[2]
 
     @property
     def volume(self) -> float:
@@ -1043,10 +1037,10 @@ class Mixin1D(Shape[TOPODS]):
 
         Note that circles may have identical start and end points.
         """
-        curve = self.geom_adaptor()
-        umax = curve.LastParameter() if self.is_forward else curve.FirstParameter()
+        curve = kernel.curve_of(self.wrapped)
+        umax = curve.last if self.is_forward else curve.first
 
-        return Vector(curve.Value(umax))
+        return Vector(curve.value(umax))
 
     def _intersect(
         self,
@@ -1550,27 +1544,13 @@ class Mixin1D(Shape[TOPODS]):
             list[Vector]: positions along curve
         """
         if deflection is not None:
-            curve: BRepAdaptor_Curve | BRepAdaptor_CompCurve = self.geom_adaptor()
-            # GCPnts_UniformDeflection provides the best results but is limited
-            if curve.Continuity() in (GeomAbs_C2, GeomAbs_C3, GeomAbs_CN):
-                discretizer: (
-                    GCPnts_UniformDeflection | GCPnts_QuasiUniformDeflection
-                ) = GCPnts_UniformDeflection()
-            else:
-                discretizer = GCPnts_QuasiUniformDeflection()
-
-            discretizer.Initialize(
-                curve,
-                deflection,
-                curve.FirstParameter(),
-                curve.LastParameter(),
-            )
-            if not discretizer.IsDone() or discretizer.NbPoints() == 0:
-                raise RuntimeError("Deflection calculation failed")
             return [
-                Vector(curve.Value(discretizer.Parameter(i + 1)))
-                for i in range(discretizer.NbPoints())
+                Vector(*point)
+                for point in kernel.curve_of(self.wrapped).positions_by_deflection(
+                    deflection
+                )
             ]
+
         if distances is not None:
             return [self.position_at(d, position_mode) for d in distances]
         raise ValueError("Either distances or deflection must be provided")
@@ -1725,10 +1705,10 @@ class Mixin1D(Shape[TOPODS]):
 
         Note that circles may have identical start and end points.
         """
-        curve = self.geom_adaptor()
-        umin = curve.FirstParameter() if self.is_forward else curve.LastParameter()
+        curve = kernel.curve_of(self.wrapped)
+        umin = curve.first if self.is_forward else curve.last
 
-        return Vector(curve.Value(umin))
+        return Vector(curve.value(umin))
 
     def tangent_angle_at(
         self,
@@ -1832,12 +1812,12 @@ class Edge(Mixin1D[TopoDS_Edge]):
         """center of an underlying circle or ellipse geometry."""
 
         geom_type = self.geom_type
-        geom_adaptor = self.geom_adaptor()
+        curve = kernel.curve_of(self.wrapped)
 
         if geom_type == GeomType.CIRCLE:
-            return_value = Vector(geom_adaptor.Circle().Position().Location())
+            return_value = Vector(curve.circle()[0])
         elif geom_type == GeomType.ELLIPSE:
-            return_value = Vector(geom_adaptor.Ellipse().Position().Location())
+            return_value = Vector(curve.ellipse()[0])
         else:
             raise ValueError(f"{geom_type} has no arc center")
 
@@ -3278,12 +3258,9 @@ class Edge(Mixin1D[TopoDS_Edge]):
 
         """
 
-        curve = self.geom_adaptor()
+        curve = kernel.curve_of(self.wrapped)
 
-        length = GCPnts_AbscissaPoint.Length_s(curve)
-        return GCPnts_AbscissaPoint(
-            curve, length * position, curve.FirstParameter()
-        ).Parameter()
+        return curve.param_at_length(curve.length() * position)
 
     def param_at_point(self, point: VectorLike) -> float:
         """
@@ -3343,9 +3320,8 @@ class Edge(Mixin1D[TopoDS_Edge]):
             Vector(nearest_vertex) - pnt
         ).length <= TOLERANCE and not nearest_vertex.is_empty:
             param = BRep_Tool.Parameter_s(nearest_vertex.wrapped, self.wrapped)
-            curve_adaptor = BRepAdaptor_Curve(self.wrapped)
-            u_value = GCPnts_AbscissaPoint.Length_s(curve_adaptor, param_min, param)
-            u_value /= GCPnts_AbscissaPoint.Length_s(curve_adaptor)
+            curve = kernel.curve_of(self.wrapped)
+            u_value = curve.length(param_min, param) / curve.length()
             # The length is measured along the curve while position_at measures
             # a reversed edge from its other end
             return u_value if self.is_forward else 1 - u_value
@@ -3360,16 +3336,11 @@ class Edge(Mixin1D[TopoDS_Edge]):
         # end points.
 
         # Extract the normalized parameter using OCCT GeomAPI_ProjectPointOnCurve
-        curve = BRep_Tool.Curve_s(self.wrapped, float(), float())
-        projector = GeomAPI_ProjectPointOnCurve(pnt.to_pnt(), curve)
-        param = projector.LowerDistanceParameter()
-        # Note that for some periodic curves the LowerDistanceParameter might
-        # be outside the given range
-        curve_adaptor = BRepAdaptor_Curve(self.wrapped)
-        if curve_adaptor.IsPeriodic():
-            param = param_min + ((param - param_min) % curve_adaptor.Period())
-        u_value = GCPnts_AbscissaPoint.Length_s(curve_adaptor, param_min, param)
-        u_value /= GCPnts_AbscissaPoint.Length_s(curve_adaptor)
+        curve = kernel.curve_of(self.wrapped)
+        param = curve.closest_param(tuple(pnt))
+        if curve.is_periodic():
+            param = param_min + ((param - param_min) % curve.period())
+        u_value = curve.length(param_min, param) / curve.length()
         if not self.is_forward:
             u_value = 1 - u_value
 

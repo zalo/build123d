@@ -116,3 +116,76 @@ class TestKernelFacadeOperations(unittest.TestCase):
         self.assertTrue(kernel.is_same(placed, box.wrapped))
         kernel.set_location(placed, shift)
         self.assertTrue(kernel.is_same(placed, moved))
+
+
+class TestKernelFacadeGeometry(unittest.TestCase):
+    def test_curve_view(self):
+        from build123d import Cylinder
+
+        cylinder = Cylinder(1, 2)
+        circle = [e for e in cylinder.edges() if e.geom_type.name == "CIRCLE"][0]
+        view = kernel.curve_of(circle.wrapped)
+        self.assertEqual(view.geom_type, "CIRCLE")
+        self.assertAlmostEqual(view.length(), 2 * 3.141592653589793, 6)
+        center, axis, radius = view.circle()
+        self.assertAlmostEqual(radius, 1.0, 6)
+        self.assertAlmostEqual(abs(axis[2]), 1.0, 6)
+        mid = view.param_at_length(view.length() / 2)
+        self.assertAlmostEqual(
+            sum((a - b) ** 2 for a, b in zip(view.value(mid), center)) ** 0.5, 1.0, 6
+        )
+        self.assertTrue(view.is_periodic())
+        self.assertGreater(len(view.positions_by_deflection(0.01)), 8)
+        self.assertAlmostEqual(
+            view.closest_param(view.value(view.first)), view.first, 6
+        )
+
+    def test_surface_view(self):
+        from build123d import Cylinder
+
+        cylinder = Cylinder(1, 2)
+        curved = [f for f in cylinder.faces() if f.geom_type.name == "CYLINDER"][0]
+        view = kernel.surface_of(curved.wrapped)
+        self.assertEqual(view.geom_type, "CYLINDER")
+        self.assertAlmostEqual(view.radius(), 1.0, 6)
+        self.assertTrue(view.is_u_periodic())
+        point, normal = view.normal(0.0, 0.0)
+        self.assertAlmostEqual(abs(normal[0]), 1.0, 6)
+        self.assertIsNone(view.plane())
+        flat = [f for f in cylinder.faces() if f.geom_type.name == "PLANE"][0]
+        self.assertIsNotNone(kernel.surface_of(flat.wrapped).plane())
+
+    def test_construction(self):
+        from build123d import Plane
+        from build123d.kernel import JoinKind, SweepTransition
+
+        frame = Plane.XY.to_gp_ax2()
+        box = kernel.make_box(frame, 1, 2, 3)
+        self.assertAlmostEqual(kernel.volume(box), 6.0, 6)
+        self.assertAlmostEqual(
+            kernel.volume(kernel.make_cylinder(frame, 1, 1, 2 * 3.141592653589793)),
+            3.141592653589793,
+            5,
+        )
+        face = kernel.sub_shapes(box, TopoKind.FACE)[0]
+        prism = kernel.extrude(face, (1.0, 0.0, 0.0))
+        self.assertEqual(kernel.kind(prism), TopoKind.SOLID)
+        self.assertAlmostEqual(kernel.volume(prism), 6.0, 6)
+        filleted, record = kernel.fillet(
+            box, kernel.sub_shapes(box, TopoKind.EDGE)[:1], 0.25
+        )
+        self.assertEqual(len(kernel.sub_shapes(filleted, TopoKind.FACE)), 7)
+        self.assertIsNotNone(record)
+        shelled = kernel.thick_solid(box, [face], -0.1, 1e-4, JoinKind.ARC)
+        self.assertLess(kernel.volume(shelled), 6.0)
+        self.assertIsInstance(SweepTransition.ROUND, SweepTransition)
+
+    def test_tessellation(self):
+        box = Solid.make_box(1, 1, 1)
+        kernel.mesh(box.wrapped, 0.1, 0.1)
+        face = kernel.sub_shapes(box.wrapped, TopoKind.FACE)[0]
+        triangulation = kernel.face_triangulation(face)
+        self.assertIsNotNone(triangulation)
+        points, triangles = triangulation
+        self.assertEqual(len(points), 4)
+        self.assertEqual(len(triangles), 2)

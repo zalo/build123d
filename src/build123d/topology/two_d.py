@@ -96,7 +96,6 @@ from OCP.GeomAbs import (
 from OCP.GeomAdaptor import GeomAdaptor_Surface
 from OCP.GeomAPI import (
     GeomAPI_PointsToBSplineSurface,
-    GeomAPI_ProjectPointOnSurf,
 )
 from OCP.GeomLib import GeomLib_IsPlanarSurface
 from OCP.gp import gp_Ax1, gp_Ax3, gp_Dir, gp_Pln, gp_Pnt, gp_Vec
@@ -1236,11 +1235,7 @@ class Face(Mixin2D[TopoDS_Face]):
     def radii(self) -> None | tuple[float, float]:
         """Return the major and minor radii of a torus otherwise None"""
         if self.geom_type == GeomType.TORUS:
-            return (
-                self.geom_adaptor().MajorRadius(),  # type: ignore[attr-defined]
-                self.geom_adaptor().MinorRadius(),  # type: ignore[attr-defined]
-            )
-
+            return kernel.surface_of(self.wrapped).torus_radii()
         return None
 
     @property
@@ -1252,11 +1247,8 @@ class Face(Mixin2D[TopoDS_Face]):
         """
         if self.is_empty:
             return None
-        adaptor = BRepAdaptor_Surface(self.wrapped)
-        if self.geom_type == GeomType.CYLINDER:
-            return adaptor.Cylinder().Radius()
-        if self.geom_type == GeomType.SPHERE:
-            return adaptor.Sphere().Radius()
+        if self.geom_type in (GeomType.CYLINDER, GeomType.SPHERE):
+            return kernel.surface_of(self.wrapped).radius()
         return None
 
     @property
@@ -1273,7 +1265,7 @@ class Face(Mixin2D[TopoDS_Face]):
         arrived as a trimmed surface has its semi angle all the same.
         """
         if self.geom_type == GeomType.CONE:
-            return degrees(BRepAdaptor_Surface(self.wrapped).Cone().SemiAngle())
+            return degrees(kernel.surface_of(self.wrapped).semi_angle())
         return None
 
     def _uv_edge(self, native_edge: TopoDS_Edge) -> Edge:
@@ -2123,7 +2115,7 @@ class Face(Mixin2D[TopoDS_Face]):
             v = v_min + v * (v_max - v_min)
             scale = (u_max - u_min) ** u_order * (v_max - v_min) ** v_order
         return (
-            Vector(BRepAdaptor_Surface(self.wrapped).DN(u, v, u_order, v_order)) * scale
+            Vector(kernel.surface_of(self.wrapped).dn(u, v, u_order, v_order)) * scale
         )
 
     def fillet_2d(self, radius: float, vertices: Iterable[Vertex]) -> Face:
@@ -2235,10 +2227,7 @@ class Face(Mixin2D[TopoDS_Face]):
     def is_coplanar(self, plane: Plane) -> bool:
         """Is this planar face coplanar with the provided plane"""
         u_val0, _u_val1, v_val0, _v_val1 = self._uv_bounds()
-        gp_pnt = gp_Pnt()
-        normal = gp_Vec()
-        BRepGProp_Face(self.wrapped).Normal(u_val0, v_val0, gp_pnt, normal)
-
+        gp_pnt, normal = kernel.surface_of(self.wrapped).normal(u_val0, v_val0)
         return (
             plane.contains(Vector(gp_pnt))
             and 1 - abs(plane.z_dir.dot(Vector(normal))) < TOLERANCE
@@ -2339,24 +2328,15 @@ class Face(Mixin2D[TopoDS_Face]):
         elif surface_point is None and (u < 0 or v < 0):
             raise ValueError("Both u & v values must be specified")
 
-        geom_surface: Geom_Surface = self.geom_adaptor()
+        surface = kernel.surface_of(self.wrapped)
         u_min, u_max, v_min, v_max = self._uv_bounds()
-
         if surface_point is None:
             u_val = u_min + u * (u_max - u_min)
             v_val = v_min + v * (v_max - v_min)
         else:
-            projector = GeomAPI_ProjectPointOnSurf(
-                Vector(surface_point).to_pnt(), geom_surface
-            )
-            u_val, v_val = projector.LowerDistanceParameters()
-
+            u_val, v_val = surface.closest_uv(tuple(Vector(surface_point)))
         # Evaluate point and partials
-        pnt = gp_Pnt()
-        du = gp_Vec()
-        dv = gp_Vec()
-        geom_surface.D1(u_val, v_val, pnt, du, dv)
-
+        pnt, du, dv = surface.d1(u_val, v_val)
         origin = Vector(pnt)
         z_dir = Vector(du).cross(Vector(dv)).normalized()
         # The surface normal ignores the face orientation flag, so flip it to
@@ -2482,25 +2462,16 @@ class Face(Mixin2D[TopoDS_Face]):
             raise ValueError("Both u & v values must be specified")
 
         # get the geometry
-        surface = self.geom_adaptor()
+        surface = kernel.surface_of(self.wrapped)
 
         if surface_point is None:
             u_val0, u_val1, v_val0, v_val1 = self._uv_bounds()
             u_val = u_val0 + u * (u_val1 - u_val0)
             v_val = v_val0 + v * (v_val1 - v_val0)
         else:
-            # project point on surface
-            projector = GeomAPI_ProjectPointOnSurf(
-                Vector(surface_point).to_pnt(), surface
-            )
+            u_val, v_val = surface.closest_uv(tuple(Vector(surface_point)))
 
-            u_val, v_val = projector.LowerDistanceParameters()
-
-        gp_pnt = gp_Pnt()
-        normal = gp_Vec()
-        BRepGProp_Face(self.wrapped).Normal(u_val, v_val, gp_pnt, normal)
-
-        return Vector(normal).normalized()
+        return Vector(surface.normal(u_val, v_val)[1]).normalized()
 
     def outer_wire(self) -> Wire:
         """Extract the perimeter wire from this Face"""
