@@ -77,7 +77,6 @@ from anytree import NodeMixin, RenderTree
 from IPython.lib.pretty import RepresentationPrinter, pretty
 from OCP.Bnd import Bnd_OBB
 from OCP.BRep import BRep_TEdge, BRep_Tool
-from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCP.GCPnts import GCPnts_AbscissaPoint
 from OCP.GeomAdaptor import GeomAdaptor_Curve
 from OCP.BRepBuilderAPI import (
@@ -93,11 +92,9 @@ from OCP.BRepBuilderAPI import (
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
-from OCP.BRepMesh import BRepMesh_IncrementalMesh
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
 from OCP.BRepTools import BRepTools
 from OCP.gce import gce_MakeLin
-from OCP.GeomAPI import GeomAPI_ProjectPointOnSurf
 from OCP.GeomLib import GeomLib_IsPlanarSurface
 from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_TrsfForm, gp_Vec, gp_XYZ
 from OCP.GProp import GProp_GProps
@@ -544,13 +541,9 @@ class Shape(NodeMixin, Generic[TOPODS]):
         shape: TopAbs_ShapeEnum = shapetype(self.wrapped)
 
         if shape == ta.TopAbs_EDGE:
-            geom = Shape.geom_LUT_EDGE[
-                BRepAdaptor_Curve(tcast(TopoDS_Edge, self.wrapped)).GetType()
-            ]
+            geom = GeomType[kernel.curve_of(self.wrapped).geom_type]
         elif shape == ta.TopAbs_FACE:
-            geom = Shape.geom_LUT_FACE[
-                BRepAdaptor_Surface(tcast(TopoDS_Face, self.wrapped)).GetType()
-            ]
+            geom = GeomType[kernel.surface_of(self.wrapped).geom_type]
         else:
             geom = GeomType.OTHER
 
@@ -1907,10 +1900,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty:
             raise ValueError("Cannot mesh an empty shape")
 
-        if not BRepTools.Triangulation_s(self.wrapped, tolerance):
-            BRepMesh_IncrementalMesh(
-                self.wrapped, tolerance, True, angular_tolerance, True
-            )
+        kernel.mesh(self.wrapped, tolerance, angular_tolerance)
 
     def mirror(self, mirror_plane: Plane | None = None) -> Self:
         """
@@ -2321,16 +2311,13 @@ class Shape(NodeMixin, Generic[TOPODS]):
                 tool_face = trim_tool
 
             # Create a reference point off the +ve side of the tool
-            surface_gppnt = gp_Pnt()
-            surface_normal = gp_Vec()
-            u_min, u_max, v_min, v_max = BRepTools.UVBounds_s(tool_face)
-            BRepGProp_Face(tool_face).Normal(
-                (u_min + u_max) / 2, (v_min + v_max) / 2, surface_gppnt, surface_normal
+            tool_surface = kernel.surface_of(tool_face)
+            u_min, u_max, v_min, v_max = tool_surface.uv_bounds()
+            surface_point_xyz, surface_normal = tool_surface.normal(
+                (u_min + u_max) / 2, (v_min + v_max) / 2
             )
-            normalized_surface_normal = Vector(
-                surface_normal.X(), surface_normal.Y(), surface_normal.Z()
-            ).normalized()
-            surface_point = Vector(surface_gppnt)
+            normalized_surface_normal = Vector(surface_normal).normalized()
+            surface_point = Vector(surface_point_xyz)
             ref_point = surface_point + normalized_surface_normal
 
             # Create a HalfSpace - Solidish object to determine top/bottom
@@ -2398,37 +2385,15 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         for face in self.faces():
             assert not face.is_empty
-            loc = TopLoc_Location()
-            poly = BRep_Tool.Triangulation_s(face.wrapped, loc)
-            trsf = loc.Transformation()
-            reverse = face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
-
-            # add vertices
-            vertices += [
-                Vector(v.X(), v.Y(), v.Z())
-                for v in (
-                    poly.Node(i).Transformed(trsf) for i in range(1, poly.NbNodes() + 1)
-                )
-            ]
-            # add triangles
+            triangulation = kernel.face_triangulation(face.wrapped)
+            if triangulation is None:
+                continue
+            points, face_triangles = triangulation
+            vertices += [Vector(*point) for point in points]
             triangles += [
-                (
-                    (
-                        t.Value(1) + offset - 1,
-                        t.Value(3) + offset - 1,
-                        t.Value(2) + offset - 1,
-                    )
-                    if reverse
-                    else (
-                        t.Value(1) + offset - 1,
-                        t.Value(2) + offset - 1,
-                        t.Value(3) + offset - 1,
-                    )
-                )
-                for t in poly.Triangles()
+                (a + offset, b + offset, c + offset) for a, b, c in face_triangles
             ]
-
-            offset += poly.NbNodes()
+            offset += len(points)
 
         return vertices, triangles
 
@@ -4163,17 +4128,11 @@ def _topods_entities(shape: TopoDS_Shape, topo_type: Shapes) -> list[TopoDS_Shap
 
 def _topods_face_normal_at(face: TopoDS_Face, surface_point: gp_Pnt) -> Vector:
     """Find the normal at a point on surface"""
-    surface = BRep_Tool.Surface_s(face)
-
-    # project point on surface
-    projector = GeomAPI_ProjectPointOnSurf(surface_point, surface)
-    u_val, v_val = projector.LowerDistanceParameters()
-
-    gp_pnt = gp_Pnt()
-    normal = gp_Vec()
-    BRepGProp_Face(face).Normal(u_val, v_val, gp_pnt, normal)
-
-    return Vector(normal).normalized()
+    surface = kernel.surface_of(face)
+    u_val, v_val = surface.closest_uv(
+        (surface_point.X(), surface_point.Y(), surface_point.Z())
+    )
+    return Vector(surface.normal(u_val, v_val)[1]).normalized()
 
 
 def downcast(obj: TopoDS_Shape) -> TopoDS_Shape:

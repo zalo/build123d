@@ -63,27 +63,18 @@ from bd_materials import FinishedMaterial
 
 import OCP.TopAbs as ta
 from OCP.BRep import BRep_Builder
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepFeat import BRepFeat_MakeDPrism
-from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
+from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet
 from OCP.BRepGProp import BRepGProp_Face
 from OCP.BRepOffset import BRepOffset_MakeOffset, BRepOffset_Skin
 from OCP.BRepOffsetAPI import (
     BRepOffsetAPI_DraftAngle,
     BRepOffsetAPI_MakePipeShell,
-    BRepOffsetAPI_MakeThickSolid,
 )
 from OCP.BRepPrimAPI import (
-    BRepPrimAPI_MakeBox,
-    BRepPrimAPI_MakeCone,
-    BRepPrimAPI_MakeCylinder,
     BRepPrimAPI_MakePrism,
-    BRepPrimAPI_MakeRevol,
-    BRepPrimAPI_MakeSphere,
-    BRepPrimAPI_MakeTorus,
-    BRepPrimAPI_MakeWedge,
 )
 from OCP.GeomAbs import GeomAbs_Intersection, GeomAbs_JoinType
 from OCP.gp import gp_Ax2, gp_Pln, gp_Pnt, gp_Vec
@@ -103,10 +94,9 @@ from OCP.TopoDS import (
 )
 from OCP.collections import (
     IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher,
-    List_TopoDS_Shape,
 )
 
-from build123d.kernel import BoolOp, TopoKind, kernel
+from build123d.kernel import BoolOp, JoinKind, SweepTransition, TopoKind, kernel
 from build123d.build_enums import (
     CenterOf,
     GeomType,
@@ -259,8 +249,6 @@ class Mixin3D(Shape[TOPODS]):
         )
 
         # note: we prefer 'length' word to 'radius' as opposed to FreeCAD's API
-        chamfer_builder = BRepFilletAPI_MakeChamfer(self.wrapped)
-
         if length2:
             distance1 = length
             distance2 = length2
@@ -268,18 +256,17 @@ class Mixin3D(Shape[TOPODS]):
             distance1 = length
             distance2 = length
 
+        specs = []
         for native_edge in native_edges:
             if face:
                 topo_face = face.wrapped
             else:
                 topo_face = edge_face_map.FindFromKey(native_edge).First()
-
-            chamfer_builder.Add(
-                distance1, distance2, native_edge, TopoDS.Face(topo_face)
-            )  # NB: edge_face_map return a generic TopoDS_Shape
+            specs.append((native_edge, TopoDS.Face(topo_face), distance1, distance2))
 
         try:
-            new_shape = self._make_3d_result(chamfer_builder.Shape())
+            chamfered, chamfer_record = kernel.chamfer(self.wrapped, specs)
+            new_shape = self._make_3d_result(chamfered)
             if not new_shape.is_valid:
                 raise Standard_Failure
         except (StdFail_NotDone, Standard_Failure) as err:
@@ -289,7 +276,7 @@ class Mixin3D(Shape[TOPODS]):
 
         return new_shape._made_by(
             ShapeHistory.from_algorithm(
-                chamfer_builder, [self.wrapped], new_shape.wrapped
+                chamfer_record, [self.wrapped], new_shape.wrapped
             )
         )
 
@@ -361,13 +348,9 @@ class Mixin3D(Shape[TOPODS]):
         """
         native_edges = [e.wrapped for e in edge_list]
 
-        fillet_builder = BRepFilletAPI_MakeFillet(self.wrapped)
-
-        for native_edge in native_edges:
-            fillet_builder.Add(radius, native_edge)
-
         try:
-            new_shape = self._make_3d_result(fillet_builder.Shape())
+            filleted, fillet_record = kernel.fillet(self.wrapped, native_edges, radius)
+            new_shape = self._make_3d_result(filleted)
             if not new_shape.is_valid:
                 raise Standard_Failure
         except (StdFail_NotDone, Standard_Failure) as err:
@@ -378,7 +361,7 @@ class Mixin3D(Shape[TOPODS]):
 
         return new_shape._made_by(
             ShapeHistory.from_algorithm(
-                fillet_builder, [self.wrapped], new_shape.wrapped
+                fillet_record, [self.wrapped], new_shape.wrapped
             )
         )
 
@@ -413,47 +396,37 @@ class Mixin3D(Shape[TOPODS]):
             raise ValueError("Kind.TANGENT not supported")
 
         kind_dict = {
-            Kind.ARC: GeomAbs_JoinType.GeomAbs_Arc,
-            Kind.INTERSECTION: GeomAbs_JoinType.GeomAbs_Intersection,
+            Kind.ARC: JoinKind.ARC,
+            Kind.INTERSECTION: JoinKind.INTERSECTION,
         }
 
-        occ_faces_list = List_TopoDS_Shape()
-        for face in faces:
-            occ_faces_list.Append(face.wrapped)
-
-        shell_builder = BRepOffsetAPI_MakeThickSolid()
-        shell_builder.MakeThickSolidByJoin(
+        shelled = kernel.thick_solid(
             self.wrapped,
-            occ_faces_list,
+            [face.wrapped for face in faces],
             thickness,
             tolerance,
-            Intersection=True,
-            Join=kind_dict[kind],
+            kind_dict[kind],
         )
-        shell_builder.Build()
-        shell_shape = shell_builder.Shape()
         # The kernel can report success and still hand back a null shape, and
         # any method on a null shape is a segfault
-        if shell_shape.IsNull():
+        if kernel.is_null(shelled):
             raise RuntimeError(
                 "hollow Error, an alternative kind may resolve this error"
             )
 
         if faces:
-            return_value = self.__class__.cast(shell_shape)
+            return_value = self.__class__.cast(shelled)
 
         else:  # if no faces provided a watertight solid will be constructed
-            shell1 = self.__class__.cast(shell_shape).shells()[0].wrapped
+            shell1 = self.__class__.cast(shelled).shells()[0].wrapped
             shell2 = self.shells()[0].wrapped  # pylint: disable=no-member
 
-            # s1 can be outer or inner shell depending on the thickness sign
             if thickness > 0:
-                sol = BRepBuilderAPI_MakeSolid(shell1, shell2)
+                sol = kernel.make_solid([shell1, shell2])
             else:
-                sol = BRepBuilderAPI_MakeSolid(shell2, shell1)
+                sol = kernel.make_solid([shell2, shell1])
 
-            # fix needed for the orientations
-            return_value = self.__class__.cast(sol.Shape()).fix()
+            return_value = self.__class__.cast(sol).fix()
 
         return return_value
 
@@ -664,36 +637,27 @@ class Mixin3D(Shape[TOPODS]):
             raise ValueError("Kind.TANGENT not supported")
 
         kind_dict = {
-            Kind.ARC: GeomAbs_JoinType.GeomAbs_Arc,
-            Kind.INTERSECTION: GeomAbs_JoinType.GeomAbs_Intersection,
+            Kind.ARC: JoinKind.ARC,
+            Kind.INTERSECTION: JoinKind.INTERSECTION,
             Kind.TANGENT: GeomAbs_JoinType.GeomAbs_Tangent,
         }
 
-        occ_faces_list = List_TopoDS_Shape()
-        for face in openings:
-            occ_faces_list.Append(face.wrapped)
-
-        offset_builder = BRepOffsetAPI_MakeThickSolid()
-        offset_builder.MakeThickSolidByJoin(
-            self.wrapped,
-            occ_faces_list,
-            thickness,
-            tolerance,
-            Intersection=True,
-            RemoveIntEdges=True,
-            Join=kind_dict[kind],
-        )
-        offset_builder.Build()
-
         try:
-            offset_occt_solid = offset_builder.Shape()
+            offset_occt_solid = kernel.thick_solid(
+                self.wrapped,
+                [face.wrapped for face in openings],
+                thickness,
+                tolerance,
+                kind_dict[kind],
+                remove_internal_edges=True,
+            )
         except (StdFail_NotDone, Standard_Failure) as err:
             raise RuntimeError(
                 "offset Error, an alternative kind may resolve this error"
             ) from err
         # The kernel can report success and still hand back a null shape, and
         # any method on a null shape is a segfault
-        if offset_occt_solid.IsNull():
+        if kernel.is_null(offset_occt_solid):
             raise RuntimeError(
                 "offset Error, an alternative kind may resolve this error"
             )
@@ -1430,16 +1394,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
         Returns:
             Solid: Box
         """
-        return cls(
-            TopoDS.Solid(
-                BRepPrimAPI_MakeBox(
-                    plane.to_gp_ax2(),
-                    length,
-                    width,
-                    height,
-                ).Shape()
-            )
-        )
+        return cls(kernel.make_box(plane.to_gp_ax2(), length, width, height))
 
     @classmethod
     def make_cone(
@@ -1465,14 +1420,8 @@ class Solid(Mixin3D[TopoDS_Solid]):
             Solid: Full or partial cone
         """
         return cls(
-            TopoDS.Solid(
-                BRepPrimAPI_MakeCone(
-                    plane.to_gp_ax2(),
-                    base_radius,
-                    top_radius,
-                    height,
-                    angle * DEG2RAD,
-                ).Shape()
+            kernel.make_cone(
+                plane.to_gp_ax2(), base_radius, top_radius, height, angle * DEG2RAD
             )
         )
 
@@ -1498,14 +1447,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
             Solid: Full or partial cylinder
         """
         return cls(
-            TopoDS.Solid(
-                BRepPrimAPI_MakeCylinder(
-                    plane.to_gp_ax2(),
-                    radius,
-                    height,
-                    angle * DEG2RAD,
-                ).Shape()
-            )
+            kernel.make_cylinder(plane.to_gp_ax2(), radius, height, angle * DEG2RAD)
         )
 
     @classmethod
@@ -1552,14 +1494,12 @@ class Solid(Mixin3D[TopoDS_Solid]):
             Solid: sphere
         """
         return cls(
-            TopoDS.Solid(
-                BRepPrimAPI_MakeSphere(
-                    plane.to_gp_ax2(),
-                    radius,
-                    angle1 * DEG2RAD,
-                    angle2 * DEG2RAD,
-                    angle3 * DEG2RAD,
-                ).Shape()
+            kernel.make_sphere(
+                plane.to_gp_ax2(),
+                radius,
+                angle1 * DEG2RAD,
+                angle2 * DEG2RAD,
+                angle3 * DEG2RAD,
             )
         )
 
@@ -1588,15 +1528,13 @@ class Solid(Mixin3D[TopoDS_Solid]):
             Solid: Full or partial torus
         """
         return cls(
-            TopoDS.Solid(
-                BRepPrimAPI_MakeTorus(
-                    plane.to_gp_ax2(),
-                    major_radius,
-                    minor_radius,
-                    start_angle * DEG2RAD,
-                    end_angle * DEG2RAD,
-                    major_angle * DEG2RAD,
-                ).Shape()
+            kernel.make_torus(
+                plane.to_gp_ax2(),
+                major_radius,
+                minor_radius,
+                start_angle * DEG2RAD,
+                end_angle * DEG2RAD,
+                major_angle * DEG2RAD,
             )
         )
 
@@ -1628,17 +1566,8 @@ class Solid(Mixin3D[TopoDS_Solid]):
             Solid: wedge
         """
         return cls(
-            TopoDS.Solid(
-                BRepPrimAPI_MakeWedge(
-                    plane.to_gp_ax2(),
-                    delta_x,
-                    delta_y,
-                    delta_z,
-                    min_x,
-                    min_z,
-                    max_x,
-                    max_z,
-                ).Solid()
+            kernel.make_wedge(
+                plane.to_gp_ax2(), delta_x, delta_y, delta_z, min_x, min_z, max_x, max_z
             )
         )
 
@@ -1670,14 +1599,11 @@ class Solid(Mixin3D[TopoDS_Solid]):
         else:
             section_face = section
 
-        revol_builder = BRepPrimAPI_MakeRevol(
-            section_face.wrapped,
-            axis.wrapped,
-            angle * DEG2RAD,
-            True,
+        return cls(
+            TopoDS.Solid(
+                kernel.revolve(section_face.wrapped, axis.wrapped, angle * DEG2RAD)
+            )
         )
-
-        return cls(TopoDS.Solid(revol_builder.Shape()))
 
     @classmethod
     def sweep(
@@ -1732,25 +1658,23 @@ class Solid(Mixin3D[TopoDS_Solid]):
 
         shapes: list[Mixin3D[TopoDS_Shape]] = []
         for wire in [outer_wire] + inner_wires:
-            builder = BRepOffsetAPI_MakePipeShell(Wire(path).wrapped)
-
-            rotate = False
-
-            # handle sweep mode
-            if mode:
-                rotate = Solid._set_sweep_mode(builder, path, mode)
-            else:
-                builder.SetMode(is_frenet)
-
-            builder.SetTransitionMode(Shape._transModeDict[transition])
-
-            builder.Add(wire.wrapped, False, rotate)
-
-            builder.Build()
-            if make_solid:
-                builder.MakeSolid()
-
-            shapes.append(Mixin3D.cast(builder.Shape()))
+            binormal = binormal_origin = auxiliary_spine = None
+            if isinstance(mode, Vector):
+                binormal = tuple(mode)
+                binormal_origin = tuple(path.start_point())
+            elif isinstance(mode, (Wire, Edge)):
+                auxiliary_spine = Wire(mode).wrapped
+            swept = kernel.sweep(
+                wire.wrapped,
+                Wire(path).wrapped,
+                is_frenet=is_frenet,
+                transition=SweepTransition[transition.name],
+                make_solid=make_solid,
+                binormal=binormal,
+                binormal_origin=binormal_origin,
+                auxiliary_spine=auxiliary_spine,
+            )
+            shapes.append(Mixin3D.cast(swept))
 
         outer_shape, inner_shapes = shapes[0], shapes[1:]
 
@@ -1902,7 +1826,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
             raise RuntimeError("Error applying thicken to given surface") from err
         # The kernel can report success and still hand back a null shape, and
         # any method on a null shape is a segfault
-        if thickened.IsNull():
+        if kernel.is_null(thickened):
             raise RuntimeError("Error applying thicken to given surface")
 
         return Solid(TopoDS.Solid(thickened))

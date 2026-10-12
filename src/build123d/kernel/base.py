@@ -92,7 +92,270 @@ class BoolOp(Enum):
     SPLIT = "split"
 
 
-class Kernel(ABC):
+class JoinKind(Enum):
+    """How offset faces meet at a convex edge."""
+
+    ARC = "arc"
+    INTERSECTION = "intersection"
+
+
+class SweepTransition(Enum):
+    """How a swept profile turns a corner of its path."""
+
+    TRANSFORMED = "transformed"
+    ROUND = "round"
+    RIGHT = "right"
+
+
+Point = tuple[float, float, float]
+
+
+class CurveView(ABC):
+    """Read-only parametric access to the curve under an edge or wire.
+
+    Parameters are the backend's native ones; ``first``/``last`` bound them.
+    ``geom_type`` is the name of the build123d ``GeomType`` member.
+    """
+
+    geom_type: str
+    first: float
+    last: float
+
+    @abstractmethod
+    def is_periodic(self) -> bool: ...
+
+    @abstractmethod
+    def period(self) -> float: ...
+
+    @abstractmethod
+    def value(self, t: float) -> Point: ...
+
+    @abstractmethod
+    def d1(self, t: float) -> tuple[Point, Point]:
+        """Point and first derivative at ``t``."""
+
+    @abstractmethod
+    def length(self, t0: float | None = None, t1: float | None = None) -> float:
+        """Arc length over ``[t0, t1]``, the whole curve by default."""
+
+    @abstractmethod
+    def param_at_length(self, length: float, t0: float | None = None) -> float:
+        """The parameter ``length`` along the curve from ``t0`` (``first`` by default)."""
+
+    @abstractmethod
+    def closest_param(self, point: Point) -> float:
+        """The parameter of the point on the curve nearest ``point``."""
+
+    @abstractmethod
+    def positions_by_deflection(self, deflection: float) -> list[Point]:
+        """Points along the curve whose polyline stays within ``deflection``."""
+
+    @abstractmethod
+    def circle(self) -> tuple[Point, Point, float]:
+        """Centre, axis direction and radius; only for a CIRCLE curve."""
+
+    @abstractmethod
+    def ellipse(self) -> tuple[Point, Point, float, float]:
+        """Centre, axis direction, major and minor radii; only for an ELLIPSE."""
+
+
+class SurfaceView(ABC):
+    """Read-only parametric access to the surface under a face.
+
+    Normals follow the face's orientation (they point out of a solid).
+    """
+
+    geom_type: str
+
+    @abstractmethod
+    def uv_bounds(self) -> tuple[float, float, float, float]:
+        """``(umin, umax, vmin, vmax)`` of the face's parameter domain."""
+
+    @abstractmethod
+    def is_u_periodic(self) -> bool: ...
+
+    @abstractmethod
+    def is_v_periodic(self) -> bool: ...
+
+    @abstractmethod
+    def u_period(self) -> float: ...
+
+    @abstractmethod
+    def v_period(self) -> float: ...
+
+    @abstractmethod
+    def value(self, u: float, v: float) -> Point: ...
+
+    @abstractmethod
+    def d1(self, u: float, v: float) -> tuple[Point, Point, Point]:
+        """Point and the two first partial derivatives at ``(u, v)``."""
+
+    @abstractmethod
+    def dn(self, u: float, v: float, u_order: int, v_order: int) -> Point:
+        """The mixed partial derivative of the given orders at ``(u, v)``."""
+
+    @abstractmethod
+    def normal(self, u: float, v: float) -> tuple[Point, Point]:
+        """Point and (unnormalised) face-oriented normal at ``(u, v)``."""
+
+    @abstractmethod
+    def closest_uv(self, point: Point) -> tuple[float, float]:
+        """Parameters of the point on the surface nearest ``point``."""
+
+    @abstractmethod
+    def plane(self) -> tuple[Point, Point, Point] | None:
+        """``(origin, normal, x_dir)`` of a right-handed plane the surface lies in,
+        or None when it is not planar within tolerance."""
+
+    @abstractmethod
+    def radius(self) -> float:
+        """Radius of a CYLINDER or SPHERE surface."""
+
+    @abstractmethod
+    def semi_angle(self) -> float:
+        """Half angle in radians of a CONE surface."""
+
+    @abstractmethod
+    def torus_radii(self) -> tuple[float, float]:
+        """Major and minor radii of a TORUS surface."""
+
+
+class KernelGeometry(ABC):
+    """Curve/surface views, construction and tessellation: the second half of
+    the facade, kept on a mixin so ``Kernel`` stays readable."""
+
+    # ---- views --------------------------------------------------------------
+
+    @abstractmethod
+    def curve_of(self, shape: Handle) -> CurveView:
+        """The curve under an edge, or the composite curve of a wire."""
+
+    @abstractmethod
+    def surface_of(self, face: Handle) -> SurfaceView:
+        """The surface under a face, with the face's placement applied."""
+
+    # ---- construction -------------------------------------------------------
+
+    @abstractmethod
+    def make_box(
+        self, frame: Handle, length: float, width: float, height: float
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_cylinder(
+        self, frame: Handle, radius: float, height: float, angle: float
+    ) -> Handle:
+        """``angle`` in radians; a full cylinder is 2*pi."""
+
+    @abstractmethod
+    def make_cone(
+        self,
+        frame: Handle,
+        base_radius: float,
+        top_radius: float,
+        height: float,
+        angle: float,
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_sphere(
+        self, frame: Handle, radius: float, angle1: float, angle2: float, angle3: float
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_torus(
+        self,
+        frame: Handle,
+        major_radius: float,
+        minor_radius: float,
+        angle1: float,
+        angle2: float,
+        angle3: float,
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_wedge(
+        self,
+        frame: Handle,
+        delta_x: float,
+        delta_y: float,
+        delta_z: float,
+        min_x: float,
+        min_z: float,
+        max_x: float,
+        max_z: float,
+    ) -> Handle: ...
+
+    @abstractmethod
+    def extrude(self, shape: Handle, direction: Point) -> Handle:
+        """Sweep ``shape`` linearly along ``direction`` (its length is the distance)."""
+
+    @abstractmethod
+    def revolve(self, shape: Handle, axis: Handle, angle: float) -> Handle:
+        """Revolve ``shape`` about ``axis`` by ``angle`` radians."""
+
+    @abstractmethod
+    def loft(self, sections: Sequence[Handle], solid: bool, ruled: bool) -> Handle:
+        """Skin ``sections`` (wires, with an optional vertex at either end)."""
+
+    @abstractmethod
+    def sweep(
+        self,
+        profile: Handle,
+        path: Handle,
+        *,
+        is_frenet: bool,
+        transition: SweepTransition,
+        make_solid: bool,
+        binormal: Point | None = None,
+        binormal_origin: Point | None = None,
+        auxiliary_spine: Handle | None = None,
+    ) -> Handle:
+        """Sweep a wire profile along a wire path."""
+
+    @abstractmethod
+    def fillet(
+        self, shape: Handle, edges: Sequence[Handle], radius: float
+    ) -> tuple[Handle, Any]:
+        """Round ``edges`` of ``shape``; returns the result and the history record."""
+
+    @abstractmethod
+    def chamfer(
+        self, shape: Handle, specs: Sequence[tuple[Handle, Handle, float, float]]
+    ) -> tuple[Handle, Any]:
+        """Bevel edges: each spec is ``(edge, reference_face, distance1, distance2)``."""
+
+    @abstractmethod
+    def thick_solid(
+        self,
+        shape: Handle,
+        openings: Sequence[Handle],
+        thickness: float,
+        tolerance: float,
+        join: JoinKind,
+        remove_internal_edges: bool = False,
+    ) -> Handle:
+        """Offset the faces of ``shape`` by ``thickness``, leaving ``openings`` open."""
+
+    @abstractmethod
+    def make_solid(self, shells: Sequence[Handle]) -> Handle:
+        """A solid bounded by ``shells`` (the first outer, the rest voids)."""
+
+    # ---- tessellation -------------------------------------------------------
+
+    @abstractmethod
+    def mesh(self, shape: Handle, tolerance: float, angular_tolerance: float) -> None:
+        """Make sure ``shape`` carries a triangulation at least this fine."""
+
+    @abstractmethod
+    def face_triangulation(
+        self, face: Handle
+    ) -> tuple[list[Point], list[tuple[int, int, int]]] | None:
+        """The face's triangulation in world coordinates, triangles wound to
+        follow the face's orientation; None when the face has none."""
+
+
+class Kernel(KernelGeometry):
     """What build123d asks of a B-rep kernel.
 
     Methods take and return opaque handles. A backend is free to represent a

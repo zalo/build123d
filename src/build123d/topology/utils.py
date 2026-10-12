@@ -64,8 +64,6 @@ from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.BRepTools import BRepTools
 from OCP.BRepLib import BRepLib_FindSurface
-from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
-from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
 from OCP.GProp import GProp_GProps
 from OCP.gp import gp_Pnt, gp_Vec
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
@@ -215,8 +213,7 @@ def _extrude_topods_shape(obj: TopoDS_Shape, direction: VectorLike) -> TopoDS_Sh
     ):
         raise ValueError(f"extrude not supported for {type(obj)}")
 
-    prism_builder = BRepPrimAPI_MakePrism(obj, direction.wrapped)
-    extrusion = downcast(prism_builder.Shape())
+    extrusion = kernel.extrude(obj, tuple(direction))
     shape_type = extrusion.ShapeType()
     if shape_type == TopAbs_ShapeEnum.TopAbs_COMPSOLID:
         solids = [
@@ -277,17 +274,7 @@ def _make_loft(
                 "The vertices must be at the beginning and end of the list"
             )
 
-    loft_builder = BRepOffsetAPI_ThruSections(filled, ruled)
-
-    for obj in objs:
-        if isinstance(obj.wrapped, TopoDS_Vertex):
-            loft_builder.AddVertex(obj.wrapped)
-        elif isinstance(obj.wrapped, TopoDS_Wire):
-            loft_builder.AddWire(obj.wrapped)
-
-    loft_builder.Build()
-
-    return loft_builder.Shape()
+    return kernel.loft([obj.wrapped for obj in objs], filled, ruled)
 
 
 def _make_topods_face_from_wires(
