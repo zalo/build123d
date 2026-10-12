@@ -85,7 +85,6 @@ from OCP.GProp import GProp_GProps
 
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import (
-    TopoDS,
     TopoDS_Compound,
     TopoDS_Edge,
     TopoDS_Face,
@@ -2140,7 +2139,10 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if not isinstance(tool, Plane):
             # Get a TopoDS_Face to work with from the tool
             if kernel.is_kind(trim_tool, TopoKind.SHELL):
-                tool_face = TopoDS.Face(kernel.sub_shapes(trim_tool, TopoKind.FACE)[0])
+                tool_face = tcast(
+                    TopoDS_Face,
+                    downcast(kernel.sub_shapes(trim_tool, TopoKind.FACE)[0]),
+                )
             else:
                 tool_face = trim_tool
 

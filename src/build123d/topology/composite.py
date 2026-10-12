@@ -58,6 +58,7 @@ import copy
 from collections.abc import Iterable, Iterator, Sequence
 from itertools import combinations
 from os import PathLike, fspath
+from typing import cast as tcast
 from typing import ClassVar
 from typing_extensions import Self
 
@@ -79,7 +80,6 @@ from OCP.NCollection import NCollection_String
 from OCP.StdPrs import StdPrs_BRepTextBuilder as Font_BRepTextBuilder, StdPrs_BRepFont
 
 from OCP.TopoDS import (
-    TopoDS,
     TopoDS_Compound,
 )
 
@@ -225,7 +225,11 @@ class Compound(Mixin3D[TopoDS_Compound]):
         Returns:
             Edge: extruded shape
         """
-        return Compound(TopoDS.Compound(_extrude_topods_shape(obj.wrapped, direction)))
+        return Compound(
+            tcast(
+                TopoDS_Compound, downcast(_extrude_topods_shape(obj.wrapped, direction))
+            )
+        )
 
     @staticmethod
     def resolve_font(
@@ -389,14 +393,17 @@ class Compound(Mixin3D[TopoDS_Compound]):
             brep_font.SetCompositeCurveMode(False)
 
         text_flat = Compound(
-            TopoDS.Compound(
-                builder.Perform(
-                    brep_font,
-                    NCollection_String(txt),
-                    gp_Ax3(),
-                    horiz_align,
-                    vert_align,
-                )
+            tcast(
+                TopoDS_Compound,
+                downcast(
+                    builder.Perform(
+                        brep_font,
+                        NCollection_String(txt),
+                        gp_Ax3(),
+                        horiz_align,
+                        vert_align,
+                    )
+                ),
             )
         )
 

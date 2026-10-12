@@ -55,12 +55,13 @@ from __future__ import annotations
 
 import itertools
 
+from typing import cast as tcast
 from typing import ClassVar, overload, TYPE_CHECKING
 
 from collections.abc import Iterable
 
 
-from OCP.TopoDS import TopoDS, TopoDS_Face, TopoDS_Vertex, TopoDS_Edge
+from OCP.TopoDS import TopoDS_Face, TopoDS_Vertex, TopoDS_Edge
 
 from build123d.geometry import (
     TOLERANCE,
@@ -192,7 +193,7 @@ class Vertex(Shape[TopoDS_Vertex]):
         """The innermost face this vertex was selected through, if any."""
         for step in reversed(self.topo_path):
             if not step.is_empty and kernel.is_kind(step.wrapped, TopoKind.FACE):
-                return TopoDS.Face(step.wrapped)
+                return tcast(TopoDS_Face, downcast(step.wrapped))
         return None
 
     def _only_face(self) -> TopoDS_Face | None:
@@ -210,7 +211,7 @@ class Vertex(Shape[TopoDS_Vertex]):
             return None
         holding = []
         for topods_face in kernel.sub_shapes(parent.wrapped, TopoKind.FACE):
-            face = TopoDS.Face(topods_face)
+            face = tcast(TopoDS_Face, downcast(topods_face))
             if any(
                 kernel.is_same(vertex, self.wrapped)
                 for vertex in kernel.sub_shapes(face, TopoKind.VERTEX)
@@ -235,7 +236,7 @@ class Vertex(Shape[TopoDS_Vertex]):
         seen: list[TopoDS_Edge] = []
         directions: list[tuple[float, float]] = []
         for topods_edge in kernel.sub_shape_uses(face, TopoKind.EDGE):
-            edge = TopoDS.Edge(topods_edge)
+            edge = tcast(TopoDS_Edge, downcast(topods_edge))
             if any(kernel.is_same(edge, other) for other in seen):
                 continue  # a seam edge is met once per side
             seen.append(edge)
@@ -501,7 +502,9 @@ def topo_explore_common_vertex(
         for vertex2 in kernel.sub_shapes(topods_edge2, TopoKind.VERTEX):
             # Check if the vertices are the same
             if kernel.is_same(vertex1, vertex2):
-                return Vertex(TopoDS.Vertex(vertex1))  # Common vertex found
+                return Vertex(
+                    tcast(TopoDS_Vertex, downcast(vertex1))
+                )  # Common vertex found
 
     return Vertex()  # No common vertex found
 

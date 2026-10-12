@@ -57,6 +57,7 @@ from __future__ import annotations
 import warnings
 from collections.abc import Iterable
 from math import radians, tan
+from typing import cast as tcast
 from typing import TYPE_CHECKING, ClassVar, cast
 
 from bd_materials import FinishedMaterial
@@ -162,11 +163,12 @@ class Mixin3D(Shape[TOPODS]):
 
         if kernel.is_kind(result, TopoKind.COMPOUND):
             solids = ShapeList(
-                Solid(TopoDS.Solid(s)) for s in get_top_level_topods_shapes(result)
+                Solid(tcast(TopoDS_Solid, downcast(s)))
+                for s in get_top_level_topods_shapes(result)
             )
             return cast("Part", Shape.make_composite(solids, 3))
 
-        return Solid(TopoDS.Solid(result))
+        return Solid(tcast(TopoDS_Solid, downcast(result)))
 
     # ---- Instance Methods ----
 
@@ -630,7 +632,9 @@ class Mixin3D(Shape[TOPODS]):
             )
 
         if kernel.is_kind(offset_occt_solid, TopoKind.SOLID):
-            offset_occt_solid = _forward_solid(TopoDS.Solid(offset_occt_solid))
+            offset_occt_solid = _forward_solid(
+                tcast(TopoDS_Solid, downcast(offset_occt_solid))
+            )
         offset_solid = self.__class__.cast(offset_occt_solid)
         assert not offset_solid.is_empty
 
@@ -687,7 +691,7 @@ def _forward_solid(solid: TopoDS_Solid) -> TopoDS_Solid:
     forward_shells = [
         kernel.make_shell(kernel.direct_children(shell)) for shell in shells
     ]
-    return TopoDS.Solid(kernel.make_solid(forward_shells))
+    return tcast(TopoDS_Solid, downcast(kernel.make_solid(forward_shells)))
 
 
 class Solid(Mixin3D[TopoDS_Solid]):
@@ -961,7 +965,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
     @classmethod
     def _make_solid(cls, shell: Shell) -> TopoDS_Solid:
         """Create a Solid object from the surface shell"""
-        return TopoDS.Solid(kernel.solid_from_shell(shell.wrapped))
+        return tcast(TopoDS_Solid, downcast(kernel.solid_from_shell(shell.wrapped)))
 
     @classmethod
     def extrude(cls, obj: Face, direction: VectorLike) -> Solid:
@@ -979,7 +983,9 @@ class Solid(Mixin3D[TopoDS_Solid]):
         Returns:
             Edge: extruded shape
         """
-        return Solid(TopoDS.Solid(_extrude_topods_shape(obj.wrapped, direction)))
+        return Solid(
+            tcast(TopoDS_Solid, downcast(_extrude_topods_shape(obj.wrapped, direction)))
+        )
 
     @classmethod
     def extrude_linear_with_rotation(
@@ -1070,11 +1076,12 @@ class Solid(Mixin3D[TopoDS_Solid]):
 
         # convert to a TopoDS_Solid - might be wrapped in a TopoDS_Compound
         if kernel.is_kind(difference, TopoKind.COMPOUND):
-            result = TopoDS.Solid(
-                unwrap_topods_compound(TopoDS.Compound(difference), True)
+            result = tcast(
+                TopoDS_Solid,
+                downcast(unwrap_topods_compound(TopoDS.Compound(difference), True)),
             )
         else:
-            result = TopoDS.Solid(difference)
+            result = tcast(TopoDS_Solid, downcast(difference))
 
         return Solid(result)
 
@@ -1122,7 +1129,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
             angle = -taper if i > 0 and not flip_inner else taper
             for edge in wire.edges():
                 for side in generated.get(edge.wrapped):
-                    side_faces.append((TopoDS.Face(side), angle))
+                    side_faces.append((tcast(TopoDS_Face, downcast(side)), angle))
 
         along_normal = abs(pull.dot(profile.normal_at())) > 1 - TOLERANCE
         draftable = {GeomType.PLANE, GeomType.CYLINDER, GeomType.CONE}
@@ -1139,7 +1146,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
                     tuple(pull),
                     neutral_plane,
                 )
-                new_solid = Solid(TopoDS.Solid(drafted))
+                new_solid = Solid(tcast(TopoDS_Solid, downcast(drafted)))
             except DraftFailure:
                 # The draft cannot build every taper that a loft can
                 new_solid = None
@@ -1257,9 +1264,9 @@ class Solid(Mixin3D[TopoDS_Solid]):
         # Find the faces from the intersection that originated on the target
         modified_target_faces = []
         for topods_face in kernel.sub_shapes(target.wrapped, TopoKind.FACE):
-            target_face = TopoDS.Face(topods_face)
+            target_face = tcast(TopoDS_Face, downcast(topods_face))
             for modified in list_shapes(history.Modified(target_face)):
-                modified_target_faces.append(TopoDS.Face(modified))
+                modified_target_faces.append(tcast(TopoDS_Face, downcast(modified)))
 
         # 3: Sew the resulting faces into shells - one for each surface the extrusion
         #    passes through and sort by distance from the profile
@@ -1399,7 +1406,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
         Returns:
             Solid: Lofted object
         """
-        return cls(TopoDS.Solid(_make_loft(objs, True, ruled)))
+        return cls(tcast(TopoDS_Solid, downcast(_make_loft(objs, True, ruled))))
 
     @classmethod
     def make_sphere(
@@ -1531,8 +1538,11 @@ class Solid(Mixin3D[TopoDS_Solid]):
             section_face = section
 
         return cls(
-            TopoDS.Solid(
-                kernel.revolve(section_face.wrapped, axis.wrapped, angle * DEG2RAD)
+            tcast(
+                TopoDS_Solid,
+                downcast(
+                    kernel.revolve(section_face.wrapped, axis.wrapped, angle * DEG2RAD)
+                ),
             )
         )
 
@@ -1675,23 +1685,26 @@ class Solid(Mixin3D[TopoDS_Solid]):
             auxiliary_spine = Wire(binormal).wrapped
 
         swept = cls(
-            TopoDS.Solid(
-                kernel.sweep_multi(
-                    [
-                        (
-                            profile.wrapped
-                            if isinstance(profile, Wire)
-                            else profile.outer_wire().wrapped
-                        )
-                        for profile in profiles
-                    ],
-                    path_as_wire,
-                    is_frenet=is_frenet,
-                    make_solid=make_solid,
-                    binormal=binormal_direction,
-                    binormal_origin=binormal_origin,
-                    auxiliary_spine=auxiliary_spine,
-                )
+            tcast(
+                TopoDS_Solid,
+                downcast(
+                    kernel.sweep_multi(
+                        [
+                            (
+                                profile.wrapped
+                                if isinstance(profile, Wire)
+                                else profile.outer_wire().wrapped
+                            )
+                            for profile in profiles
+                        ],
+                        path_as_wire,
+                        is_frenet=is_frenet,
+                        make_solid=make_solid,
+                        binormal=binormal_direction,
+                        binormal_origin=binormal_origin,
+                        auxiliary_spine=auxiliary_spine,
+                    )
+                ),
             )
         )
         # The kernel reports success for a sweep that folds over itself
@@ -1759,7 +1772,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
         if kernel.is_null(thickened):
             raise RuntimeError("Error applying thicken to given surface")
 
-        return Solid(TopoDS.Solid(thickened))
+        return Solid(tcast(TopoDS_Solid, downcast(thickened)))
 
     def draft(self, faces: Iterable[Face], neutral_plane: Plane, angle: float) -> Solid:
         """A        pply a draft angle to the given faces of the solid.
@@ -1791,7 +1804,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
                 tuple(neutral_plane.z_dir),
                 neutral_plane.wrapped,
             )
-            result = Solid(TopoDS.Solid(drafted))
+            result = Solid(tcast(TopoDS_Solid, downcast(drafted)))
         except DraftFailure as err:
             if err.stage == "add":
                 raise DraftAngleError(

@@ -84,7 +84,6 @@ from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
 
 
 from OCP.TopoDS import (
-    TopoDS,
     TopoDS_Compound,
     TopoDS_Edge,
     TopoDS_Face,
@@ -92,6 +91,7 @@ from OCP.TopoDS import (
     TopoDS_Vertex,
     TopoDS_Wire,
 )
+
 from scipy.optimize import minimize_scalar
 from scipy.spatial import ConvexHull
 from typing_extensions import Self
@@ -222,7 +222,8 @@ def _split_edge_at_vertex(edge: Edge, split_vertex: Vertex) -> list[TopoDS_Edge]
         BoolOp.SPLIT, [edge.wrapped], [split_vertex.wrapped]
     )
     split_edges = [
-        TopoDS.Edge(edge) for edge in kernel.sub_shapes(split_shape, TopoKind.EDGE)
+        tcast(TopoDS_Edge, downcast(edge))
+        for edge in kernel.sub_shapes(split_shape, TopoKind.EDGE)
     ]
 
     return split_edges
@@ -1689,7 +1690,9 @@ class Edge(Mixin1D[TopoDS_Edge]):
         """
         if not obj:
             raise ValueError("Can't extrude empty vertex")
-        return Edge(TopoDS.Edge(_extrude_topods_shape(obj.wrapped, direction)))
+        return Edge(
+            tcast(TopoDS_Edge, downcast(_extrude_topods_shape(obj.wrapped, direction)))
+        )
 
     @classmethod
     def make_bezier(
@@ -3929,7 +3932,7 @@ class Wire(Mixin1D[TopoDS_Wire]):
         for topods_edge in kernel.sub_shapes(self.wrapped, TopoKind.EDGE):
             if kernel.hash_key(topods_edge) not in explored:
                 explored.add(kernel.hash_key(topods_edge))
-                missing_edge = Edge(TopoDS.Edge(topods_edge))
+                missing_edge = Edge(tcast(TopoDS_Edge, downcast(topods_edge)))
                 missing_edge._extracted_from(self)
                 edge_list.append(missing_edge)
         return self._select(edge_list, select)
@@ -3997,7 +4000,12 @@ class Wire(Mixin1D[TopoDS_Wire]):
         # located() returns a new shape, so `transformed` keeps its own location
         # and the move can be recorded against it
         final_wire = Wire(
-            TopoDS.Wire(kernel.located(transformed, kernel.location_of(self._wrapped)))
+            tcast(
+                TopoDS_Wire,
+                downcast(
+                    kernel.located(transformed, kernel.location_of(self._wrapped))
+                ),
+            )
         )
         record.merge(ShapeHistory.from_relocation(transformed, final_wire.wrapped))
 
@@ -4534,7 +4542,7 @@ def topo_explore_connected_edges(
     parent_edge = find_same_topods(edge.wrapped, topods_edges)
     if parent_edge is None:
         return ShapeList()
-    given_topods_edge = TopoDS.Edge(parent_edge)
+    given_topods_edge = tcast(TopoDS_Edge, downcast(parent_edge))
     relocation = relocation_between(given_topods_edge, edge.wrapped)
 
     for topods_edge in topods_edges:
@@ -4563,7 +4571,9 @@ def topo_explore_connected_edges(
 
     if relocation.IsIdentity():
         return ShapeList(Edge(e) for e in connected_edges)
-    return ShapeList(Edge(TopoDS.Edge(e.Moved(relocation))) for e in connected_edges)
+    return ShapeList(
+        Edge(tcast(TopoDS_Edge, downcast(e.Moved(relocation)))) for e in connected_edges
+    )
 
 
 def _edge_is_seam_of(edge: TopoDS_Edge, face: TopoDS_Face) -> bool:
@@ -4581,7 +4591,7 @@ def _edge_as_bounded_by(face: TopoDS_Face, edge: TopoDS_Edge) -> TopoDS_Edge:
     """``edge`` with the orientation it has in ``face``'s boundary."""
     for use in kernel.sub_shape_uses(face, TopoKind.EDGE):
         if kernel.is_same(use, edge):
-            return TopoDS.Edge(use)
+            return tcast(TopoDS_Edge, downcast(use))
     raise ValueError("edge is not on the face")
 
 
@@ -4675,7 +4685,8 @@ def topo_explore_connected_faces(
     for face in edge_face_map.get(parent_edge):
         unique_faces.setdefault(kernel.hash_key(face), face)
     return [
-        TopoDS.Face(kernel.moved(face, relocation)) for face in unique_faces.values()
+        tcast(TopoDS_Face, downcast(kernel.moved(face, relocation)))
+        for face in unique_faces.values()
     ]
 
 

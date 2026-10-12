@@ -60,7 +60,6 @@ from collections.abc import Iterable
 
 
 from OCP.TopoDS import (
-    TopoDS,
     TopoDS_Face,
     TopoDS_Shape,
     TopoDS_Shell,
@@ -68,6 +67,7 @@ from OCP.TopoDS import (
     TopoDS_Edge,
     TopoDS_Wire,
 )
+
 
 from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.geometry import TOLERANCE, BoundBox, Vector, VectorLike
@@ -152,10 +152,10 @@ def _topods_material_side(face: TopoDS_Face, edge: TopoDS_Edge) -> Vector:
     occurrence = None
     for use in kernel.sub_shape_uses(face, TopoKind.EDGE):
         if kernel.is_same(use, edge):
-            occurrence = TopoDS.Edge(use)
+            occurrence = tcast(TopoDS_Edge, downcast(use))
             break
         if occurrence is None and kernel.is_partner(use, edge):
-            occurrence = TopoDS.Edge(use)
+            occurrence = tcast(TopoDS_Edge, downcast(use))
     if occurrence is None:
         raise ValueError("the edge is not an edge of the face")
     curve = kernel.curve_of(occurrence)

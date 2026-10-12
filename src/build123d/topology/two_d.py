@@ -95,13 +95,13 @@ from OCP.collections import (
 
 
 from OCP.TopoDS import (
-    TopoDS,
     TopoDS_Edge,
     TopoDS_Face,
     TopoDS_Shape,
     TopoDS_Shell,
     TopoDS_Solid,
 )
+
 
 from ocp_gordon import interpolate_curve_network
 from typing_extensions import Self
@@ -1300,7 +1300,9 @@ class Face(Mixin2D[TopoDS_Face]):
         """
         if not obj:
             raise ValueError("Can't extrude empty object")
-        return Face(TopoDS.Face(_extrude_topods_shape(obj.wrapped, direction)))
+        return Face(
+            tcast(TopoDS_Face, downcast(_extrude_topods_shape(obj.wrapped, direction)))
+        )
 
     @classmethod
     def make_bezier_surface(
@@ -1737,7 +1739,7 @@ class Face(Mixin2D[TopoDS_Face]):
                 patch.add_point(tuple(Vector(point)))
 
         try:
-            result = cls(TopoDS.Face(patch.build()))
+            result = cls(tcast(TopoDS_Face, downcast(patch.build())))
         except kernel.failure_types as err:
             raise RuntimeError(
                 "Error building non-planar face with provided constraints"
@@ -2467,7 +2469,7 @@ class Face(Mixin2D[TopoDS_Face]):
             )
             if not topods_shape.IsNull():
                 intersected_shapes.extend(
-                    Face(TopoDS.Face(topods_face))
+                    Face(tcast(TopoDS_Face, downcast(topods_face)))
                     for topods_face in get_top_level_topods_shapes(topods_shape)
                 )
         else:
@@ -2478,7 +2480,9 @@ class Face(Mixin2D[TopoDS_Face]):
                     BoolOp.COMMON,
                 )
                 for topods_shell in get_top_level_topods_shapes(topods_shape):
-                    intersected_shapes.append(Shell(TopoDS.Shell(topods_shell)))
+                    intersected_shapes.append(
+                        Shell(tcast(TopoDS_Shell, downcast(topods_shell)))
+                    )
 
         intersected_shapes = intersected_shapes.sort_by(Axis(self.center(), direction))
         projected_shapes: ShapeList[Face | Shell] = ShapeList()
@@ -2510,7 +2514,7 @@ class Face(Mixin2D[TopoDS_Face]):
             self._wrapped, [hole_wire.wrapped for hole_wire in inner_wires]
         )
         # pylint: disable=attribute-defined-outside-init
-        holeless.wrapped = TopoDS.Face(modified_shape)
+        holeless.wrapped = tcast(TopoDS_Face, downcast(modified_shape))
         return holeless
 
     def uv_frame(self, location: Location, tolerance: float = 1e-4) -> UVFrame:
@@ -2961,7 +2965,9 @@ class Shell(Mixin2D[TopoDS_Shell]):
         Returns:
             Edge: extruded shape
         """
-        return Shell(TopoDS.Shell(_extrude_topods_shape(obj.wrapped, direction)))
+        return Shell(
+            tcast(TopoDS_Shell, downcast(_extrude_topods_shape(obj.wrapped, direction)))
+        )
 
     @classmethod
     def make_loft(cls, objs: Iterable[Vertex | Wire], ruled: bool = False) -> Shell:
@@ -2981,7 +2987,7 @@ class Shell(Mixin2D[TopoDS_Shell]):
         Returns:
             Shell: Lofted object
         """
-        return cls(TopoDS.Shell(_make_loft(objs, False, ruled)))
+        return cls(tcast(TopoDS_Shell, downcast(_make_loft(objs, False, ruled))))
 
     @classmethod
     def revolve(
@@ -3004,7 +3010,12 @@ class Shell(Mixin2D[TopoDS_Shell]):
         """
         profile = Wire(profile.edges())
         return cls(
-            TopoDS.Shell(kernel.revolve(profile.wrapped, axis.wrapped, angle * DEG2RAD))
+            tcast(
+                TopoDS_Shell,
+                downcast(
+                    kernel.revolve(profile.wrapped, axis.wrapped, angle * DEG2RAD)
+                ),
+            )
         )
 
     @classmethod
@@ -3030,14 +3041,17 @@ class Shell(Mixin2D[TopoDS_Shell]):
         profile = Wire(profile.edges())
         path = Wire(Wire(path.edges()).order_edges())
         result = Shell(
-            TopoDS.Shell(
-                kernel.sweep(
-                    profile.wrapped,
-                    path.wrapped,
-                    is_frenet=False,
-                    transition=SweepTransition[transition.name],
-                    make_solid=False,
-                )
+            tcast(
+                TopoDS_Shell,
+                downcast(
+                    kernel.sweep(
+                        profile.wrapped,
+                        path.wrapped,
+                        is_frenet=False,
+                        transition=SweepTransition[transition.name],
+                        make_solid=False,
+                    )
+                ),
             )
         )
         if SkipClean.clean:
