@@ -61,17 +61,50 @@ from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS, TopoDS_Shape
 
 from OCP.BRep import BRep_Tool
+from OCP.BRep import BRep_Builder
 from OCP.BRepAdaptor import (
     BRepAdaptor_CompCurve,
     BRepAdaptor_Curve,
     BRepAdaptor_Surface,
 )
 from OCP.BRepBuilderAPI import (
+    BRepBuilderAPI_DisconnectedWire,
+    BRepBuilderAPI_EmptyWire,
+    BRepBuilderAPI_GTransform,
+    BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakeSolid,
+    BRepBuilderAPI_MakeVertex,
+    BRepBuilderAPI_MakeWire,
+    BRepBuilderAPI_NonManifoldWire,
     BRepBuilderAPI_RightCorner,
     BRepBuilderAPI_RoundCorner,
+    BRepBuilderAPI_Sewing,
+    BRepBuilderAPI_Transform,
     BRepBuilderAPI_Transformed,
 )
+from OCP.BRepClass3d import BRepClass3d_SolidClassifier
+from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+from OCP.BRepLib import BRepLib_FindSurface
+from OCP.IntTools import IntTools_FClass2d
+from OCP.ShapeFix import ShapeFix_Face
+from OCP.Standard import (
+    Standard_ConstructionError,
+    Standard_DomainError,
+    Standard_Failure,
+    Standard_NoSuchObject,
+)
+from OCP.StdFail import StdFail_NotDone
+from OCP.TopExp import TopExp
+from OCP.TopoDS import (
+    TopoDS_Builder,
+    TopoDS_Compound,
+    TopoDS_Iterator,
+    TopoDS_Shell,
+)
+from OCP.collections import (
+    IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher,
+)
+from OCP.gp import gp_GTrsf, gp_Pnt2d, gp_Trsf
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
 from OCP.BRepGProp import BRepGProp_Face
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
@@ -102,6 +135,7 @@ from OCP.GeomLib import GeomLib_IsPlanarSurface
 from OCP.gp import gp_Ax2, gp_Ax3, gp_Dir, gp_Pln, gp_Pnt, gp_Vec
 
 from build123d.kernel.base import (
+    AncestorMap,
     BoolOp,
     CurveView,
     JoinKind,
@@ -110,6 +144,7 @@ from build123d.kernel.base import (
     SurfaceView,
     SweepTransition,
     TopoKind,
+    WireStatus,
 )
 
 _KIND_TO_TOPABS = {
@@ -516,6 +551,178 @@ class _OcctGeometry:
             builder.Add(TopoDS.Shell(shell))
         return builder.Shape()
 
+    def make_vertex(self, point: Point) -> TopoDS_Shape:
+        return BRepBuilderAPI_MakeVertex(gp_Pnt(*point)).Vertex()
+
+    def vertex_point(self, vertex: TopoDS_Shape) -> Point:
+        return _pt(BRep_Tool.Pnt_s(TopoDS.Vertex(vertex)))
+
+    def make_wire(
+        self, shapes: Sequence[TopoDS_Shape]
+    ) -> tuple[TopoDS_Shape | None, WireStatus]:
+        builder = BRepBuilderAPI_MakeWire()
+        pending: list[TopoDS_Shape] = []  # a run of edges is added as one list
+
+        def flush() -> None:
+            if pending:
+                builder.Add(_shape_list(pending))
+                pending.clear()
+
+        for shape in shapes:
+            if shape.ShapeType() == ta.TopAbs_WIRE:
+                flush()
+                builder.Add(TopoDS.Wire(shape))
+            else:
+                pending.append(shape)
+        flush()
+        builder.Build()
+        if not builder.IsDone():
+            error = builder.Error()
+            if error == BRepBuilderAPI_NonManifoldWire:
+                return builder.Wire(), WireStatus.NON_MANIFOLD
+            if error == BRepBuilderAPI_EmptyWire:
+                return None, WireStatus.EMPTY
+            if error == BRepBuilderAPI_DisconnectedWire:
+                return None, WireStatus.DISCONNECTED
+        return builder.Wire(), WireStatus.OK
+
+    def make_wire_placed(
+        self, edges: Sequence[TopoDS_Shape]
+    ) -> tuple[TopoDS_Shape, list[TopoDS_Shape]]:
+        builder = BRepBuilderAPI_MakeWire()
+        placed: list[TopoDS_Shape] = []
+        for edge in edges:
+            builder.Add(TopoDS.Edge(edge))
+            placed.append(builder.Edge())
+        builder.Build()
+        return builder.Wire(), placed
+
+    def make_planar_face(
+        self, outer: TopoDS_Shape, inners: Sequence[TopoDS_Shape]
+    ) -> TopoDS_Shape:
+        inners = list(inners)
+        if inners and not BRep_Tool.IsClosed_s(outer):
+            raise ValueError("Cannot build face(s): outer wire is not closed")
+        # every wire must lie in one plane
+        if not BRepLib_FindSurface(
+            self.make_compound([outer, *inners]), OnlyPlane=True
+        ).Found():
+            raise ValueError("Cannot build face(s): wires not planar")
+
+        builder = BRepBuilderAPI_MakeFace(TopoDS.Wire(_fixed(outer)), True)
+        for inner in inners:
+            if not BRep_Tool.IsClosed_s(inner):
+                raise ValueError("Cannot build face(s): inner wire is not closed")
+            builder.Add(TopoDS.Wire(_fixed(inner)))
+        builder.Build()
+        if not builder.IsDone():
+            raise ValueError(f"Cannot build face(s): {builder.Error()}")
+
+        fixer = ShapeFix_Face(builder.Face())
+        fixer.FixOrientation()
+        fixer.Perform()
+        return TopoDS.Face(fixer.Result())
+
+    def add_holes(
+        self, face: TopoDS_Shape, wires: Sequence[TopoDS_Shape]
+    ) -> TopoDS_Shape:
+        builder = BRepBuilderAPI_MakeFace(TopoDS.Face(face))
+        for wire in wires:
+            builder.Add(TopoDS.Wire(wire))
+        return builder.Face()
+
+    def face_of_plane(self, plane: gp_Pln) -> TopoDS_Shape:
+        return BRepBuilderAPI_MakeFace(plane).Face()
+
+    def make_shell(self, faces: Sequence[TopoDS_Shape]) -> TopoDS_Shape:
+        shell = TopoDS_Shell()
+        builder = BRep_Builder()
+        builder.MakeShell(shell)
+        for face in faces:
+            builder.Add(shell, face)
+        return shell
+
+    def sew(self, faces: Sequence[TopoDS_Shape]) -> tuple[TopoDS_Shape, Any]:
+        sewing = BRepBuilderAPI_Sewing()
+        for face in faces:
+            sewing.Add(face)
+        sewing.Perform()
+        return self.downcast(sewing.SewedShape()), sewing
+
+    def make_compound(self, shapes: Sequence[TopoDS_Shape]) -> TopoDS_Shape:
+        compound = TopoDS_Compound()
+        builder = TopoDS_Builder()
+        builder.MakeCompound(compound)
+        for shape in shapes:
+            builder.Add(compound, shape)
+        return compound
+
+    def remove_from_compound(self, compound: TopoDS_Shape, shape: TopoDS_Shape) -> None:
+        TopoDS_Builder().Remove(compound, shape)
+
+    def transformed(
+        self, shape: TopoDS_Shape, transform: gp_Trsf, copy: bool = True
+    ) -> tuple[TopoDS_Shape, Any]:
+        builder = BRepBuilderAPI_Transform(shape, transform, copy)
+        return self.downcast(builder.Shape()), builder
+
+    def transformed_general(
+        self, shape: TopoDS_Shape, transform: gp_GTrsf
+    ) -> TopoDS_Shape:
+        return self.downcast(BRepBuilderAPI_GTransform(shape, transform, True).Shape())
+
+    # ---- distance and classification ----------------------------------------
+
+    def distance(self, a: TopoDS_Shape, b: TopoDS_Shape) -> float:
+        return BRepExtrema_DistShapeShape(a, b).Value()
+
+    def closest_points(
+        self, a: TopoDS_Shape, b: TopoDS_Shape
+    ) -> tuple[float, Point, Point]:
+        calculator = BRepExtrema_DistShapeShape()
+        calculator.LoadS1(a)
+        calculator.LoadS2(b)
+        calculator.Perform()
+        return (
+            calculator.Value(),
+            _pt(calculator.PointOnShape1(1)),
+            _pt(calculator.PointOnShape2(1)),
+        )
+
+    def extrema(
+        self, a: TopoDS_Shape, b: TopoDS_Shape, deflection: float | None = None
+    ) -> tuple[float, list[tuple[Point, Point]]]:
+        calculator = BRepExtrema_DistShapeShape()
+        if deflection is not None:
+            calculator.SetDeflection(deflection)
+        calculator.LoadS1(a)
+        calculator.LoadS2(b)
+        calculator.Perform()
+        if not calculator.IsDone():
+            return float("inf"), []
+        return calculator.Value(), [
+            (_pt(calculator.PointOnShape1(i)), _pt(calculator.PointOnShape2(i)))
+            for i in range(1, calculator.NbSolution() + 1)
+        ]
+
+    def point_in_solid(
+        self, solid: TopoDS_Shape, point: Point, tolerance: float
+    ) -> bool:
+        classifier = BRepClass3d_SolidClassifier(solid)
+        classifier.Perform(gp_Pnt(*point), tolerance)
+        return classifier.State() == ta.TopAbs_IN or classifier.IsOnAFace()
+
+    def point_on_face(self, face: TopoDS_Shape, point: Point, tolerance: float) -> bool:
+        classifier = BRepClass3d_SolidClassifier(face)
+        classifier.Perform(gp_Pnt(*point), tolerance)
+        return classifier.IsOnAFace()
+
+    def uv_in_face(
+        self, face: TopoDS_Shape, uv: tuple[float, float], tolerance: float
+    ) -> bool:
+        classifier = IntTools_FClass2d(TopoDS.Face(face), tolerance)
+        return classifier.Perform(gp_Pnt2d(*uv)) == ta.TopAbs_IN
+
     # ---- tessellation -------------------------------------------------------
 
     def mesh(
@@ -551,6 +758,16 @@ class OcctKernel(_OcctGeometry, Kernel):
     """OpenCascade through OCP."""
 
     name = "occt"
+
+    # OCP binds each OCCT exception straight to Exception, so there is no
+    # common base class to catch; this is the set an operation may raise
+    failure_types = (
+        Standard_Failure,
+        StdFail_NotDone,
+        Standard_ConstructionError,
+        Standard_NoSuchObject,
+        Standard_DomainError,
+    )
 
     # ---- handles and identity ------------------------------------------------
 
@@ -601,6 +818,62 @@ class OcctKernel(_OcctGeometry, Kernel):
             explorer.Next()
         return found
 
+    def direct_children(self, shape: TopoDS_Shape) -> list[TopoDS_Shape]:
+        children: list[TopoDS_Shape] = []
+        iterator = TopoDS_Iterator(shape, True, True)
+        while iterator.More():
+            children.append(iterator.Value())
+            iterator.Next()
+        return children
+
+    def ancestors(
+        self, shape: TopoDS_Shape, sub_kind: TopoKind, ancestor_kind: TopoKind
+    ) -> AncestorMap:
+        occt_map = (
+            IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
+        )
+        TopExp.MapShapesAndAncestors_s(
+            shape, _KIND_TO_TOPABS[sub_kind], _KIND_TO_TOPABS[ancestor_kind], occt_map
+        )
+        entries = []
+        for index in range(1, occt_map.Extent() + 1):
+            ancestors: list[TopoDS_Shape] = []
+            # the kernel list is walked once here; indexing it from Python is slow
+            for ancestor in occt_map.FindFromIndex(index):
+                ancestors.append(ancestor)
+            entries.append((occt_map.FindKey(index), ancestors))
+        return AncestorMap(self, entries)
+
+    def edge_vertices(self, edge: TopoDS_Shape) -> tuple[TopoDS_Shape, TopoDS_Shape]:
+        topods_edge = TopoDS.Edge(edge)
+        return TopExp.FirstVertex_s(topods_edge), TopExp.LastVertex_s(topods_edge)
+
+    def is_closed(self, shape: TopoDS_Shape) -> bool:
+        return BRep_Tool.IsClosed_s(shape)
+
+    def is_degenerate(self, edge: TopoDS_Shape) -> bool:
+        return BRep_Tool.Degenerated_s(TopoDS.Edge(edge))
+
+    # ---- orientation --------------------------------------------------------
+
+    def is_forward(self, shape: TopoDS_Shape) -> bool:
+        return shape.Orientation() == ta.TopAbs_FORWARD
+
+    def is_reversed(self, shape: TopoDS_Shape) -> bool:
+        return shape.Orientation() == ta.TopAbs_REVERSED
+
+    def reverse(self, shape: TopoDS_Shape) -> None:
+        shape.Reverse()
+
+    def reversed(self, shape: TopoDS_Shape) -> TopoDS_Shape:
+        return self.downcast(shape.Reversed())
+
+    def same_orientation(self, a: TopoDS_Shape, b: TopoDS_Shape) -> bool:
+        return a.Orientation() == b.Orientation()
+
+    def orient_like(self, shape: TopoDS_Shape, like: TopoDS_Shape) -> None:
+        shape.Orientation(like.Orientation())
+
     # ---- validity and repair ------------------------------------------------
 
     def is_valid(self, shape: TopoDS_Shape) -> bool:
@@ -628,6 +901,11 @@ class OcctKernel(_OcctGeometry, Kernel):
     def length(self, shape: TopoDS_Shape) -> float:
         properties = GProp_GProps()
         BRepGProp.LinearProperties_s(shape, properties)
+        return properties.Mass()
+
+    def measure(self, shape: TopoDS_Shape, kind: TopoKind) -> float:
+        properties = GProp_GProps()
+        _MASS_PROPERTIES[kind](shape, properties)
         return properties.Mass()
 
     def center_of_mass(
@@ -726,6 +1004,13 @@ _BOOLEAN_ALGORITHMS: dict[BoolOp, Callable[[], BRepAlgoAPI_BuilderAlgo]] = {
     BoolOp.SECTION: BRepAlgoAPI_Section,
     BoolOp.SPLIT: BRepAlgoAPI_Splitter,
 }
+
+
+def _fixed(shape: TopoDS_Shape) -> TopoDS_Shape:
+    """``shape`` after a general shape fix (used on wires before making faces)."""
+    fixer = ShapeFix_Shape(shape)
+    fixer.Perform()
+    return fixer.Shape()
 
 
 def _shape_list(shapes: Sequence[TopoDS_Shape]) -> List_TopoDS_Shape:

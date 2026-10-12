@@ -72,7 +72,7 @@ from typing import overload
 
 import numpy as np
 import OCP.GeomAbs as ga
-import OCP.TopAbs as ta
+
 from anytree import NodeMixin, RenderTree
 from IPython.lib.pretty import RepresentationPrinter, pretty
 from OCP.Bnd import Bnd_OBB
@@ -80,16 +80,12 @@ from OCP.BRep import BRep_TEdge, BRep_Tool
 from OCP.GCPnts import GCPnts_AbscissaPoint
 from OCP.GeomAdaptor import GeomAdaptor_Curve
 from OCP.BRepBuilderAPI import (
-    BRepBuilderAPI_GTransform,
-    BRepBuilderAPI_MakeFace,
-    BRepBuilderAPI_MakeVertex,
     BRepBuilderAPI_RightCorner,
     BRepBuilderAPI_RoundCorner,
-    BRepBuilderAPI_Sewing,
-    BRepBuilderAPI_Transform,
     BRepBuilderAPI_Transformed,
 )
-from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+
+
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
@@ -100,28 +96,21 @@ from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_TrsfForm, gp_Vec,
 from OCP.GProp import GProp_GProps
 from OCP.ShapeAnalysis import ShapeAnalysis_Curve, ShapeAnalysis_Shell
 from OCP.ShapeCustom import ShapeCustom, ShapeCustom_RestrictionParameters
-from OCP.Standard import Standard_Failure
-from OCP.TopAbs import TopAbs_Orientation, TopAbs_ShapeEnum
-from OCP.TopExp import TopExp
+
+
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import (
     TopoDS,
-    TopoDS_Builder,
     TopoDS_Compound,
     TopoDS_Edge,
     TopoDS_Face,
-    TopoDS_Iterator,
     TopoDS_Shape,
-    TopoDS_Shell,
-    TopoDS_Solid,
-    TopoDS_Vertex,
     TopoDS_Wire,
 )
-from OCP.collections import (
-    IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher,
-)
+
+
 from OCP.collections import List_TopoDS_Shape
-from OCP.TopTools import TopTools_ShapeMapHasher
+
 from typing_extensions import Self, deprecated
 
 from bd_materials import FinishedMaterial, resolve as resolve_material
@@ -157,7 +146,6 @@ from build123d.geometry import (
 from build123d.pack_utils import _pack2d
 
 from .history import ShapeHistory
-from .kernel import list_shapes
 
 if TYPE_CHECKING:  # pragma: no cover
     from build123d.build_part import BuildPart  # pylint: disable=R0801
@@ -203,43 +191,12 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
     build123d_type: ClassVar[str] = "Shape"
     composite_factories: ClassVar[dict[int | None, CompositeFactory]] = {}
-    shape_constructors: ClassVar[dict[TopAbs_ShapeEnum, ShapeConstructor]] = {}
+    shape_constructors: ClassVar[dict[TopoKind, ShapeConstructor]] = {}
     geometry_constructors: ClassVar[dict[type, GeometryConstructor]] = {}
 
-    shape_LUT = {
-        ta.TopAbs_VERTEX: "Vertex",
-        ta.TopAbs_EDGE: "Edge",
-        ta.TopAbs_WIRE: "Wire",
-        ta.TopAbs_FACE: "Face",
-        ta.TopAbs_SHELL: "Shell",
-        ta.TopAbs_SOLID: "Solid",
-        ta.TopAbs_COMPOUND: "Compound",
-        ta.TopAbs_COMPSOLID: "CompSolid",
-    }
+    shape_LUT: dict[TopoKind, str] = {kind: kind.label for kind in TopoKind}
 
-    shape_properties_LUT: dict[TopAbs_ShapeEnum, CalcFn | None] = {
-        ta.TopAbs_VERTEX: None,
-        ta.TopAbs_EDGE: BRepGProp.LinearProperties_s,
-        ta.TopAbs_WIRE: BRepGProp.LinearProperties_s,
-        ta.TopAbs_FACE: BRepGProp.SurfaceProperties_s,
-        ta.TopAbs_SHELL: BRepGProp.SurfaceProperties_s,
-        ta.TopAbs_SOLID: BRepGProp.VolumeProperties_s,
-        ta.TopAbs_COMPOUND: BRepGProp.VolumeProperties_s,
-        ta.TopAbs_COMPSOLID: BRepGProp.VolumeProperties_s,
-    }
-
-    inverse_shape_LUT = {v: k for k, v in shape_LUT.items()}
-
-    downcast_LUT = {
-        ta.TopAbs_VERTEX: TopoDS.Vertex,
-        ta.TopAbs_EDGE: TopoDS.Edge,
-        ta.TopAbs_WIRE: TopoDS.Wire,
-        ta.TopAbs_FACE: TopoDS.Face,
-        ta.TopAbs_SHELL: TopoDS.Shell,
-        ta.TopAbs_SOLID: TopoDS.Solid,
-        ta.TopAbs_COMPOUND: TopoDS.Compound,
-        ta.TopAbs_COMPSOLID: TopoDS.CompSolid,
-    }
+    inverse_shape_LUT: dict[str, TopoKind] = {v: k for k, v in shape_LUT.items()}
 
     geom_LUT_EDGE: dict[ga.GeomAbs_CurveType, GeomType] = {
         ga.GeomAbs_Line: GeomType.LINE,
@@ -291,14 +248,14 @@ class Shape(NodeMixin, Generic[TOPODS]):
             self.children: list[Shape] = []
 
     _ordered_shapes = [
-        TopAbs_ShapeEnum.TopAbs_COMPOUND,
-        TopAbs_ShapeEnum.TopAbs_COMPSOLID,
-        TopAbs_ShapeEnum.TopAbs_SOLID,
-        TopAbs_ShapeEnum.TopAbs_SHELL,
-        TopAbs_ShapeEnum.TopAbs_FACE,
-        TopAbs_ShapeEnum.TopAbs_WIRE,
-        TopAbs_ShapeEnum.TopAbs_EDGE,
-        TopAbs_ShapeEnum.TopAbs_VERTEX,
+        TopoKind.COMPOUND,
+        TopoKind.COMPSOLID,
+        TopoKind.SOLID,
+        TopoKind.SHELL,
+        TopoKind.FACE,
+        TopoKind.WIRE,
+        TopoKind.EDGE,
+        TopoKind.VERTEX,
     ]
     # ---- Constructor ----
 
@@ -538,11 +495,11 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty:
             raise ValueError("Cannot determine geometry type of an empty shape")
 
-        shape: TopAbs_ShapeEnum = shapetype(self.wrapped)
+        kind = kernel.kind(self.wrapped)
 
-        if shape == ta.TopAbs_EDGE:
+        if kind is TopoKind.EDGE:
             geom = GeomType[kernel.curve_of(self.wrapped).geom_type]
-        elif shape == ta.TopAbs_FACE:
+        elif kind is TopoKind.FACE:
             geom = GeomType[kernel.surface_of(self.wrapped).geom_type]
         else:
             geom = GeomType.OTHER
@@ -571,36 +528,16 @@ class Shape(NodeMixin, Generic[TOPODS]):
         while shape_stack:
             shape = shape_stack.pop(0)
 
-            # Create an empty indexed data map to store the edges and their corresponding faces.
-            shape_map = (
-                IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
-            )
-
-            # Fill the map with edges and their associated faces in the given shape. Each edge in
-            # the map is associated with a list of faces that share that edge.
-            TopExp.MapShapesAndAncestors_s(
-                # shape.wrapped, ta.TopAbs_EDGE, ta.TopAbs_FACE, shape_map
-                shape,
-                ta.TopAbs_EDGE,
-                ta.TopAbs_FACE,
-                shape_map,
-            )
-
-            # Iterate over the edges in the map and checks if each edge is non-degenerate and has
-            # exactly two faces associated with it.
-            for i in range(shape_map.Extent()):
-                # Access each edge in the map sequentially
-                edge = TopoDS.Edge(shape_map.FindKey(i + 1))
-
+            # Each edge with the faces that share it: a manifold shape has
+            # exactly two on every edge that has a length.
+            for edge, faces in kernel.ancestors(
+                shape, TopoKind.EDGE, TopoKind.FACE
+            ).items():
                 # A degenerate edge, such as the pole of a sphere or the apex of a
                 # cone, has no length and belongs to one face only, so it is skipped.
-                if BRep_Tool.Degenerated_s(edge):
+                if kernel.is_degenerate(edge):
                     continue
-
-                # Check if the current edge has exactly two faces associated with it. If not,
-                # it means the edge is not shared by exactly two faces, indicating that the
-                # shape is not manifold.
-                if shape_map.FindFromIndex(i + 1).Extent() != 2:
+                if len(faces) != 2:
                     return False
 
             # In a closed shell each edge is used once in each direction; faces
@@ -772,7 +709,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
             for base in type(self).__mro__:
                 if base.__name__ in Shape.inverse_shape_LUT:
                     return tcast(Shapes, base.__name__)
-        return tcast(Shapes, Shape.shape_LUT[shapetype(self.wrapped)])
+        return tcast(Shapes, kernel.kind(self.wrapped).label)
 
     @property
     def static_moments(self) -> tuple[float, float, float]:
@@ -807,9 +744,9 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
     @classmethod
     def register_shape_constructor(
-        cls, shape_type: TopAbs_ShapeEnum, constructor: ShapeConstructor
+        cls, shape_type: TopoKind, constructor: ShapeConstructor
     ) -> None:
-        """Register a wrapper class for a TopAbs type without importing it here.
+        """Register a wrapper class for a topological kind without importing it here.
 
         Each topology module registers the classes it defines as it is imported,
         so that :meth:`cast` can build any shape without shape_core needing to
@@ -860,10 +797,11 @@ class Shape(NodeMixin, Generic[TOPODS]):
         ):
             return cls._zero_class()()
 
+        kind = kernel.kind(obj)
         try:
-            constructor = cls.shape_constructors[shapetype(obj)]
+            constructor = cls.shape_constructors[kind]
         except KeyError as exc:
-            raise ValueError(f"Unable to cast {obj.ShapeType()}") from exc
+            raise ValueError(f"Unable to cast {kind}") from exc
         # NB downcast is needed to handle TopoDS_Shape types
         return constructor(downcast(obj))
 
@@ -899,28 +837,24 @@ class Shape(NodeMixin, Generic[TOPODS]):
         shape: TopoDS_Shape,
         tree: list[_DisplayNode],
         parent: _DisplayNode | None = None,
-        limit: TopAbs_ShapeEnum = TopAbs_ShapeEnum.TopAbs_VERTEX,
+        limit: TopoKind = TopoKind.VERTEX,
         show_center: bool = True,
     ) -> list[_DisplayNode]:
         """Create an anytree copy of the TopoDS_Shape structure"""
 
-        obj_type = Shape.shape_LUT[shape.ShapeType()]
+        obj_type = kernel.kind(shape).label
         loc: Vector | Location
         if show_center:
             loc = Shape(shape).bounding_box().center()
         else:
-            loc = Location(shape.Location())
+            loc = Location(kernel.location_of(shape))
         tree.append(Shape._DisplayNode(obj_type, id(shape), loc, parent))
-        iterator = TopoDS_Iterator()
-        iterator.Initialize(shape)
         parent_node = tree[-1]
-        while iterator.More():
-            child = iterator.Value()
+        for child in kernel.direct_children(shape):
             if Shape._ordered_shapes.index(
-                child.ShapeType()
+                kernel.kind(child)
             ) <= Shape._ordered_shapes.index(limit):
                 Shape._build_tree(child, tree, parent_node, limit)
-            iterator.Next()
         return tree
 
     @staticmethod
@@ -1338,17 +1272,10 @@ class Shape(NodeMixin, Generic[TOPODS]):
             float: the volume of the shape
 
         """
-        if not self or shapetype(self.wrapped) == TopAbs_ShapeEnum.TopAbs_VERTEX:
+        if not self or kernel.kind(self.wrapped) is TopoKind.VERTEX:
             return 0.0
 
-        properties = GProp_GProps()
-        calc_function = Shape.shape_properties_LUT[shapetype(self.wrapped)]
-
-        if calc_function is None:
-            raise NotImplementedError
-
-        calc_function(self.wrapped, properties)
-        return properties.Mass()
+        return kernel.measure(self.wrapped, kernel.kind(self.wrapped))
 
     def compute_mass(
         self, mass_unit: Unit = Unit.G, length_unit: Unit = Unit.MM
@@ -1501,7 +1428,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty or not other:
             raise ValueError("Cannot calculate distance to or from an empty shape")
 
-        return BRepExtrema_DistShapeShape(self.wrapped, other.wrapped).Value()
+        return kernel.distance(self.wrapped, other.wrapped)
 
     def distance_to(self, other: Shape | VectorLike) -> float:
         """Minimal distance between two shapes"""
@@ -1517,20 +1444,10 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if isinstance(other, Shape):
             topods_shape = tcast(TopoDS_Shape, other.wrapped)
         else:
-            vec = Vector(other)
-            topods_shape = BRepBuilderAPI_MakeVertex(
-                gp_Pnt(vec.X, vec.Y, vec.Z)
-            ).Vertex()
+            topods_shape = kernel.make_vertex(tuple(Vector(other)))
 
-        dist_calc = BRepExtrema_DistShapeShape()
-        dist_calc.LoadS1(self.wrapped)
-        dist_calc.LoadS2(topods_shape)
-        dist_calc.Perform()
-        return (
-            dist_calc.Value(),
-            Vector(dist_calc.PointOnShape1(1)),
-            Vector(dist_calc.PointOnShape2(1)),
-        )
+        distance, point1, point2 = kernel.closest_points(self.wrapped, topods_shape)
+        return distance, Vector(point1), Vector(point2)
 
     def distances(self, *others: Shape) -> Iterator[float]:
         """Minimal distances to between self and other shapes
@@ -1544,16 +1461,10 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty:
             raise ValueError("Cannot calculate distance to or from an empty shape")
 
-        dist_calc = BRepExtrema_DistShapeShape()
-        dist_calc.LoadS1(self.wrapped)
-
         for other_shape in others:
             if not other_shape:
                 raise ValueError("Cannot calculate distance to or from an empty shape")
-            dist_calc.LoadS2(other_shape.wrapped)
-            dist_calc.Perform()
-
-            yield dist_calc.Value()
+            yield kernel.distance(self.wrapped, other_shape.wrapped)
 
     def edge(self) -> Edge:
         """Return the Edge"""
@@ -2208,7 +2119,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
             tree = Shape._build_tree(
                 tcast(TopoDS_Shape, self.wrapped),
                 tree=[],
-                limit=Shape.inverse_shape_LUT[limit_class],
+                limit=TopoKind.from_label(limit_class),
             )
             show_center = True if show_center is None else show_center
             result = Shape._show_tree(tree[0], show_center)
@@ -2284,7 +2195,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         # Define the splitting tool
         trim_tool = (
-            BRepBuilderAPI_MakeFace(tool.wrapped).Face()  # gp_Pln to Face
+            kernel.face_of_plane(tool.wrapped)
             if isinstance(tool, Plane)
             else tool.wrapped
         )
@@ -2329,28 +2240,23 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         tops: list[Shape] = []
         bottoms: list[Shape] = []
-        properties = GProp_GProps()
         for part in get_top_level_topods_shapes(split_result):
             sub_shape = self.__class__.cast(part)
             if isinstance(tool, Plane):
                 # A piece lies wholly on one side of the plane and so does its
                 # centre of mass. The geometric centre need not: that of a curved
                 # face is the middle of its surface, whether trimmed away or not.
-                calc_function = Shape.shape_properties_LUT[shapetype(part)]
-                if calc_function is None:  # pragma: no cover
+                part_kind = kernel.kind(part)
+                if part_kind is TopoKind.VERTEX:  # pragma: no cover
                     piece_center = sub_shape.center()
                 else:
-                    piece_properties = GProp_GProps()
-                    calc_function(part, piece_properties)
-                    piece_center = Vector(piece_properties.CentreOfMass())
+                    piece_center = Vector(kernel.center_of_mass(part, part_kind))
                 is_up = tool.to_local_coords(piece_center).Z >= 0
             else:
                 # Intersect self and the thickened tool
                 is_up_obj = _topods_bool_op((part,), (tool_solid,), BoolOp.COMMON)
-                # Check for valid intersections
-                BRepGProp.LinearProperties_s(is_up_obj, properties)
-                # Mass represents the total length for linear properties
-                is_up = properties.Mass() >= TOLERANCE
+                # Check for valid intersections: a touching piece has length
+                is_up = kernel.length(is_up_obj) >= TOLERANCE
             (tops if is_up else bottoms).append(sub_shape)
 
         # a side with nothing on it is the empty shape of self's class
@@ -2461,9 +2367,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
             if poly is None:
                 continue
             trsf = loc.Transformation()
-            is_reversed = (
-                face.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED
-            )
+            is_reversed = kernel.is_reversed(face.wrapped)
             reverse_factor = -1.0 if is_reversed else 1.0
             nb_nodes = poly.NbNodes()
 
@@ -2531,7 +2435,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
                     arc_h = GCPnts_AbscissaPoint.Length_s(
                         v_adaptor, v_min, v_max, TOLERANCE
                     )
-                except Standard_Failure:
+                except kernel.failure_types:
                     # Degenerate/unsupported surface parameterization — fall back
                     # to the raw UV-parameter extents computed above.
                     pass
@@ -2676,17 +2580,13 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if t_matrix.wrapped.Form() == gp_TrsfForm.gp_Other:
             # a general affine transform (stretch, shear): only GTransform
             # can apply it, at the cost of converting geometry to splines
-            builder: BRepBuilderAPI_GTransform | BRepBuilderAPI_Transform = (
-                BRepBuilderAPI_GTransform(self.wrapped, t_matrix.wrapped, True)
-            )
+            transformed = kernel.transformed_general(self.wrapped, t_matrix.wrapped)
         else:
             # a similarity: Transform applies it exactly and keeps the geometry
             # types; GTransform would drop its scale factor, which a gp_GTrsf
             # of any recognised form keeps apart from its matrix
-            builder = BRepBuilderAPI_Transform(
-                self.wrapped, t_matrix.wrapped.Trsf(), True
-            )
-        new_shape.wrapped = tcast(TOPODS, downcast(builder.Shape()))
+            transformed, _ = kernel.transformed(self.wrapped, t_matrix.wrapped.Trsf())
+        new_shape.wrapped = tcast(TOPODS, transformed)
 
         return new_shape
 
@@ -2706,8 +2606,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty:
             return self
         new_shape = copy.deepcopy(self, None)
-        transformed = downcast(
-            BRepBuilderAPI_Transform(self.wrapped, t_matrix.wrapped.Trsf()).Shape()
+        transformed, _ = kernel.transformed(
+            self.wrapped, t_matrix.wrapped.Trsf(), copy=False
         )
         new_shape.wrapped = tcast(TOPODS, transformed)
 
@@ -2787,12 +2687,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty:
             return self
         shape_copy: Shape = copy.deepcopy(self, None)
-        transformed_shape = BRepBuilderAPI_Transform(
-            self.wrapped,
-            transformation,
-            True,
-        ).Shape()
-        shape_copy.wrapped = tcast(TOPODS, downcast(transformed_shape))
+        transformed_shape, _ = kernel.transformed(self.wrapped, transformation)
+        shape_copy.wrapped = tcast(TOPODS, transformed_shape)
         return shape_copy
 
     def _bool_op(
@@ -3210,12 +3106,12 @@ def topo_distance_to(
         "Shell": "shells",
         "Solid": "solids",
     }
-    connector_enum_lut = {
-        "Edge": ta.TopAbs_VERTEX,
-        "Wire": ta.TopAbs_VERTEX,
-        "Face": ta.TopAbs_EDGE,
-        "Shell": ta.TopAbs_FACE,
-        "Solid": ta.TopAbs_FACE,
+    connector_kind_lut = {
+        "Edge": TopoKind.VERTEX,
+        "Wire": TopoKind.VERTEX,
+        "Face": TopoKind.EDGE,
+        "Shell": TopoKind.FACE,
+        "Solid": TopoKind.FACE,
     }
 
     if peer_type not in plural_lut:
@@ -3230,7 +3126,7 @@ def topo_distance_to(
         raise ValueError("Topological distance requires a shared topo_parent")
 
     peers = tcast(ShapeList[Shape], getattr(parent, plural_lut[peer_type])())
-    shape_hasher = TopTools_ShapeMapHasher()
+    shape_hasher = kernel.hash_key
     peer_lookup = {
         shape_hasher(peer.wrapped): peer for peer in peers if not peer.is_empty
     }
@@ -3249,52 +3145,33 @@ def topo_distance_to(
 
     if peer_type == "Vertex":
         vertex_neighbors: dict[Shape, set[Shape]] = {peer: set() for peer in peers}
-        vertex_edge_map = (
-            IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
-        )
-        TopExp.MapShapesAndAncestors_s(
-            parent.wrapped,
-            ta.TopAbs_VERTEX,
-            ta.TopAbs_EDGE,
-            vertex_edge_map,
+        vertex_edge_map = kernel.ancestors(
+            parent.wrapped, TopoKind.VERTEX, TopoKind.EDGE
         )
 
-        for index in range(vertex_edge_map.Extent()):
-            vertex_wrapped = TopoDS.Vertex(vertex_edge_map.FindKey(index + 1))
+        for vertex_wrapped, edges_wrapped in vertex_edge_map.items():
             vertex_peer = peer_lookup.get(shape_hasher(vertex_wrapped))
             if vertex_peer is None:
                 continue
 
-            for edge_wrapped in list_shapes(
-                vertex_edge_map.FindFromKey(vertex_wrapped)
-            ):
-                edge = TopoDS.Edge(edge_wrapped)
-                vertex0 = TopoDS_Vertex()
-                vertex1 = TopoDS_Vertex()
-                TopExp.Vertices_s(edge, vertex0, vertex1)
-
-                for neighbor_wrapped in (vertex0, vertex1):
+            for edge_wrapped in edges_wrapped:
+                for neighbor_wrapped in kernel.edge_vertices(edge_wrapped):
                     neighbor = peer_lookup.get(shape_hasher(neighbor_wrapped))
                     if neighbor is not None and neighbor != vertex_peer:
                         vertex_neighbors[vertex_peer].add(neighbor)
     else:
-        connector_peer_map = (
-            IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
-        )
-        TopExp.MapShapesAndAncestors_s(
+        connector_peer_map = kernel.ancestors(
             parent.wrapped,
-            connector_enum_lut[peer_type],
-            Shape.inverse_shape_LUT[peer_type],
-            connector_peer_map,
+            connector_kind_lut[peer_type],
+            TopoKind.from_label(peer_type),
         )
 
         peer_connectors: dict[Shape, list[TopoDS_Shape]] = {peer: [] for peer in peers}
         connector_to_peers: dict[TopoDS_Shape, list[Shape]] = {}
 
-        for index in range(connector_peer_map.Extent()):
-            connector = connector_peer_map.FindKey(index + 1)
+        for connector, peers_wrapped in connector_peer_map.items():
             connected_peers = []
-            for peer_wrapped in list_shapes(connector_peer_map.FindFromKey(connector)):
+            for peer_wrapped in peers_wrapped:
                 peer = peer_lookup.get(shape_hasher(peer_wrapped))
                 if peer is None:
                     continue
@@ -4075,7 +3952,7 @@ def _faces_of(result: Shape | Iterable[Shape] | None) -> ShapeList[Face]:
         return ShapeList()
     faces: ShapeList[Face] = ShapeList()
     for shape in [result] if isinstance(result, Shape) else result:
-        if not shape.is_empty and shapetype(shape.wrapped) == ta.TopAbs_FACE:
+        if not shape.is_empty and kernel.is_kind(shape.wrapped, TopoKind.FACE):
             faces.append(tcast("Face", shape))
         else:
             faces.extend(shape.faces())
@@ -4089,11 +3966,7 @@ def _topods_area(shape: TopoDS_Shape) -> float:
 
 def _sew_topods_faces(faces: Iterable[TopoDS_Face]) -> TopoDS_Shape:
     """Sew faces into a shell if possible"""
-    shell_builder = BRepBuilderAPI_Sewing()
-    for face in faces:
-        shell_builder.Add(face)
-    shell_builder.Perform()
-    return downcast(shell_builder.SewedShape())
+    return kernel.sew(list(faces))[0]
 
 
 def _topods_bool_op(
@@ -4190,45 +4063,40 @@ def get_top_level_topods_shapes(
     while stack:
         current_shape = stack.pop()
         if kernel.is_kind(current_shape, TopoKind.COMPOUND):
-            iterator = TopoDS_Iterator()
-            iterator.Initialize(current_shape)
-            while iterator.More():
-                child_shape = downcast(iterator.Value())
+            for child in kernel.direct_children(current_shape):
+                child_shape = downcast(child)
                 if kernel.is_kind(child_shape, TopoKind.COMPOUND):
                     # Traverse further into the compound
                     stack.append(child_shape)
                 else:
                     # Add non-compound shape
                     first_level_shapes.append(child_shape)
-                iterator.Next()
         else:
             first_level_shapes.append(current_shape)
 
     return first_level_shapes
 
 
-def shapetype(obj: TopoDS_Shape | None) -> TopAbs_ShapeEnum:
-    """Return TopoDS_Shape's TopAbs_ShapeEnum"""
-    if obj is None or obj.IsNull():
-        raise ValueError("Null TopoDS_Shape object")
-
-    return obj.ShapeType()
+def shapetype(obj: TopoDS_Shape | None) -> TopoKind:
+    """The topological kind of a kernel shape; ValueError for a null one"""
+    return kernel.kind(obj)
 
 
 def topods_dim(topods: TopoDS_Shape) -> int | None:
     """Return the dimension of this TopoDS_Shape"""
     shape_dim_map = {
-        (TopoDS_Vertex,): 0,
-        (TopoDS_Edge, TopoDS_Wire): 1,
-        (TopoDS_Face, TopoDS_Shell): 2,
-        (TopoDS_Solid,): 3,
+        TopoKind.VERTEX: 0,
+        TopoKind.EDGE: 1,
+        TopoKind.WIRE: 1,
+        TopoKind.FACE: 2,
+        TopoKind.SHELL: 2,
+        TopoKind.SOLID: 3,
     }
+    kind = kernel.kind(topods)
+    if kind in shape_dim_map:
+        return shape_dim_map[kind]
 
-    for shape_types, dim in shape_dim_map.items():
-        if isinstance(topods, shape_types):
-            return dim
-
-    if kernel.is_kind(topods, TopoKind.COMPOUND):
+    if kind is TopoKind.COMPOUND:
         sub_dims = {topods_dim(s) for s in get_top_level_topods_shapes(topods)}
         return sub_dims.pop() if len(sub_dims) == 1 else None
 
@@ -4249,12 +4117,11 @@ def unwrap_topods_compound(
         TopoDS_Compound | TopoDS_Shape: base shape
     """
     if compound.NbChildren() == 1:
-        iterator = TopoDS_Iterator(compound)
-        single_element = downcast(iterator.Value())
+        single_element = downcast(kernel.direct_children(compound)[0])
 
         # If the single element is another TopoDS_Compound, unwrap it recursively
         if kernel.is_kind(single_element, TopoKind.COMPOUND):
-            return unwrap_topods_compound(single_element, fully)
+            return unwrap_topods_compound(tcast(TopoDS_Compound, single_element), fully)
 
         return single_element if fully else compound
 
@@ -4275,12 +4142,4 @@ def _make_topods_compound_from_shapes(
     Returns:
         TopoDS_Compound: OCCT compound
     """
-    comp = TopoDS_Compound()
-    comp_builder = TopoDS_Builder()
-    comp_builder.MakeCompound(comp)
-
-    for shape in occt_shapes:
-        if shape is not None:
-            comp_builder.Add(comp, shape)
-
-    return comp
+    return kernel.make_compound([shape for shape in occt_shapes if shape is not None])

@@ -890,19 +890,9 @@ class TestShapeCast(unittest.TestCase):
             Shape.shape_constructors.update(registered)
 
     def test_registry_covers_every_wrapped_type(self):
-        import OCP.TopAbs as ta
+        from build123d.kernel import TopoKind
 
-        expected = {
-            ta.TopAbs_VERTEX,
-            ta.TopAbs_EDGE,
-            ta.TopAbs_WIRE,
-            ta.TopAbs_FACE,
-            ta.TopAbs_SHELL,
-            ta.TopAbs_SOLID,
-            ta.TopAbs_COMPOUND,
-            ta.TopAbs_COMPSOLID,
-        }
-        self.assertEqual(set(Shape.shape_constructors), expected)
+        self.assertEqual(set(Shape.shape_constructors), set(TopoKind))
 
 
 class TestTransformShape(unittest.TestCase):

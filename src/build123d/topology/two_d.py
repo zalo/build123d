@@ -63,11 +63,11 @@ from typing import TYPE_CHECKING, Any, ClassVar, Literal
 from typing import cast as tcast
 from typing import overload
 
-import OCP.TopAbs as ta
+
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing
-from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
+
 from OCP.BRepFeat import BRepFeat_SplitShape
 from OCP.BRepFill import BRepFill
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
@@ -103,12 +103,8 @@ from OCP.GProp import GProp_GProps
 from OCP.Precision import Precision
 from OCP.ShapeAnalysis import ShapeAnalysis_Edge, ShapeAnalysis_Surface
 from OCP.ShapeFix import ShapeFix_Solid
-from OCP.Standard import (
-    Standard_ConstructionError,
-    Standard_Failure,
-    Standard_NoSuchObject,
-)
-from OCP.StdFail import StdFail_NotDone
+
+
 from OCP.collections import (
     Array1_double,
     Array1_gp_Pnt,
@@ -118,7 +114,7 @@ from OCP.collections import (
     List_TopoDS_Shape,
     Sequence_TopoDS_Shape,
 )
-from OCP.TopAbs import TopAbs_Orientation
+
 from OCP.TopoDS import (
     TopoDS,
     TopoDS_Edge,
@@ -131,7 +127,7 @@ from OCP.TopLoc import TopLoc_Location
 from ocp_gordon import interpolate_curve_network
 from typing_extensions import Self
 
-from build123d.kernel import BoolOp, kernel
+from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.build_enums import (
     CenterOf,
     ContinuityLevel,
@@ -264,12 +260,7 @@ class Mixin2D(ABC, Shape[TOPODS]):
         faces = list(self.faces()) + [f for s in summands for f in s.faces()]
         try:
             sum_shape: Shape = Shell(faces)
-        except (
-            TypeError,
-            ValueError,
-            RuntimeError,
-            Standard_ConstructionError,
-        ) as exc:
+        except (TypeError, ValueError, RuntimeError) + kernel.failure_types as exc:
             raise ValueError(
                 "Unable to sew faces into a single connected Shell - faces must "
                 "meet along shared edges, with at most two faces on an edge"
@@ -656,21 +647,16 @@ class Mixin2D(ABC, Shape[TOPODS]):
             # Use BRepExtrema to find all contact points
             # (vertex-vertex, vertex-edge, vertex-face)
             found_vertices: ShapeList = ShapeList()
-            extrema = BRepExtrema_DistShapeShape()
-            extrema.SetDeflection(
-                tolerance * 1e-3
-            )  # Higher precision to avoid duplicate solutions
-            extrema.LoadS1(self.wrapped)
-            extrema.LoadS2(other.wrapped)
-            extrema.Perform()
-            if extrema.IsDone() and extrema.Value() <= tolerance:
-                for i in range(1, extrema.NbSolution() + 1):
-                    pnt1 = extrema.PointOnShape1(i)
-                    pnt2 = extrema.PointOnShape2(i)
-                    if pnt1.Distance(pnt2) > tolerance:
+            # a finer deflection avoids duplicate solutions
+            separation, pairs = kernel.extrema(
+                self.wrapped, other.wrapped, deflection=tolerance * 1e-3
+            )
+            if separation <= tolerance:
+                for pnt1, pnt2 in pairs:
+                    if (Vector(pnt1) - Vector(pnt2)).length > tolerance:
                         continue
 
-                    new_vertex = Vertex(pnt1.X(), pnt1.Y(), pnt1.Z())
+                    new_vertex = Vertex(*pnt1)
 
                     # Skip duplicates early (cheap check)
                     if is_duplicate(new_vertex, found_vertices):
@@ -873,7 +859,7 @@ class Face(Mixin2D[TopoDS_Face]):
         parent = kwargs.get("parent", parent)
 
         if isinstance(obj, Plane):
-            obj = BRepBuilderAPI_MakeFace(obj.wrapped).Face()
+            obj = tcast(TopoDS_Face, kernel.face_of_plane(obj.wrapped))
 
         if outer_wire is not None:
             inner_topods_wires = (
@@ -1576,14 +1562,14 @@ class Face(Mixin2D[TopoDS_Face]):
         cls, surface_face: Face, interior_wires: Iterable[Wire]
     ) -> Face:
         """Add interior wires as holes to a surface face."""
-        makeface_object = BRepBuilderAPI_MakeFace(surface_face.wrapped)
+        wires = []
         for wire in interior_wires:
             if not wire:
                 raise ValueError("interior_wires contain an empty wire")
-            makeface_object.Add(wire.wrapped)
+            wires.append(wire.wrapped)
         try:
-            return cls(makeface_object.Face())
-        except StdFail_NotDone as err:
+            return cls(kernel.add_holes(surface_face.wrapped, wires))
+        except kernel.failure_types as err:
             raise RuntimeError(
                 "Error adding interior hole in non-planar face with provided interior_wires"
             ) from err
@@ -1649,12 +1635,7 @@ class Face(Mixin2D[TopoDS_Face]):
         surface_face = cls._build_surface_face(
             surface,
             "Error building non-planar face with provided exterior",
-            (
-                Standard_Failure,
-                StdFail_NotDone,
-                Standard_NoSuchObject,
-                Standard_ConstructionError,
-            ),
+            kernel.failure_types,
         )
         if surface_point_vectors:
             for point in surface_point_vectors:
@@ -1662,12 +1643,7 @@ class Face(Mixin2D[TopoDS_Face]):
             surface_face = cls._build_surface_face(
                 surface,
                 "Error building non-planar face with provided surface_points",
-                (
-                    Standard_Failure,
-                    StdFail_NotDone,
-                    Standard_NoSuchObject,
-                    Standard_ConstructionError,
-                ),
+                kernel.failure_types,
             )
 
         # Next, add wires that define interior holes - note these wires must be entirely interior
@@ -1852,12 +1828,7 @@ class Face(Mixin2D[TopoDS_Face]):
         try:
             patch.Build()
             result = cls(TopoDS.Face(patch.Shape()))
-        except (
-            Standard_Failure,
-            StdFail_NotDone,
-            Standard_NoSuchObject,
-            Standard_ConstructionError,
-        ) as err:
+        except kernel.failure_types as err:
             raise RuntimeError(
                 "Error building non-planar face with provided constraints"
             ) from err
@@ -2061,7 +2032,9 @@ class Face(Mixin2D[TopoDS_Face]):
 
         chamfered_face = self.__class__(chamfered_wires[0], chamfered_wires[1:])
         if self.normal_at() != chamfered_face.normal_at():
-            chamfered_face = -chamfered_face  # pylint: disable=invalid-unary-operand-type
+            chamfered_face = (
+                -chamfered_face
+            )  # pylint: disable=invalid-unary-operand-type
         chamfered_face._made_by(
             record.add_modified(self.wrapped, chamfered_face.wrapped)
         )
@@ -2341,7 +2314,7 @@ class Face(Mixin2D[TopoDS_Face]):
         z_dir = Vector(du).cross(Vector(dv)).normalized()
         # The surface normal ignores the face orientation flag, so flip it to
         # match the face's actual normal direction (see normal_at).
-        if self.wrapped.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
+        if kernel.is_reversed(self.wrapped):
             z_dir = -z_dir
         x_dir = (
             Vector(user_x_dir).normalized()
@@ -2378,12 +2351,11 @@ class Face(Mixin2D[TopoDS_Face]):
 
         """
         # Add wires that define interior holes - note these wires must be entirely interior
-        makeface_object = BRepBuilderAPI_MakeFace(self.wrapped)
-        for interior_wire in interior_wires:
-            makeface_object.Add(interior_wire.wrapped)
         try:
-            surface_face = Face(makeface_object.Face())
-        except StdFail_NotDone as err:
+            surface_face = Face(
+                kernel.add_holes(self.wrapped, [w.wrapped for w in interior_wires])
+            )
+        except kernel.failure_types as err:
             raise RuntimeError(
                 "Error adding interior hole in non-planar face with provided interior_wires"
             ) from err
@@ -3035,14 +3007,10 @@ class Shell(Mixin2D[TopoDS_Shell]):
             ):
                 raise ValueError("a sheet's cylindrical faces need a positive radius")
 
-        sewing = BRepBuilderAPI_Sewing()
-        for face in faces:
-            sewing.Add(face.wrapped)
-        sewing.Perform()
-        sewn = downcast(sewing.SewedShape())
-        if isinstance(sewn, TopoDS_Face):
+        sewn, sewing = kernel.sew([face.wrapped for face in faces])
+        if kernel.is_kind(sewn, TopoKind.FACE):
             shell = cls(Face(sewn))  # one face is a sheet of one face
-        elif isinstance(sewn, TopoDS_Shell):
+        elif kernel.is_kind(sewn, TopoKind.SHELL):
             shell = cls(sewn)
         else:
             raise ValueError("Sheet faces must sew into one connected shell")
@@ -3361,6 +3329,6 @@ def _merge_coplanar_faces(
     return merged, records
 
 
-Shape.register_shape_constructor(ta.TopAbs_FACE, Face)
-Shape.register_shape_constructor(ta.TopAbs_SHELL, Shell)
+Shape.register_shape_constructor(TopoKind.FACE, Face)
+Shape.register_shape_constructor(TopoKind.SHELL, Shell)
 Shape.register_geometry_constructor(Plane, Face)

@@ -15,12 +15,15 @@ from build123d.kernel.base import (
     SurfaceView,
     SweepTransition,
     TopoKind,
+    WireStatus,
 )
+from build123d.kernel.base import AncestorMap
 from build123d.kernel.occt import OcctKernel
 
 kernel: Kernel = OcctKernel()
 
 __all__ = [
+    "AncestorMap",
     "BoolOp",
     "CurveView",
     "Handle",
@@ -29,6 +32,7 @@ __all__ = [
     "SurfaceView",
     "SweepTransition",
     "TopoKind",
+    "WireStatus",
     "OcctKernel",
     "kernel",
 ]

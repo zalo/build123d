@@ -62,15 +62,12 @@ from collections.abc import Iterable
 import OCP.TopAbs as ta
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve2d
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+
 from OCP.BRepTools import BRepTools
-from OCP.IntTools import IntTools_FClass2d
-from OCP.TopExp import TopExp, TopExp_Explorer
-from OCP.collections import (
-    IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher,
-)
+
+
 from OCP.TopoDS import TopoDS, TopoDS_Face, TopoDS_Vertex, TopoDS_Edge
-from OCP.gp import gp_Pnt, gp_Pnt2d, gp_Vec2d
+from OCP.gp import gp_Pnt2d, gp_Vec2d
 from build123d.geometry import (
     TOLERANCE,
     Matrix,
@@ -82,7 +79,7 @@ from build123d.geometry import (
 )
 from build123d.kernel import TopoKind, kernel
 from build123d.build_enums import Convexity, Keep, Select, Unit
-from .kernel import list_shapes
+
 from .shape_core import Shape, ShapeList, TrimmingTool, downcast, find_same_topods
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -142,11 +139,7 @@ class Vertex(Shape[TopoDS_Vertex]):
         if v is not None:
             x, y, z = itertools.islice(itertools.chain(v, [0, 0, 0]), 3)
 
-        ocp_vx = (
-            downcast(BRepBuilderAPI_MakeVertex(gp_Pnt(x, y, z)).Vertex())
-            if ocp_vx is None
-            else ocp_vx
-        )
+        ocp_vx = downcast(kernel.make_vertex((x, y, z))) if ocp_vx is None else ocp_vx
 
         super().__init__(ocp_vx)
 
@@ -291,8 +284,8 @@ class Vertex(Shape[TopoDS_Vertex]):
         u_min, u_max, v_min, v_max = BRepTools.UVBounds_s(face)
         step = 1e-4 * ((u_max - u_min) ** 2 + (v_max - v_min) ** 2) ** 0.5 / span
         here = BRep_Tool.Parameters_s(self.wrapped, face)
-        probe = gp_Pnt2d(here.X() + bisector[0] * step, here.Y() + bisector[1] * step)
-        inside = IntTools_FClass2d(face, TOLERANCE).Perform(probe) == ta.TopAbs_IN
+        probe = (here.X() + bisector[0] * step, here.Y() + bisector[1] * step)
+        inside = kernel.uv_in_face(face, probe, TOLERANCE)
         return Convexity.CONVEX if inside else Convexity.CONCAVE
 
     def _crease_convexity(self) -> Convexity:
@@ -303,21 +296,15 @@ class Vertex(Shape[TopoDS_Vertex]):
                 "this vertex was not selected from a shape, so there is nothing "
                 "to classify it against - take it from a face or solid"
             )
-        vertex_edge_map = (
-            IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
+        vertex_edge_map = kernel.ancestors(
+            parent.wrapped, TopoKind.VERTEX, TopoKind.EDGE
         )
-        TopExp.MapShapesAndAncestors_s(
-            parent.wrapped, ta.TopAbs_VERTEX, ta.TopAbs_EDGE, vertex_edge_map
-        )
-        own = find_same_topods(
-            self.wrapped,
-            (vertex_edge_map.FindKey(i + 1) for i in range(vertex_edge_map.Extent())),
-        )
+        own = find_same_topods(self.wrapped, vertex_edge_map.keys())
         if own is None:
             raise ValueError("this vertex is not part of its topo_parent")
 
         kinds: set[Convexity] = set()
-        for topods_edge in list_shapes(vertex_edge_map.FindFromKey(own)):
+        for topods_edge in vertex_edge_map.get(own):
             edge = Shape.cast(topods_edge)
             edge.topo_path = self.topo_path
             kinds.add(edge.convexity)
@@ -329,25 +316,25 @@ class Vertex(Shape[TopoDS_Vertex]):
         return Convexity.SADDLE
 
     @property
-    def _point(self) -> gp_Pnt:
+    def _point(self) -> tuple[float, float, float]:
         """The kernel point, including the current Location"""
         self._needs_geometry("position")
-        return BRep_Tool.Pnt_s(self.wrapped)
+        return kernel.vertex_point(self.wrapped)
 
     @property
     def X(self) -> float:
         """The X coordinate of this Vertex, including its current Location."""
-        return self._point.X()
+        return self._point[0]
 
     @property
     def Y(self) -> float:
         """The Y coordinate of this Vertex, including its current Location."""
-        return self._point.Y()
+        return self._point[1]
 
     @property
     def Z(self) -> float:
         """The Z coordinate of this Vertex, including its current Location."""
-        return self._point.Z()
+        return self._point[2]
 
     # ---- Class Methods ----
 
@@ -532,7 +519,7 @@ def topo_explore_common_vertex(
     return Vertex()  # No common vertex found
 
 
-Shape.register_shape_constructor(ta.TopAbs_VERTEX, Vertex)
+Shape.register_shape_constructor(TopoKind.VERTEX, Vertex)
 Shape.register_geometry_constructor(Vector, Vertex)
 Shape.register_geometry_constructor(
     Location, lambda location: Vertex(location.position)

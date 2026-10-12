@@ -63,7 +63,7 @@ from typing_extensions import Self
 
 from bd_materials import FinishedMaterial
 
-import OCP.TopAbs as ta
+
 from OCP.Font import Font_SystemFont
 from OCP.gp import gp_Ax3
 from OCP.Graphic3d import (
@@ -77,13 +77,13 @@ from OCP.Graphic3d import (
 )
 from OCP.NCollection import NCollection_String
 from OCP.StdPrs import StdPrs_BRepTextBuilder as Font_BRepTextBuilder, StdPrs_BRepFont
-from OCP.TopAbs import TopAbs_ShapeEnum
+
 from OCP.TopoDS import (
     TopoDS,
-    TopoDS_Builder,
     TopoDS_Compound,
-    TopoDS_Iterator,
 )
+
+
 from anytree import PreOrderIter
 from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.build_enums import Align, CenterOf, FontStyle, Select, TextAlign, Unit
@@ -554,7 +554,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
         Check if empty.
         """
 
-        return not self.is_empty and TopoDS_Iterator(self.wrapped).More()
+        return not self.is_empty and bool(kernel.direct_children(self.wrapped))
 
     def __iter__(self) -> Iterator[Shape]:
         """
@@ -562,11 +562,8 @@ class Compound(Mixin3D[TopoDS_Compound]):
 
         """
 
-        iterator = TopoDS_Iterator(self.wrapped)
-
-        while iterator.More():
-            yield Compound.cast(iterator.Value())
-            iterator.Next()
+        for child in kernel.direct_children(self.wrapped):
+            yield Compound.cast(child)
 
     def __len__(self) -> int:
         """Return the number of subshapes"""
@@ -618,7 +615,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
             middle = Vector(
                 kernel.center_of_mass(
                     self.wrapped,
-                    TopoKind.from_label(Shape.shape_LUT[unwrapped_shapetype(self)]),
+                    unwrapped_shapetype(self),
                 )
             )
         else:  # center_of == CenterOf.BOUNDING_BOX:
@@ -730,23 +727,19 @@ class Compound(Mixin3D[TopoDS_Compound]):
         """
 
         type_map = {
-            Vertex: TopAbs_ShapeEnum.TopAbs_VERTEX,
-            Edge: TopAbs_ShapeEnum.TopAbs_EDGE,
-            Face: TopAbs_ShapeEnum.TopAbs_FACE,
-            Shell: TopAbs_ShapeEnum.TopAbs_SHELL,
-            Solid: TopAbs_ShapeEnum.TopAbs_SOLID,
-            Wire: TopAbs_ShapeEnum.TopAbs_WIRE,
-            Compound: TopAbs_ShapeEnum.TopAbs_COMPOUND,
+            Vertex: TopoKind.VERTEX,
+            Edge: TopoKind.EDGE,
+            Face: TopoKind.FACE,
+            Shell: TopoKind.SHELL,
+            Solid: TopoKind.SOLID,
+            Wire: TopoKind.WIRE,
+            Compound: TopoKind.COMPOUND,
         }
         results = []
         for comp in self.compounds():
-            iterator = TopoDS_Iterator()
-            iterator.Initialize(comp.wrapped)
-            while iterator.More():
-                child = iterator.Value()
-                if child.ShapeType() == type_map[obj_type]:
+            for child in kernel.direct_children(comp.wrapped):
+                if kernel.kind(child) is type_map[obj_type]:
                     results.append(obj_type(downcast(child)))  # type: ignore
-                iterator.Next()
 
         return results
 
@@ -1005,8 +998,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
         Args:
           shape: Shape:
         """
-        comp_builder = TopoDS_Builder()
-        comp_builder.Remove(self.wrapped, shape.wrapped)
+        kernel.remove_from_compound(self.wrapped, shape.wrapped)
         return self
 
 
@@ -1077,5 +1069,5 @@ Shape.register_composite_factory(2, Sketch)
 Shape.register_composite_factory(3, Part)
 
 
-Shape.register_shape_constructor(ta.TopAbs_COMPOUND, Compound)
-Shape.register_shape_constructor(ta.TopAbs_COMPSOLID, Compound)
+Shape.register_shape_constructor(TopoKind.COMPOUND, Compound)
+Shape.register_shape_constructor(TopoKind.COMPSOLID, Compound)

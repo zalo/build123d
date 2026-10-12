@@ -343,7 +343,9 @@ class Trace:
     def __init__(self, history: ShapeHistory, inputs: Iterable[TopoDS_Shape]):
         self.untouched = Map_TopoDS_Shape_TopTools_ShapeMapHasher()
         self.modified_from = DataMap_TopoDS_Shape_TopoDS_Shape_TopTools_ShapeMapHasher()
-        self.generated_from = DataMap_TopoDS_Shape_TopoDS_Shape_TopTools_ShapeMapHasher()
+        self.generated_from = (
+            DataMap_TopoDS_Shape_TopoDS_Shape_TopTools_ShapeMapHasher()
+        )
         for sub in tracked_subshapes(inputs):
             self.untouched.Add(sub)
             for shape in history.modified(sub):

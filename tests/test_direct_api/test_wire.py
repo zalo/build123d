@@ -734,7 +734,7 @@ class TestWireValidation(unittest.TestCase):
         builder.IsDone.return_value = False
         builder.Error.return_value = BRepBuilderAPI_EmptyWire
         with patch(
-            "build123d.topology.one_d.BRepBuilderAPI_MakeWire", return_value=builder
+            "build123d.kernel.occt.BRepBuilderAPI_MakeWire", return_value=builder
         ):
             with self.assertRaisesRegex(RuntimeError, "Wire is empty"):
                 Wire([Edge.make_line((0, 0), (1, 0))])
@@ -744,7 +744,7 @@ class TestWireValidation(unittest.TestCase):
         builder.IsDone.return_value = False
         builder.Error.return_value = BRepBuilderAPI_NonManifoldWire
         with patch(
-            "build123d.topology.one_d.BRepBuilderAPI_MakeWire", return_value=builder
+            "build123d.kernel.occt.BRepBuilderAPI_MakeWire", return_value=builder
         ):
             with self.assertWarnsRegex(UserWarning, "non manifold"):
                 # _make_wire directly: the mocked builder's Wire() is not a

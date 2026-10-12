@@ -107,7 +107,52 @@ class SweepTransition(Enum):
     RIGHT = "right"
 
 
+class WireStatus(Enum):
+    """What the kernel found when it chained edges into a wire."""
+
+    OK = "ok"
+    NON_MANIFOLD = "non_manifold"
+    EMPTY = "empty"
+    DISCONNECTED = "disconnected"
+
+
 Point = tuple[float, float, float]
+
+
+class AncestorMap:
+    """Sub-shapes of one kind inside a parent and, for each, the sub-shapes
+    of a higher kind that contain it (an edge's faces, a vertex's edges).
+
+    Keys are looked up by :meth:`Kernel.hash_key`, so a handle that is the
+    same entity at the same placement finds its entry whatever its
+    orientation, while a moved copy does not.
+    """
+
+    def __init__(
+        self, kernel: Kernel, entries: Sequence[tuple[Handle, Sequence[Handle]]]
+    ):
+        self._keys = [key for key, _ in entries]
+        self._by_key = {
+            kernel.hash_key(key): list(ancestors) for key, ancestors in entries
+        }
+        self._kernel = kernel
+
+    def keys(self) -> list[Handle]:
+        """The sub-shapes, in kernel order."""
+        return list(self._keys)
+
+    def __len__(self) -> int:
+        return len(self._keys)
+
+    def __contains__(self, shape: Handle) -> bool:
+        return self._kernel.hash_key(shape) in self._by_key
+
+    def get(self, shape: Handle) -> list[Handle]:
+        """The ancestors of ``shape``; KeyError when it is not a key."""
+        return self._by_key[self._kernel.hash_key(shape)]
+
+    def items(self) -> list[tuple[Handle, list[Handle]]]:
+        return [(key, self.get(key)) for key in self._keys]
 
 
 class CurveView(ABC):
@@ -341,6 +386,101 @@ class KernelGeometry(ABC):
     def make_solid(self, shells: Sequence[Handle]) -> Handle:
         """A solid bounded by ``shells`` (the first outer, the rest voids)."""
 
+    @abstractmethod
+    def make_vertex(self, point: Point) -> Handle: ...
+
+    @abstractmethod
+    def vertex_point(self, vertex: Handle) -> Point:
+        """Where a vertex is, its placement applied."""
+
+    @abstractmethod
+    def make_wire(self, shapes: Sequence[Handle]) -> tuple[Handle | None, WireStatus]:
+        """Chain edges (or the edges of wires) into one wire.
+
+        Consecutive edges are added together so that the kernel may order
+        them; a wire is added whole. The wire is None when the status is
+        EMPTY or DISCONNECTED; a NON_MANIFOLD wire is still returned.
+        """
+
+    @abstractmethod
+    def make_wire_placed(self, edges: Sequence[Handle]) -> tuple[Handle, list[Handle]]:
+        """Chain ``edges`` one at a time into a wire, returning it and each
+        edge as it was placed (the kernel may copy edges so neighbours share
+        vertices)."""
+
+    @abstractmethod
+    def make_planar_face(self, outer: Handle, inners: Sequence[Handle]) -> Handle:
+        """A planar face bounded by the closed wire ``outer`` with ``inners``
+        as holes; raises ValueError when the kernel cannot build it."""
+
+    @abstractmethod
+    def add_holes(self, face: Handle, wires: Sequence[Handle]) -> Handle:
+        """``face`` with ``wires`` cut out of it as holes on its own surface."""
+
+    @abstractmethod
+    def face_of_plane(self, plane: Handle) -> Handle:
+        """The unbounded face of a plane (``gp_Pln`` for the OCCT backend)."""
+
+    @abstractmethod
+    def make_shell(self, faces: Sequence[Handle]) -> Handle:
+        """A shell holding ``faces`` as they are, with no sewing."""
+
+    @abstractmethod
+    def sew(self, faces: Sequence[Handle]) -> tuple[Handle, Any]:
+        """Sew ``faces`` together along their shared edges; the result is a
+        shell, a single face, or a compound of what could not be joined;
+        plus the history record."""
+
+    @abstractmethod
+    def make_compound(self, shapes: Sequence[Handle]) -> Handle: ...
+
+    @abstractmethod
+    def remove_from_compound(self, compound: Handle, shape: Handle) -> None:
+        """Take ``shape`` out of ``compound`` in place."""
+
+    @abstractmethod
+    def transformed(
+        self, shape: Handle, transform: Handle, copy: bool = True
+    ) -> tuple[Handle, Any]:
+        """``shape`` under a rigid or similarity transform (``gp_Trsf``),
+        geometry types kept; plus the history record."""
+
+    @abstractmethod
+    def transformed_general(self, shape: Handle, transform: Handle) -> Handle:
+        """``shape`` under a general affine transform (``gp_GTrsf``), which
+        converts its geometry to splines where needed."""
+
+    # ---- distance and classification ----------------------------------------
+
+    @abstractmethod
+    def distance(self, a: Handle, b: Handle) -> float:
+        """The least distance between two shapes."""
+
+    @abstractmethod
+    def closest_points(self, a: Handle, b: Handle) -> tuple[float, Point, Point]:
+        """The least distance and a pair of points on ``a`` and ``b`` that realise it."""
+
+    @abstractmethod
+    def extrema(
+        self, a: Handle, b: Handle, deflection: float | None = None
+    ) -> tuple[float, list[tuple[Point, Point]]]:
+        """The least distance between ``a`` and ``b`` and every pair of
+        points that realises it; ``(inf, [])`` when the search fails."""
+
+    @abstractmethod
+    def point_in_solid(self, solid: Handle, point: Point, tolerance: float) -> bool:
+        """Whether ``point`` is inside ``solid`` or on its boundary."""
+
+    @abstractmethod
+    def point_on_face(self, face: Handle, point: Point, tolerance: float) -> bool:
+        """Whether ``point`` lies on ``face``, its edges included."""
+
+    @abstractmethod
+    def uv_in_face(
+        self, face: Handle, uv: tuple[float, float], tolerance: float
+    ) -> bool:
+        """Whether the surface parameters ``uv`` fall inside the face's trim."""
+
     # ---- tessellation -------------------------------------------------------
 
     @abstractmethod
@@ -364,6 +504,10 @@ class Kernel(KernelGeometry):
     """
 
     name: str = "abstract"
+
+    failure_types: tuple[type[BaseException], ...] = ()
+    """The exception types the backend raises when an operation cannot be
+    done; what a caller catches around a kernel call that may fail."""
 
     # ---- handles and identity ------------------------------------------------
 
@@ -417,6 +561,57 @@ class Kernel(KernelGeometry):
         orientation it has in that use.
         """
 
+    @abstractmethod
+    def direct_children(self, shape: Handle) -> list[Handle]:
+        """The shapes one level down inside ``shape`` (a compound's members,
+        a solid's shells, an edge's vertices), with the parent's placement
+        and orientation applied to each."""
+
+    @abstractmethod
+    def ancestors(
+        self, shape: Handle, sub_kind: TopoKind, ancestor_kind: TopoKind
+    ) -> AncestorMap:
+        """Every sub-shape of ``sub_kind`` in ``shape`` with the sub-shapes of
+        ``ancestor_kind`` that contain it."""
+
+    @abstractmethod
+    def edge_vertices(self, edge: Handle) -> tuple[Handle, Handle]:
+        """The first and last vertex of an edge in its own parameter direction."""
+
+    @abstractmethod
+    def is_closed(self, shape: Handle) -> bool:
+        """Whether an edge or wire ends where it starts, or a shell or solid
+        is closed."""
+
+    @abstractmethod
+    def is_degenerate(self, edge: Handle) -> bool:
+        """Whether an edge has no length (a pole of a sphere, an apex of a cone)."""
+
+    # ---- orientation --------------------------------------------------------
+
+    @abstractmethod
+    def is_forward(self, shape: Handle) -> bool:
+        """True when ``shape`` runs with its underlying geometry."""
+
+    @abstractmethod
+    def is_reversed(self, shape: Handle) -> bool:
+        """True when ``shape`` runs against its underlying geometry."""
+
+    @abstractmethod
+    def reverse(self, shape: Handle) -> None:
+        """Flip the orientation of ``shape`` in place."""
+
+    @abstractmethod
+    def reversed(self, shape: Handle) -> Handle:
+        """The same entity with its orientation flipped."""
+
+    @abstractmethod
+    def same_orientation(self, a: Handle, b: Handle) -> bool: ...
+
+    @abstractmethod
+    def orient_like(self, shape: Handle, like: Handle) -> None:
+        """Give ``shape`` the orientation of ``like``, in place."""
+
     # ---- validity and repair ------------------------------------------------
 
     @abstractmethod
@@ -440,6 +635,11 @@ class Kernel(KernelGeometry):
     @abstractmethod
     def length(self, shape: Handle) -> float:
         """Total length of the edges in ``shape``."""
+
+    @abstractmethod
+    def measure(self, shape: Handle, kind: TopoKind) -> float:
+        """The size of ``shape`` measured as a ``kind``: length of edges and
+        wires, area of faces and shells, volume of solids and compounds."""
 
     @abstractmethod
     def center_of_mass(

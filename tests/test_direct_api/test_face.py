@@ -1897,7 +1897,7 @@ class TestSurfaceHoles(unittest.TestCase):
 
     def test_make_holes_reports_a_failure(self):
         with patch(
-            "build123d.topology.two_d.BRepBuilderAPI_MakeFace",
+            "build123d.kernel.occt.BRepBuilderAPI_MakeFace",
             return_value=self._failing_make_face(),
         ):
             with self.assertRaisesRegex(RuntimeError, "Error adding interior hole"):
@@ -1905,7 +1905,7 @@ class TestSurfaceHoles(unittest.TestCase):
 
     def test_add_surface_holes_reports_a_failure(self):
         with patch(
-            "build123d.topology.two_d.BRepBuilderAPI_MakeFace",
+            "build123d.kernel.occt.BRepBuilderAPI_MakeFace",
             return_value=self._failing_make_face(),
         ):
             with self.assertRaisesRegex(RuntimeError, "Error adding interior hole"):
