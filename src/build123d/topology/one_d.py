@@ -84,13 +84,13 @@ from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
 
 
 from OCP.TopoDS import (
-    TopoDS_Compound,
     TopoDS_Edge,
     TopoDS_Face,
     TopoDS_Shape,
     TopoDS_Vertex,
     TopoDS_Wire,
 )
+
 
 from scipy.optimize import minimize_scalar
 from scipy.spatial import ConvexHull
@@ -3207,8 +3207,6 @@ class Edge(Mixin1D[TopoDS_Edge]):
         if self.is_empty:
             raise ValueError("An empty edge can't be reversed")
 
-        assert isinstance(self._wrapped, TopoDS_Edge)
-
         reversed_edge = copy.deepcopy(self)
         # pylint: disable=attribute-defined-outside-init
         if reconstruct:
@@ -3454,7 +3452,7 @@ class Wire(Mixin1D[TopoDS_Wire]):
 
         if args:
             l_a = len(args)
-            if isinstance(args[0], TopoDS_Wire):
+            if kernel.is_kind(args[0], TopoKind.WIRE):
                 obj, label, color, parent = args[:4] + (None,) * (4 - l_a)
             elif isinstance(args[0], Edge):
                 edge, label, color, parent = args[:4] + (None,) * (4 - l_a)
@@ -3462,7 +3460,7 @@ class Wire(Mixin1D[TopoDS_Wire]):
                 wire, label, color, parent = args[:4] + (None,) * (4 - l_a)
             elif (
                 hasattr(args[0], "wrapped")
-                and isinstance(args[0].wrapped, TopoDS_Compound)
+                and kernel.is_kind(args[0].wrapped, TopoKind.COMPOUND)
                 and topods_dim(args[0].wrapped) == 1
             ):  # Curve
                 curve, label, color, parent = args[:4] + (None,) * (4 - l_a)
@@ -3984,7 +3982,7 @@ class Wire(Mixin1D[TopoDS_Wire]):
         # Transform the wire back to the original location not that of the wire_pln
         old_loc = globalized_filleted_wire.location
         # pylint: disable=attribute-defined-outside-init
-        new_loc = Location(self._wrapped.Location())
+        new_loc = Location(kernel.location_of(self._wrapped))
         geometry_adjust = new_loc.inverse() * old_loc
         trsf = geometry_adjust.wrapped.Transformation()
         base_wire = kernel.located(
@@ -4572,7 +4570,7 @@ def topo_explore_connected_edges(
     if relocation.IsIdentity():
         return ShapeList(Edge(e) for e in connected_edges)
     return ShapeList(
-        Edge(tcast(TopoDS_Edge, downcast(e.Moved(relocation)))) for e in connected_edges
+        Edge(tcast(TopoDS_Edge, kernel.moved(e, relocation))) for e in connected_edges
     )
 
 

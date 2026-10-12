@@ -68,7 +68,6 @@ from OCP.TopoDS import (
     TopoDS_Compound,
     TopoDS_Face,
     TopoDS_Shape,
-    TopoDS_Shell,
     TopoDS_Solid,
     TopoDS_Wire,
 )
@@ -1278,9 +1277,9 @@ class Solid(Mixin3D[TopoDS_Solid]):
 
         # For each of the top level Shells and Faces
         for top_level_shape in top_level_shapes:
-            if isinstance(top_level_shape, TopoDS_Face):
+            if kernel.is_kind(top_level_shape, TopoKind.FACE):
                 modified_target_surfaces.append(Face(top_level_shape))
-            elif isinstance(top_level_shape, TopoDS_Shell):
+            elif kernel.is_kind(top_level_shape, TopoKind.SHELL):
                 modified_target_surfaces.append(Shell(top_level_shape))
             else:
                 raise RuntimeError(f"Invalid sewn shape {type(top_level_shape)}")

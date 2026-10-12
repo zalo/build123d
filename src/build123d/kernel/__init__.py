@@ -24,7 +24,9 @@ from build123d.kernel.occt import OcctKernel
 
 
 def _select_backend() -> Kernel:
-    """The backend named by ``BUILD123D_KERNEL``: ``occt`` (default) or ``smlib``."""
+    """The backend named by ``BUILD123D_KERNEL``: ``occt`` (default), ``smlib``
+    (OCCT handles, solid operations through usd_brep) or ``smcore`` (SMLib
+    handles through the generated kernel-level bindings)."""
     name = os.environ.get("BUILD123D_KERNEL", "occt").strip().lower()
     if name == "occt":
         return OcctKernel()
@@ -34,7 +36,15 @@ def _select_backend() -> Kernel:
         )  # pylint: disable=import-outside-toplevel
 
         return SmlibKernel()
-    raise ValueError(f"unknown kernel backend {name!r}; use 'occt' or 'smlib'")
+    if name == "smcore":
+        from build123d.kernel.smlib_core import (  # pylint: disable=import-outside-toplevel
+            SmlibCoreKernel,
+        )
+
+        return SmlibCoreKernel()
+    raise ValueError(
+        f"unknown kernel backend {name!r}; use 'occt', 'smlib' or 'smcore'"
+    )
 
 
 kernel: Kernel = _select_backend()

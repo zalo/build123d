@@ -38,6 +38,7 @@ from OCP.TopoDS import TopoDS_Builder, TopoDS_CompSolid
 import numpy as np
 from OCP.BRepGProp import BRepGProp
 from OCP.GProp import GProp_GProps
+from build123d.kernel import TopoKind, kernel
 from build123d.build_common import Locations
 from build123d.build_enums import Align, Extrinsic, GeomType, Intrinsic, Mode
 from build123d.build_part import BuildPart
@@ -832,14 +833,14 @@ class TestPlaneValidation(unittest.TestCase):
         with self.assertRaisesRegex(TypeError, "Expected gp_Pln"):
             Plane((0, 0, 0), (0, 0, 0))
 
-    def test_local_coords_of_an_unknown_shape_type(self):
-        """TopoDS_CompSolid has no entry in the downcast table."""
+    def test_local_coords_of_a_comp_solid(self):
+        """Every kind the kernel knows is relocated, a CompSolid included."""
         comp_solid = TopoDS_CompSolid()
         TopoDS_Builder().MakeCompSolid(comp_solid)
         holder = Solid()
         holder.wrapped = comp_solid
-        with self.assertRaisesRegex(ValueError, "Unknown object type"):
-            Plane.XY.to_local_coords(holder)
+        moved = Plane((1, 2, 3)).to_local_coords(holder)
+        self.assertEqual(kernel.kind(moved.wrapped), TopoKind.COMPSOLID)
 
 
 if __name__ == "__main__":

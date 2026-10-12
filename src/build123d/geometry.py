@@ -40,7 +40,7 @@ import itertools
 import json
 import logging
 import warnings
-from collections.abc import Callable, Iterable, Iterator, Sequence
+from collections.abc import Iterable, Iterator, Sequence
 from math import acos, asin, copysign, degrees, log10, pi, prod, radians, sqrt
 from typing import (
     TYPE_CHECKING,
@@ -57,13 +57,13 @@ from typing import (
 import numpy as np
 from sys import float_info
 
-from build123d.kernel import kernel
+from build123d.kernel import TopoKind, kernel
 import webcolors  # type: ignore
 from typing_extensions import deprecated
 from OCP.Bnd import Bnd_Box, Bnd_OBB
 from OCP.BRep import BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face  # used for mass calculation
 from OCP.Geom import Geom_BoundedSurface, Geom_ElementarySurface, Geom_Line, Geom_Plane
 from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_IntSS, GeomAPI_ProjectPointOnSurf
@@ -87,9 +87,9 @@ from OCP.gp import (
 # properties used to store mass calculation result
 from OCP.GProp import GProp_GProps
 from OCP.Quantity import Quantity_Color, Quantity_ColorRGBA, Quantity_TypeOfColor
-from OCP.TopAbs import TopAbs_ShapeEnum
+
 from OCP.TopLoc import TopLoc_Location
-from OCP.TopoDS import TopoDS, TopoDS_Edge, TopoDS_Face, TopoDS_Shape, TopoDS_Vertex
+from OCP.TopoDS import TopoDS_Face, TopoDS_Shape, TopoDS_Vertex
 
 from build123d.build_enums import Align, Align2D, Align3D, Extrinsic, Intrinsic
 
@@ -771,7 +771,7 @@ class Axis(metaclass=AxisMeta):
                 gp_ax1 = arg
             elif isinstance(arg, Location):
                 location = arg
-            elif hasattr(arg, "wrapped") and isinstance(arg.wrapped, TopoDS_Edge):
+            elif hasattr(arg, "wrapped") and kernel.is_kind(arg.wrapped, TopoKind.EDGE):
                 edge = arg
             elif isinstance(arg, (Vector, tuple)):
                 origin = arg
@@ -788,17 +788,15 @@ class Axis(metaclass=AxisMeta):
 
         # Handle edge-based construction
         if edge is not None:
-            if not (hasattr(edge, "wrapped") and isinstance(edge.wrapped, TopoDS_Edge)):
+            if not (
+                hasattr(edge, "wrapped") and kernel.is_kind(edge.wrapped, TopoKind.EDGE)
+            ):
                 raise ValueError(f"Invalid edge argument: {edge}")
 
-            topods_edge: TopoDS_Edge = edge.wrapped  # type: ignore[annotation-unchecked]
-            curve = BRep_Tool.Curve_s(topods_edge, float(), float())
-            param_min, _ = BRep_Tool.Range_s(topods_edge)
-            origin_pnt = gp_Pnt()
-            tangent_vec = gp_Vec()
-            curve.D1(param_min, origin_pnt, tangent_vec)
-            origin = Vector(origin_pnt)
-            direction = Vector(gp_Dir(tangent_vec))
+            curve = kernel.curve_of(edge.wrapped)
+            origin_point, tangent = curve.d1(curve.first)
+            origin = Vector(origin_point)
+            direction = Vector(tangent).normalized()
 
         # Convert location to axis
         if location is not None:
@@ -1163,7 +1161,7 @@ class BoundBox:
             topo_arg = getattr(first_arg, "_wrapped", first_arg)
             if bounding_box is None and isinstance(args[0], Bnd_Box):
                 bounding_box = args[0]
-            elif isinstance(topo_arg, TopoDS_Shape) or (
+            elif kernel.is_handle(topo_arg) or (
                 hasattr(first_arg, "_wrapped") and topo_arg is None
             ):
                 shape = first_arg
@@ -1183,7 +1181,7 @@ class BoundBox:
 
         if shape is not None:
             topo_shape = getattr(shape, "_wrapped", shape)
-            if topo_shape is not None and not isinstance(topo_shape, TopoDS_Shape):
+            if topo_shape is not None and not kernel.is_handle(topo_shape):
                 raise TypeError(f"Invalid argument for shape: {topo_shape}")
 
             bounding_box = Bnd_Box()
@@ -3200,7 +3198,7 @@ class Plane(metaclass=PlaneMeta):
             elif (
                 arg_face is None
                 and hasattr(arg0, "wrapped")
-                and isinstance(arg0.wrapped, TopoDS_Face)
+                and kernel.is_kind(arg0.wrapped, TopoKind.FACE)
             ):
                 arg_face = arg0
                 if arg_x_dir is None and len(args) > 1:
@@ -3505,9 +3503,10 @@ class Plane(metaclass=PlaneMeta):
             Plane: plane with new origin
 
         """
-        if hasattr(locator, "wrapped") and isinstance(locator.wrapped, TopoDS_Vertex):
-            geom_point = BRep_Tool.Pnt_s(locator.wrapped)
-            new_origin = Vector(geom_point.X(), geom_point.Y(), geom_point.Z())
+        if hasattr(locator, "wrapped") and kernel.is_kind(
+            locator.wrapped, TopoKind.VERTEX
+        ):
+            new_origin = Vector(kernel.vertex_point(locator.wrapped))
             if not self.contains(new_origin):
                 raise ValueError(f"{locator} is not located within plane")
         elif isinstance(locator, tuple) and len(locator) == 2:
@@ -3666,30 +3665,11 @@ class Plane(metaclass=PlaneMeta):
                 gp_Pnt(*local_top_right),
             )
             return BoundBox(local_bbox)
-        if hasattr(obj, "wrapped") and isinstance(obj.wrapped, TopoDS_Shape):  # Shapes
-            # return_value = obj.transform_shape(transform_matrix)
-            downcast_lut: dict[
-                TopAbs_ShapeEnum, Callable[[TopoDS_Shape], TopoDS_Shape]
-            ] = {
-                TopAbs_ShapeEnum.TopAbs_VERTEX: TopoDS.Vertex,
-                TopAbs_ShapeEnum.TopAbs_EDGE: TopoDS.Edge,
-                TopAbs_ShapeEnum.TopAbs_WIRE: TopoDS.Wire,
-                TopAbs_ShapeEnum.TopAbs_FACE: TopoDS.Face,
-                TopAbs_ShapeEnum.TopAbs_SHELL: TopoDS.Shell,
-                TopAbs_ShapeEnum.TopAbs_SOLID: TopoDS.Solid,
-                TopAbs_ShapeEnum.TopAbs_COMPOUND: TopoDS.Compound,
-            }
+        if hasattr(obj, "wrapped") and kernel.is_handle(obj.wrapped):  # Shapes
             assert obj.wrapped is not None
-            try:
-                f_downcast = downcast_lut[obj.wrapped.ShapeType()]
-            except KeyError as exc:
-                raise ValueError(f"Unknown object type {obj}") from exc
-
             new_shape: Shape = copy_module.deepcopy(obj, None)  # type: ignore[arg-type]
-            new_shape.wrapped = f_downcast(
-                BRepBuilderAPI_Transform(
-                    obj.wrapped, transform_matrix.wrapped.Trsf()
-                ).Shape()
+            new_shape.wrapped, _ = kernel.transformed(
+                obj.wrapped, transform_matrix.wrapped.Trsf(), copy=False
             )
             return new_shape
         raise ValueError(

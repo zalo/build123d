@@ -124,7 +124,7 @@ class Vertex(Shape[TopoDS_Vertex]):
             raise ValueError(f"Unexpected argument(s): {', '.join(kwargs.keys())}")
 
         if args:
-            if isinstance(args[0], TopoDS_Vertex):
+            if kernel.is_handle(args[0]):
                 ocp_vx = args[0]
             elif isinstance(args[0], Iterable):
                 v = args[0]
@@ -493,8 +493,8 @@ def topo_explore_common_vertex(
     edge1: Edge | TopoDS_Edge, edge2: Edge | TopoDS_Edge
 ) -> Vertex:
     """Given two edges, find the common vertex; the empty Vertex if there is none"""
-    topods_edge1 = edge1 if isinstance(edge1, TopoDS_Edge) else edge1.wrapped
-    topods_edge2 = edge2 if isinstance(edge2, TopoDS_Edge) else edge2.wrapped
+    topods_edge1 = edge1 if kernel.is_handle(edge1) else edge1.wrapped
+    topods_edge2 = edge2 if kernel.is_handle(edge2) else edge2.wrapped
 
     # Explore vertices of the first edge
     for vertex1 in kernel.sub_shapes(topods_edge1, TopoKind.VERTEX):

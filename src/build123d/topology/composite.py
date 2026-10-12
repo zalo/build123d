@@ -641,9 +641,11 @@ class Compound(Mixin3D[TopoDS_Compound]):
         """compounds - all the compounds in this Shape"""
         if self.is_empty:
             return ShapeList()
-        if isinstance(self.wrapped, TopoDS_Compound):
+        if kernel.is_kind(self.wrapped, TopoKind.COMPOUND):
             # pylint: disable=not-an-iterable
-            sub_compounds = [c for c in self if isinstance(c.wrapped, TopoDS_Compound)]
+            sub_compounds = [
+                c for c in self if kernel.is_kind(c.wrapped, TopoKind.COMPOUND)
+            ]
             sub_compounds.append(self)
         else:
             sub_compounds = []

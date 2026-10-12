@@ -63,7 +63,6 @@ from OCP.TopoDS import (
     TopoDS_Face,
     TopoDS_Shape,
     TopoDS_Shell,
-    TopoDS_Vertex,
     TopoDS_Edge,
     TopoDS_Wire,
 )
@@ -228,15 +227,15 @@ def _make_loft(
     objs = list(objs)  # To determine its length
     if len(objs) < 2:
         raise ValueError("More than one wire is required")
-    vertices = [obj for obj in objs if isinstance(obj.wrapped, TopoDS_Vertex)]
+    vertices = [obj for obj in objs if kernel.is_kind(obj.wrapped, TopoKind.VERTEX)]
     vertex_count = len(vertices)
 
     if vertex_count > 2:
         raise ValueError("Only two vertices are allowed")
 
     if vertex_count == 1 and not (
-        isinstance(objs[0].wrapped, TopoDS_Vertex)
-        or isinstance(objs[-1].wrapped, TopoDS_Vertex)
+        kernel.is_kind(objs[0].wrapped, TopoKind.VERTEX)
+        or kernel.is_kind(objs[-1].wrapped, TopoKind.VERTEX)
     ):
         raise ValueError(
             "The vertex must be either at the beginning or end of the list"
@@ -248,8 +247,8 @@ def _make_loft(
                 "You can't have only 2 vertices to loft; try adding some wires"
             )
         if not (
-            isinstance(objs[0].wrapped, TopoDS_Vertex)
-            and isinstance(objs[-1].wrapped, TopoDS_Vertex)
+            kernel.is_kind(objs[0].wrapped, TopoKind.VERTEX)
+            and kernel.is_kind(objs[-1].wrapped, TopoKind.VERTEX)
         ):
             raise ValueError(
                 "The vertices must be at the beginning and end of the list"

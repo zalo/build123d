@@ -81,8 +81,7 @@ from OCP.GeomAbs import (
 )
 
 
-from OCP.GeomLib import GeomLib_IsPlanarSurface
-from OCP.gp import gp_Ax3, gp_Pln, gp_Pnt
+from OCP.gp import gp_Pnt
 
 from OCP.Precision import Precision
 
@@ -99,7 +98,6 @@ from OCP.TopoDS import (
     TopoDS_Face,
     TopoDS_Shape,
     TopoDS_Shell,
-    TopoDS_Solid,
 )
 
 
@@ -330,7 +328,7 @@ class Mixin2D(ABC, Shape[TOPODS]):
                 return sides[0]
             # Attempt to create a shell
             potential_shell = _sew_topods_faces([s.wrapped for s in sides])
-            if isinstance(potential_shell, TopoDS_Shell):
+            if kernel.is_kind(potential_shell, TopoKind.SHELL):
                 return self.__class__.cast(potential_shell)
             return ShapeList(sides)
 
@@ -787,7 +785,7 @@ class Face(Mixin2D[TopoDS_Face]):
             l_a = len(args)
             if isinstance(args[0], Plane):
                 obj = args[0]
-            elif isinstance(args[0], TopoDS_Shape):
+            elif kernel.is_handle(args[0]):
                 obj, label, color, parent = args[:4] + (None,) * (4 - l_a)
             elif isinstance(args[0], Wire):
                 outer_wire, inner_wires, label, color, parent = args[:5] + (None,) * (
@@ -1122,14 +1120,8 @@ class Face(Mixin2D[TopoDS_Face]):
         """Is the face planar even though its geom_type may not be PLANE - if so return Plane"""
         if self.is_empty:
             return None
-        surface = BRep_Tool.Surface_s(self.wrapped)
-        planar_searcher = GeomLib_IsPlanarSurface(surface, TOLERANCE)
-        if not planar_searcher.IsPlanar():
-            return None
-        pln = planar_searcher.Plan()
-        if not pln.Position().Direct():  # A left-handed plane was returned
-            pln = gp_Pln(gp_Ax3(pln.Position().Ax2()))
-        return Plane(pln)
+        pln = kernel.planar_surface(self.wrapped)
+        return None if pln is None else Plane(pln)
 
     @property
     def length(self) -> None | float:
@@ -1796,11 +1788,11 @@ class Face(Mixin2D[TopoDS_Face]):
 
         # For each of the top level shapes create a ShapeList of Face
         for top_level_shape in top_level_shapes:
-            if isinstance(top_level_shape, TopoDS_Face):
+            if kernel.is_kind(top_level_shape, TopoKind.FACE):
                 sewn_faces.append(ShapeList([Face(top_level_shape)]))
-            elif isinstance(top_level_shape, TopoDS_Shell):
+            elif kernel.is_kind(top_level_shape, TopoKind.SHELL):
                 sewn_faces.append(Shell(top_level_shape).faces())
-            elif isinstance(top_level_shape, TopoDS_Solid):
+            elif kernel.is_kind(top_level_shape, TopoKind.SOLID):
                 sewn_faces.append(
                     ShapeList(
                         Face(f)  # type: ignore[call-overload]
@@ -2467,7 +2459,7 @@ class Face(Mixin2D[TopoDS_Face]):
             topods_shape = _topods_bool_op(
                 (extruded_topods_self,), (target_object.wrapped,), BoolOp.COMMON
             )
-            if not topods_shape.IsNull():
+            if not kernel.is_null(topods_shape):
                 intersected_shapes.extend(
                     Face(tcast(TopoDS_Face, downcast(topods_face)))
                     for topods_face in get_top_level_topods_shapes(topods_shape)

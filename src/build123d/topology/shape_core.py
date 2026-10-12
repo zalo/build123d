@@ -508,7 +508,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         .. deprecated::
             Use :attr:`is_empty` instead.
         """
-        return self.is_empty or self.wrapped.IsNull()
+        return self.is_empty or kernel.is_null(self.wrapped)
 
     @property
     def is_valid(self) -> bool:
@@ -1769,7 +1769,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         """
         if not self.is_empty:  # nothing is nothing wherever it is put
-            self.wrapped.Move(loc.wrapped)
+            kernel.move(self.wrapped, loc.wrapped)
 
         return self
 
@@ -2122,7 +2122,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
             else tool.wrapped
         )
         split_result, _ = kernel.boolean(BoolOp.SPLIT, [self.wrapped], [trim_tool])
-        if split_result.IsNull():
+        if kernel.is_null(split_result):
             raise ValueError("Null TopoDS_Shape object")
         # Remove unnecessary TopoDS_Compound around single shape
         if kernel.is_kind(split_result, TopoKind.COMPOUND):
@@ -2666,7 +2666,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
             topo_result, record = kernel.boolean(
                 operation, before, brought, glue=glue, fuzzy=fuzzy
             )
-            if topo_result.IsNull():
+            if kernel.is_null(topo_result):
                 raise ValueError("Null TopoDS_Shape object")
             history = ShapeHistory(record, before, brought)
 
@@ -3850,7 +3850,7 @@ def _topods_bool_op(
 
     """
     result, _ = kernel.boolean(operation, list(args), list(tools))
-    if result.IsNull():
+    if kernel.is_null(result):
         raise ValueError("Null TopoDS_Shape object")
     # Remove unnecessary TopoDS_Compound around single shape
     if kernel.is_kind(result, TopoKind.COMPOUND):

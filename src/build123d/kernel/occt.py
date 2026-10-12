@@ -1634,6 +1634,17 @@ class _OcctGeometry:
             return BRepBuilderAPI_MakeFace(plane).Face()
         return BRepBuilderAPI_MakeFace(plane, *bounds).Face()
 
+    def planar_surface(self, face: TopoDS_Shape) -> gp_Pln | None:
+        searcher = GeomLib_IsPlanarSurface(
+            BRep_Tool.Surface_s(TopoDS.Face(face)), _PLANAR_TOLERANCE
+        )
+        if not searcher.IsPlanar():
+            return None
+        pln = searcher.Plan()
+        if not pln.Position().Direct():  # a left-handed plane was returned
+            pln = gp_Pln(gp_Ax3(pln.Position().Ax2()))
+        return pln
+
     def surface_axis(self, face: TopoDS_Shape) -> tuple[str, Point, Point] | None:
         surface: Geom_Surface = BRep_Tool.Surface_s(TopoDS.Face(face))
         # strip trimming and offsetting to get at the basis surface
@@ -1812,6 +1823,9 @@ class OcctKernel(_OcctGeometry, Kernel):
 
     def is_null(self, shape: TopoDS_Shape | None) -> bool:
         return shape is None or shape.IsNull()
+
+    def is_handle(self, obj: Any) -> bool:
+        return isinstance(obj, TopoDS_Shape)
 
     def downcast(self, shape: TopoDS_Shape) -> TopoDS_Shape:
         if shape is None or shape.IsNull():
@@ -2096,6 +2110,9 @@ class OcctKernel(_OcctGeometry, Kernel):
 
     def set_location(self, shape: TopoDS_Shape, location: TopLoc_Location) -> None:
         shape.Location(location)
+
+    def move(self, shape: TopoDS_Shape, location: TopLoc_Location) -> None:
+        shape.Move(location)
 
     def located(self, shape: TopoDS_Shape, location: TopLoc_Location) -> TopoDS_Shape:
         return self.downcast(shape.Located(location))

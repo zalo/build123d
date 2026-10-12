@@ -917,6 +917,11 @@ class KernelGeometry(ABC):
         trimmed to ``(u_min, u_max, v_min, v_max)`` in the plane's own axes."""
 
     @abstractmethod
+    def planar_surface(self, face: Handle) -> Handle | None:
+        """The plane (``gp_Pln`` for the OCCT backend, right-handed) a face's
+        surface lies in within tolerance, whatever its type, or None."""
+
+    @abstractmethod
     def surface_axis(self, face: Handle) -> tuple[str, Point, Point] | None:
         """The build123d ``GeomType`` name of the face's basis surface (any
         trimming or offsetting stripped) with the origin and direction of
@@ -1029,6 +1034,10 @@ class Kernel(KernelGeometry):
         """True when ``shape`` is None or the backend's null handle."""
 
     @abstractmethod
+    def is_handle(self, obj: Any) -> bool:
+        """True when ``obj`` is one of this backend's shape handles."""
+
+    @abstractmethod
     def downcast(self, shape: Handle) -> Handle:
         """The same shape as the most specific handle type the backend has."""
 
@@ -1054,7 +1063,11 @@ class Kernel(KernelGeometry):
 
     def is_kind(self, shape: Handle | None, kind: TopoKind) -> bool:
         """True when ``shape`` is a non-null handle of ``kind``."""
-        return not self.is_null(shape) and self.kind(shape) == kind
+        return (
+            self.is_handle(shape)
+            and not self.is_null(shape)
+            and self.kind(shape) == kind
+        )
 
     # ---- traversal ----------------------------------------------------------
 
@@ -1248,6 +1261,10 @@ class Kernel(KernelGeometry):
     @abstractmethod
     def set_location(self, shape: Handle, location: Handle) -> None:
         """Give ``shape`` the absolute placement ``location``, in place."""
+
+    @abstractmethod
+    def move(self, shape: Handle, location: Handle) -> None:
+        """Displace ``shape`` by ``location`` from where it is, in place."""
 
     @abstractmethod
     def located(self, shape: Handle, location: Handle) -> Handle:
