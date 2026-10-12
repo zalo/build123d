@@ -690,7 +690,7 @@ class TestWireParamAtExceptions(unittest.TestCase):
         mock_extrema.IsDone.return_value = True
         mock_extrema.NbExt.return_value = 0
 
-        with patch("build123d.topology.one_d.Extrema_ExtPC", return_value=mock_extrema):
+        with patch("build123d.kernel.occt.Extrema_ExtPC", return_value=mock_extrema):
             with self.assertRaises(RuntimeError) as ctx:
                 wire.param_at(0.5)
             self.assertIn("Failed to find point on curve", str(ctx.exception))
@@ -710,7 +710,7 @@ class TestWireParamAtExceptions(unittest.TestCase):
         mock_extrema.Point.return_value = mock_point
         mock_extrema.SquareDistance.return_value = 1000.0 * 1000.0
 
-        with patch("build123d.topology.one_d.Extrema_ExtPC", return_value=mock_extrema):
+        with patch("build123d.kernel.occt.Extrema_ExtPC", return_value=mock_extrema):
             with self.assertRaises(RuntimeError) as ctx:
                 wire.param_at(0.5)
             self.assertIn("Failed to find point on curve", str(ctx.exception))
@@ -757,9 +757,10 @@ class TestWireValidation(unittest.TestCase):
 
     def test_chamfer_2d_internal_error(self):
         """The chamfered shape isn't a face - simulated by a failing shape fix."""
-        shape_fix = MagicMock()
-        shape_fix.Shape.return_value = Edge.make_line((0, 0), (1, 0)).wrapped
-        with patch("build123d.topology.one_d.ShapeFix_Shape", return_value=shape_fix):
+        with patch(
+            "build123d.kernel.occt.OcctKernel.fix",
+            return_value=Edge.make_line((0, 0), (1, 0)).wrapped,
+        ):
             with self.assertRaisesRegex(RuntimeError, "internal error"):
                 self.wire.chamfer_2d(
                     1, 1, [self.wire.vertices()[0]], self.wire.edges()[0]
@@ -773,8 +774,9 @@ class TestWireValidation(unittest.TestCase):
         extrema = MagicMock()
         extrema.IsDone.return_value = False
         extrema.NbSolution.return_value = 0
+        extrema.Value.return_value = 0.0  # the point passes the distance check
         with patch(
-            "build123d.topology.one_d.BRepExtrema_DistShapeShape", return_value=extrema
+            "build123d.kernel.occt.BRepExtrema_DistShapeShape", return_value=extrema
         ):
             with self.assertRaisesRegex(ValueError, "point is not on Wire"):
                 self.wire.param_at_point((5, 0, 0))
@@ -791,7 +793,7 @@ class TestWireValidation(unittest.TestCase):
         builder = MagicMock()
         builder.Add.return_value = False
         with patch(
-            "build123d.topology.one_d.GeomConvert_CompCurveToBSplineCurve",
+            "build123d.kernel.occt.GeomConvert_CompCurveToBSplineCurve",
             return_value=builder,
         ):
             with self.assertRaisesRegex(RuntimeError, "Failed to build bspline"):
@@ -801,7 +803,7 @@ class TestWireValidation(unittest.TestCase):
         edge_builder = MagicMock()
         edge_builder.IsDone.return_value = False
         with patch(
-            "build123d.topology.one_d.BRepBuilderAPI_MakeEdge",
+            "build123d.kernel.occt.BRepBuilderAPI_MakeEdge",
             return_value=edge_builder,
         ):
             with self.assertRaisesRegex(RuntimeError, "Failed to build bspline"):

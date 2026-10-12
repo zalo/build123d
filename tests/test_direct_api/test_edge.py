@@ -255,9 +255,7 @@ class TestEdge(unittest.TestCase):
     def test_make_spline_failure(self):
         builder = MagicMock()
         builder.IsDone.return_value = False
-        with patch(
-            "build123d.topology.one_d.GeomAPI_Interpolate", return_value=builder
-        ):
+        with patch("build123d.kernel.occt.GeomAPI_Interpolate", return_value=builder):
             with self.assertRaisesRegex(ValueError, "B-spline interpolation failed"):
                 Edge.make_spline([(0, 0), (1, 1), (2, 0)])
 
@@ -265,7 +263,7 @@ class TestEdge(unittest.TestCase):
         builder = MagicMock()
         builder.IsDone.return_value = False
         with patch(
-            "build123d.topology.one_d.GeomAPI_PointsToBSpline", return_value=builder
+            "build123d.kernel.occt.GeomAPI_PointsToBSpline", return_value=builder
         ):
             with self.assertRaisesRegex(ValueError, "B-spline approximation failed"):
                 Edge.make_spline_approx([(0, 0), (1, 1), (2, 0)])

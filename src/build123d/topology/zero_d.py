@@ -59,15 +59,9 @@ from typing import ClassVar, overload, TYPE_CHECKING
 
 from collections.abc import Iterable
 
-import OCP.TopAbs as ta
-from OCP.BRep import BRep_Tool
-from OCP.BRepAdaptor import BRepAdaptor_Curve2d
-
-from OCP.BRepTools import BRepTools
-
 
 from OCP.TopoDS import TopoDS, TopoDS_Face, TopoDS_Vertex, TopoDS_Edge
-from OCP.gp import gp_Pnt2d, gp_Vec2d
+
 from build123d.geometry import (
     TOLERANCE,
     Matrix,
@@ -197,7 +191,7 @@ class Vertex(Shape[TopoDS_Vertex]):
     def _owning_face(self) -> TopoDS_Face | None:
         """The innermost face this vertex was selected through, if any."""
         for step in reversed(self.topo_path):
-            if not step.is_empty and step.wrapped.ShapeType() == ta.TopAbs_FACE:
+            if not step.is_empty and kernel.is_kind(step.wrapped, TopoKind.FACE):
                 return TopoDS.Face(step.wrapped)
         return None
 
@@ -237,7 +231,7 @@ class Vertex(Shape[TopoDS_Vertex]):
         dimensions so that a corner on a curved face reads the same as one on
         a flat face.
         """
-        here = BRep_Tool.Parameters_s(self.wrapped, face)
+        here = kernel.vertex_uv_on_face(self.wrapped, face)
         seen: list[TopoDS_Edge] = []
         directions: list[tuple[float, float]] = []
         for topods_edge in kernel.sub_shape_uses(face, TopoKind.EDGE):
@@ -245,21 +239,14 @@ class Vertex(Shape[TopoDS_Vertex]):
             if any(kernel.is_same(edge, other) for other in seen):
                 continue  # a seam edge is met once per side
             seen.append(edge)
-            curve = BRepAdaptor_Curve2d(edge, face)
-            for param, sign in (
-                (curve.FirstParameter(), 1.0),
-                (curve.LastParameter(), -1.0),
+            for (end_u, end_v), (tangent_u, tangent_v) in kernel.edge_uv_ends_on_face(
+                edge, face
             ):
-                end = curve.Value(param)
-                if (end.X() - here.X()) ** 2 + (end.Y() - here.Y()) ** 2 > TOLERANCE:
+                if (end_u - here[0]) ** 2 + (end_v - here[1]) ** 2 > TOLERANCE:
                     continue
-                point, tangent = gp_Pnt2d(), gp_Vec2d()
-                curve.D1(param, point, tangent)
-                length = (tangent.X() ** 2 + tangent.Y() ** 2) ** 0.5
+                length = (tangent_u**2 + tangent_v**2) ** 0.5
                 if length > 0:
-                    directions.append(
-                        (sign * tangent.X() / length, sign * tangent.Y() / length)
-                    )
+                    directions.append((tangent_u / length, tangent_v / length))
         return directions
 
     def _corner_convexity(self, face: TopoDS_Face) -> Convexity:
@@ -281,10 +268,10 @@ class Vertex(Shape[TopoDS_Vertex]):
         if span < TOLERANCE:
             return Convexity.SMOOTH  # the boundary runs straight through
 
-        u_min, u_max, v_min, v_max = BRepTools.UVBounds_s(face)
+        u_min, u_max, v_min, v_max = kernel.surface_of(face).uv_bounds()
         step = 1e-4 * ((u_max - u_min) ** 2 + (v_max - v_min) ** 2) ** 0.5 / span
-        here = BRep_Tool.Parameters_s(self.wrapped, face)
-        probe = (here.X() + bisector[0] * step, here.Y() + bisector[1] * step)
+        here = kernel.vertex_uv_on_face(self.wrapped, face)
+        probe = (here[0] + bisector[0] * step, here[1] + bisector[1] * step)
         inside = kernel.uv_in_face(face, probe, TOLERANCE)
         return Convexity.CONVEX if inside else Convexity.CONCAVE
 

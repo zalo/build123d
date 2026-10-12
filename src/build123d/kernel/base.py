@@ -93,10 +93,11 @@ class BoolOp(Enum):
 
 
 class JoinKind(Enum):
-    """How offset faces meet at a convex edge."""
+    """How offset faces or curves meet at a convex corner."""
 
     ARC = "arc"
     INTERSECTION = "intersection"
+    TANGENT = "tangent"
 
 
 class SweepTransition(Enum):
@@ -165,6 +166,8 @@ class CurveView(ABC):
     geom_type: str
     first: float
     last: float
+    shape: Handle
+    """The edge or wire the view was taken from."""
 
     @abstractmethod
     def is_periodic(self) -> bool: ...
@@ -202,6 +205,37 @@ class CurveView(ABC):
     @abstractmethod
     def ellipse(self) -> tuple[Point, Point, float, float]:
         """Centre, axis direction, major and minor radii; only for an ELLIPSE."""
+
+    @abstractmethod
+    def hyperbola(self) -> tuple[Point, Point, float, float]:
+        """Centre, axis direction, major and minor radii; only for a HYPERBOLA."""
+
+    @abstractmethod
+    def parabola(self) -> tuple[Point, Point, float]:
+        """Centre, axis direction and focal length; only for a PARABOLA."""
+
+    @abstractmethod
+    def bezier(self) -> tuple[int, list[Point], list[float] | None]:
+        """Degree, poles and weights (None when not rational); only for a BEZIER."""
+
+    @abstractmethod
+    def bspline(
+        self,
+    ) -> tuple[int, bool, list[Point], list[float] | None, list[float], list[int]]:
+        """Degree, periodicity, poles, weights (None when not rational), knots
+        and multiplicities; only for a BSPLINE."""
+
+    @abstractmethod
+    def offset(self) -> tuple[float, Point, Handle]:
+        """Offset distance, offset direction and an edge on the basis curve;
+        only for an OFFSET curve."""
+
+    @abstractmethod
+    def dn(self, t: float, order: int) -> Point:
+        """The derivative of ``order`` at ``t``."""
+
+    @abstractmethod
+    def is_closed(self) -> bool: ...
 
 
 class SurfaceView(ABC):
@@ -388,6 +422,284 @@ class KernelGeometry(ABC):
 
     @abstractmethod
     def make_vertex(self, point: Point) -> Handle: ...
+
+    # ---- edges from analytic curves; angles in radians, frames are gp_Ax2 ---
+
+    @abstractmethod
+    def make_line(self, start: Point, end: Point) -> Handle: ...
+
+    @abstractmethod
+    def make_infinite_line(self, origin: Point, direction: Point) -> Handle:
+        """An edge on an unbounded line."""
+
+    @abstractmethod
+    def make_circle(self, frame: Handle, radius: float) -> Handle: ...
+
+    @abstractmethod
+    def make_circle_arc(
+        self, frame: Handle, radius: float, start: float, end: float, sense: bool
+    ) -> Handle:
+        """The arc from angle ``start`` to ``end``; ``sense`` False runs it the other way."""
+
+    @abstractmethod
+    def make_ellipse(
+        self, frame: Handle, major: float, minor: float, rotation: float = 0.0
+    ) -> Handle:
+        """``rotation`` turns the ellipse about the frame's axis."""
+
+    @abstractmethod
+    def make_ellipse_arc(
+        self,
+        frame: Handle,
+        major: float,
+        minor: float,
+        start: float,
+        end: float,
+        sense: bool,
+        rotation: float = 0.0,
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_parabola_arc(
+        self, frame: Handle, focal_length: float, start: float, end: float, sense: bool
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_hyperbola(
+        self, frame: Handle, major: float, minor: float, rotation: float = 0.0
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_hyperbola_arc(
+        self,
+        frame: Handle,
+        major: float,
+        minor: float,
+        start: float,
+        end: float,
+        sense: bool,
+        rotation: float = 0.0,
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_tangent_arc(self, start: Point, tangent: Point, end: Point) -> Handle: ...
+
+    @abstractmethod
+    def make_three_point_arc(self, p1: Point, p2: Point, p3: Point) -> Handle: ...
+
+    @abstractmethod
+    def make_bezier(
+        self, poles: Sequence[Point], weights: Sequence[float] | None = None
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_bspline(
+        self,
+        poles: Sequence[Point],
+        knots: Sequence[float],
+        multiplicities: Sequence[int],
+        degree: int,
+        periodic: bool,
+        weights: Sequence[float] | None = None,
+    ) -> Handle: ...
+
+    @abstractmethod
+    def make_spline_interpolated(
+        self,
+        points: Sequence[Point],
+        *,
+        periodic: bool,
+        tolerance: float,
+        parameters: Sequence[float] | None = None,
+        end_tangents: tuple[Point, Point] | None = None,
+        point_tangents: Sequence[Point | None] | None = None,
+        scale: bool = True,
+    ) -> Handle:
+        """A B-spline through ``points``; raises ValueError when it cannot be built."""
+
+    @abstractmethod
+    def make_spline_fit(
+        self,
+        points: Sequence[Point],
+        tolerance: float,
+        min_degree: int,
+        max_degree: int,
+        smoothing: tuple[float, float, float] | None = None,
+    ) -> Handle:
+        """A B-spline approximating ``points``; raises ValueError when it cannot be built."""
+
+    @abstractmethod
+    def make_helix(
+        self,
+        center: Point,
+        normal: Point,
+        radius: float,
+        pitch: float,
+        height: float,
+        cone_angle: float,
+        lefthand: bool,
+    ) -> Handle:
+        """A helix about ``normal`` through ``center``; ``cone_angle`` in radians."""
+
+    # ---- edges from edges -----------------------------------------------------
+
+    @abstractmethod
+    def edge_range(self, edge: Handle) -> tuple[float, float]:
+        """The curve parameters at the ends of an edge."""
+
+    @abstractmethod
+    def vertex_param_on_edge(self, vertex: Handle, edge: Handle) -> float:
+        """The curve parameter of a vertex of an edge."""
+
+    @abstractmethod
+    def reversed_geometry(self, edge: Handle) -> Handle:
+        """A new edge on the reversed curve, running the other way."""
+
+    @abstractmethod
+    def trim_edge(self, edge: Handle, start: float, end: float) -> Handle:
+        """A new edge on the same curve between the parameters ``start`` and ``end``."""
+
+    @abstractmethod
+    def trim_edge_by_length(self, edge: Handle, start: float, length: float) -> Handle:
+        """A new edge on the same curve from the parameter ``start`` for ``length``."""
+
+    @abstractmethod
+    def approximate_edge(
+        self, edge: Handle, tolerance: float, max_segments: int, max_degree: int
+    ) -> Handle:
+        """A C2 B-spline edge within ``tolerance`` of ``edge``; raises
+        RuntimeError when none can be found."""
+
+    @abstractmethod
+    def wire_as_bspline_edge(self, wire: Handle, tolerance: float) -> Handle:
+        """One B-spline edge through every non-degenerate edge of the wire in
+        order; raises RuntimeError when they cannot be joined."""
+
+    @abstractmethod
+    def wire_edges(self, wire: Handle) -> list[Handle]:
+        """The edges of a wire in connection order, with their orientation in it."""
+
+    @abstractmethod
+    def build_curves_3d(
+        self, edge: Handle, tolerance: float, max_segments: int | None = None
+    ) -> None:
+        """Give an edge defined only on a surface its 3D curve."""
+
+    @abstractmethod
+    def find_plane(self, shape: Handle) -> tuple[Point, Point, Point] | None:
+        """``(origin, normal, x_dir)`` of a plane the shape's edges lie in, or None."""
+
+    @abstractmethod
+    def continuity_between(
+        self, edge1: Handle, edge2: Handle, u1: float, u2: float, tolerance: float
+    ) -> str:
+        """The continuity ("C0", "G1", "C1", "G2", "C2", "C3" or "CN") of two
+        edges where they meet at the parameters ``u1`` and ``u2``."""
+
+    @abstractmethod
+    def planar_intersections(
+        self,
+        edge: Handle,
+        bounds: tuple[float, float],
+        other: Handle | None,
+        other_bounds: tuple[float, float] | None,
+        plane: Handle,
+        tolerance: float,
+    ) -> list[tuple[float, float]]:
+        """The points, in the plane's coordinates, where the projection of
+        ``edge`` onto ``plane`` meets that of ``other``, or itself when
+        ``other`` is None."""
+
+    @abstractmethod
+    def nearest_edge(self, shape: Handle, point: Point) -> tuple[Handle, float] | None:
+        """The edge of ``shape`` nearest ``point`` and the parameter on it of
+        the nearest point; None when the search fails."""
+
+    @abstractmethod
+    def edge_uv_on_face(
+        self, edge: Handle, face: Handle, params: Sequence[float]
+    ) -> list[tuple[float, float]]:
+        """The face's surface parameters along an edge of it, at ``params``."""
+
+    @abstractmethod
+    def vertex_uv_on_face(self, vertex: Handle, face: Handle) -> tuple[float, float]:
+        """The face's surface parameters at one of its vertices."""
+
+    @abstractmethod
+    def frame_at(
+        self, shape: Handle, param: float, corrected: bool
+    ) -> tuple[Point, Point, Point, Point]:
+        """Point, tangent, normal and binormal of the Frenet frame (corrected
+        Frenet when ``corrected``) of an edge or wire at ``param``."""
+
+    @abstractmethod
+    def make_polygon(self, points: Sequence[Point]) -> Handle:
+        """A wire of straight edges through ``points`` in order."""
+
+    @abstractmethod
+    def connect_edges_to_wires(
+        self, edges: Sequence[Handle], tolerance: float
+    ) -> list[Handle]:
+        """Chain ``edges`` into as few wires as their shared ends allow."""
+
+    @abstractmethod
+    def outer_wire(self, face: Handle) -> Handle: ...
+
+    @abstractmethod
+    def fillet_2d(
+        self, face: Handle, corners: Sequence[tuple[Handle, float]]
+    ) -> tuple[Handle, Any]:
+        """A planar face with each ``(vertex, radius)`` corner rounded; plus
+        the history record."""
+
+    @abstractmethod
+    def chamfer_2d(
+        self, face: Handle, corners: Sequence[tuple[Handle, Handle, float, float]]
+    ) -> tuple[Handle, Any]:
+        """A planar face with each corner between ``(edge1, edge2)`` cut back by
+        ``distance1`` along the first and ``distance2`` along the second; plus
+        the history record."""
+
+    @abstractmethod
+    def fix_small_edges(
+        self, wire: Handle, precision: float, max_tolerance: float
+    ) -> Handle:
+        """A wire with edges shorter than ``precision`` removed and gaps closed."""
+
+    @abstractmethod
+    def project(
+        self,
+        shape: Handle,
+        target: Handle,
+        *,
+        direction: Point | None = None,
+        center: Point | None = None,
+    ) -> list[Handle]:
+        """The wires where ``shape`` (an edge or wire) lands on ``target`` when
+        projected along ``direction`` or towards ``center``."""
+
+    @abstractmethod
+    def offset_2d(
+        self,
+        wire: Handle,
+        distance: float,
+        join: JoinKind,
+        plane: Handle | None = None,
+    ) -> Handle | None:
+        """The planar offset of ``wire`` by ``distance``, within ``plane``
+        (``gp_Pln``) when the wire does not fix one; None when it fails."""
+
+    @abstractmethod
+    def offset_face(self, face: Handle, amount: float, tolerance: float) -> Handle:
+        """The surface offset of ``face`` by ``amount``."""
+
+    @abstractmethod
+    def edge_uv_ends_on_face(
+        self, edge: Handle, face: Handle
+    ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+        """For each end of an edge of ``face``: the uv point there and the
+        uv tangent leaving the curve at that end (first end: forward, last
+        end: backward), unnormalised."""
 
     @abstractmethod
     def vertex_point(self, vertex: Handle) -> Point:

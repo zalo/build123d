@@ -34,6 +34,7 @@ license:
 from __future__ import annotations
 
 from collections.abc import Callable, Hashable, Sequence
+from math import cos, pi, sqrt
 from typing import Any
 
 import OCP.TopAbs as ta
@@ -85,6 +86,19 @@ from OCP.BRepBuilderAPI import (
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepLib import BRepLib_FindSurface
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon
+from OCP.BRepFilletAPI import BRepFilletAPI_MakeFillet2d
+from OCP.BRepOffset import BRepOffset_MakeOffset
+from OCP.BRepOffsetAPI import BRepOffsetAPI_MakeOffset
+from OCP.BRepProj import BRepProj_Projection
+from OCP.GeomFill import (
+    GeomFill_CorrectedFrenet,
+    GeomFill_Frenet,
+    GeomFill_TrihedronLaw,
+)
+from OCP.ShapeAnalysis import ShapeAnalysis_FreeBounds
+from OCP.ShapeFix import ShapeFix_Wireframe
+from OCP.collections import HSequence_TopoDS_Shape
 from OCP.IntTools import IntTools_FClass2d
 from OCP.ShapeFix import ShapeFix_Face
 from OCP.Standard import (
@@ -104,7 +118,57 @@ from OCP.TopoDS import (
 from OCP.collections import (
     IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher,
 )
-from OCP.gp import gp_GTrsf, gp_Pnt2d, gp_Trsf
+from OCP.gp import (
+    gp_Circ,
+    gp_Dir2d,
+    gp_Elips,
+    gp_GTrsf,
+    gp_Hypr,
+    gp_Parab,
+    gp_Pnt2d,
+    gp_Trsf,
+    gp_Vec2d,
+)
+from OCP.BRepAdaptor import BRepAdaptor_Curve2d
+from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeEdge
+from OCP.BRepExtrema import BRepExtrema_SupportType
+from OCP.BRepLib import BRepLib
+from OCP.BRepLProp import BRepLProp
+from OCP.BRepTools import BRepTools_WireExplorer
+from OCP.Extrema import Extrema_ExtPC
+from OCP.GC import (
+    GC_MakeArcOfCircle,
+    GC_MakeArcOfEllipse,
+    GC_MakeArcOfHyperbola,
+    GC_MakeArcOfParabola,
+)
+from OCP.Geom import (
+    Geom_BezierCurve,
+    Geom_BSplineCurve,
+    Geom_ConicalSurface,
+    Geom_CylindricalSurface,
+    Geom_Line,
+    Geom_Plane,
+    Geom_Surface,
+    Geom_TrimmedCurve,
+)
+from OCP.Geom2d import Geom2d_Line, Geom2d_TrimmedCurve
+from OCP.Geom2dAPI import Geom2dAPI_InterCurveCurve
+from OCP.GeomAdaptor import GeomAdaptor_Curve
+from OCP.GeomAPI import GeomAPI_Interpolate, GeomAPI_PointsToBSpline
+from OCP.GeomConvert import (
+    GeomConvert_ApproxCurve,
+    GeomConvert_CompCurveToBSplineCurve,
+)
+from OCP.collections import (
+    Array1_double,
+    Array1_gp_Pnt,
+    Array1_gp_Vec,
+    Array1_int,
+    HArray1_bool,
+    HArray1_double,
+    HArray1_gp_Pnt,
+)
 from OCP.BRepFilletAPI import BRepFilletAPI_MakeChamfer, BRepFilletAPI_MakeFillet
 from OCP.BRepGProp import BRepGProp_Face
 from OCP.BRepMesh import BRepMesh_IncrementalMesh
@@ -208,9 +272,19 @@ _SURFACE_TYPE_LABELS = {
     ga.GeomAbs_OffsetSurface: "OFFSET",
     ga.GeomAbs_OtherSurface: "OTHER",
 }
+_CONTINUITY_LABELS = {
+    ga.GeomAbs_C0: "C0",
+    ga.GeomAbs_G1: "G1",
+    ga.GeomAbs_C1: "C1",
+    ga.GeomAbs_G2: "G2",
+    ga.GeomAbs_C2: "C2",
+    ga.GeomAbs_C3: "C3",
+    ga.GeomAbs_CN: "CN",
+}
 _JOIN = {
     JoinKind.ARC: GeomAbs_JoinType.GeomAbs_Arc,
     JoinKind.INTERSECTION: GeomAbs_JoinType.GeomAbs_Intersection,
+    JoinKind.TANGENT: GeomAbs_JoinType.GeomAbs_Tangent,
 }
 _TRANSITION = {
     SweepTransition.TRANSFORMED: BRepBuilderAPI_Transformed,
@@ -235,6 +309,7 @@ class OcctCurveView(CurveView):
         else:
             self._shape = TopoDS.Edge(shape)
             self.wrapped = BRepAdaptor_Curve(self._shape)
+        self.shape = self._shape
         self.geom_type = _CURVE_TYPE_LABELS[self.wrapped.GetType()]
         self.first = self.wrapped.FirstParameter()
         self.last = self.wrapped.LastParameter()
@@ -268,6 +343,14 @@ class OcctCurveView(CurveView):
         ).Parameter()
 
     def closest_param(self, point: Point) -> float:
+        if isinstance(self.wrapped, BRepAdaptor_CompCurve):
+            extrema = Extrema_ExtPC(gp_Pnt(*point), self.wrapped)
+            if not extrema.IsDone() or extrema.NbExt() == 0:
+                raise RuntimeError("Failed to find point on curve")
+            nearest = min(
+                range(1, extrema.NbExt() + 1), key=lambda i: extrema.SquareDistance(i)
+            )
+            return extrema.Point(nearest).Parameter()
         curve = BRep_Tool.Curve_s(TopoDS.Edge(self._shape), float(), float())
         projector = GeomAPI_ProjectPointOnCurve(gp_Pnt(*point), curve)
         return projector.LowerDistanceParameter()
@@ -303,6 +386,66 @@ class OcctCurveView(CurveView):
             ellipse.MajorRadius(),
             ellipse.MinorRadius(),
         )
+
+    def hyperbola(self) -> tuple[Point, Point, float, float]:
+        hyperbola = self.wrapped.Hyperbola()
+        return (
+            _pt(hyperbola.Location()),
+            _pt(hyperbola.Axis().Direction()),
+            hyperbola.MajorRadius(),
+            hyperbola.MinorRadius(),
+        )
+
+    def parabola(self) -> tuple[Point, Point, float]:
+        parabola = self.wrapped.Parabola()
+        return (
+            _pt(parabola.Location()),
+            _pt(parabola.Axis().Direction()),
+            parabola.Focal(),
+        )
+
+    def bezier(self) -> tuple[int, list[Point], list[float] | None]:
+        bezier = self.wrapped.Bezier()
+        count = bezier.NbPoles()
+        poles = [_pt(bezier.Pole(i)) for i in range(1, count + 1)]
+        weights = (
+            [bezier.Weight(i) for i in range(1, count + 1)]
+            if bezier.IsRational()
+            else None
+        )
+        return bezier.Degree(), poles, weights
+
+    def bspline(
+        self,
+    ) -> tuple[int, bool, list[Point], list[float] | None, list[float], list[int]]:
+        spline = self.wrapped.BSpline()
+        pole_count, knot_count = spline.NbPoles(), spline.NbKnots()
+        return (
+            spline.Degree(),
+            spline.IsPeriodic(),
+            [_pt(spline.Pole(i)) for i in range(1, pole_count + 1)],
+            (
+                [spline.Weight(i) for i in range(1, pole_count + 1)]
+                if spline.IsRational()
+                else None
+            ),
+            [spline.Knot(i) for i in range(1, knot_count + 1)],
+            [spline.Multiplicity(i) for i in range(1, knot_count + 1)],
+        )
+
+    def offset(self) -> tuple[float, Point, TopoDS_Shape]:
+        offset_curve = self.wrapped.OffsetCurve()
+        return (
+            offset_curve.Offset(),
+            _pt(offset_curve.Direction()),
+            BRepBuilderAPI_MakeEdge(offset_curve.BasisCurve()).Edge(),
+        )
+
+    def dn(self, t: float, order: int) -> Point:
+        return _pt(self.wrapped.DN(t, order))
+
+    def is_closed(self) -> bool:
+        return self.wrapped.IsClosed()
 
 
 class OcctSurfaceView(SurfaceView):
@@ -384,7 +527,9 @@ class OcctSurfaceView(SurfaceView):
 class _OcctGeometry:
     """The KernelGeometry half of OcctKernel; OcctKernel inherits it."""
 
-    downcast: Callable[[TopoDS_Shape], TopoDS_Shape]  # provided by OcctKernel
+    # provided by OcctKernel
+    downcast: Callable[[TopoDS_Shape], TopoDS_Shape]
+    ancestors: Callable[[TopoDS_Shape, TopoKind, TopoKind], AncestorMap]
 
     # ---- views --------------------------------------------------------------
 
@@ -553,6 +698,533 @@ class _OcctGeometry:
 
     def make_vertex(self, point: Point) -> TopoDS_Shape:
         return BRepBuilderAPI_MakeVertex(gp_Pnt(*point)).Vertex()
+
+    # ---- edges from analytic curves -----------------------------------------
+
+    def make_line(self, start: Point, end: Point) -> TopoDS_Shape:
+        return BRepBuilderAPI_MakeEdge(gp_Pnt(*start), gp_Pnt(*end)).Edge()
+
+    def make_infinite_line(self, origin: Point, direction: Point) -> TopoDS_Shape:
+        return BRepBuilderAPI_MakeEdge(
+            Geom_Line(gp_Pnt(*origin), gp_Dir(*direction))
+        ).Edge()
+
+    def make_circle(self, frame: gp_Ax2, radius: float) -> TopoDS_Shape:
+        return BRepBuilderAPI_MakeEdge(gp_Circ(frame, radius)).Edge()
+
+    def make_circle_arc(
+        self, frame: gp_Ax2, radius: float, start: float, end: float, sense: bool
+    ) -> TopoDS_Shape:
+        arc = GC_MakeArcOfCircle(gp_Circ(frame, radius), start, end, sense).Value()
+        return BRepBuilderAPI_MakeEdge(arc).Edge()
+
+    @staticmethod
+    def _ellipse(
+        frame: gp_Ax2, major: float, minor: float, rotation: float
+    ) -> gp_Elips:
+        ellipse = gp_Elips(frame, major, minor)
+        if rotation:
+            ellipse = ellipse.Rotated(frame.Axis(), rotation)
+        return ellipse
+
+    def make_ellipse(
+        self, frame: gp_Ax2, major: float, minor: float, rotation: float = 0.0
+    ) -> TopoDS_Shape:
+        return BRepBuilderAPI_MakeEdge(
+            self._ellipse(frame, major, minor, rotation)
+        ).Edge()
+
+    def make_ellipse_arc(
+        self,
+        frame: gp_Ax2,
+        major: float,
+        minor: float,
+        start: float,
+        end: float,
+        sense: bool,
+        rotation: float = 0.0,
+    ) -> TopoDS_Shape:
+        arc = GC_MakeArcOfEllipse(
+            self._ellipse(frame, major, minor, rotation), start, end, sense
+        ).Value()
+        return BRepBuilderAPI_MakeEdge(arc).Edge()
+
+    def make_parabola_arc(
+        self, frame: gp_Ax2, focal_length: float, start: float, end: float, sense: bool
+    ) -> TopoDS_Shape:
+        arc = GC_MakeArcOfParabola(
+            gp_Parab(frame, focal_length), start, end, sense
+        ).Value()
+        return BRepBuilderAPI_MakeEdge(arc).Edge()
+
+    @staticmethod
+    def _hyperbola(
+        frame: gp_Ax2, major: float, minor: float, rotation: float
+    ) -> gp_Hypr:
+        hyperbola = gp_Hypr(frame, major, minor)
+        if rotation:
+            hyperbola = hyperbola.Rotated(frame.Axis(), rotation)
+        return hyperbola
+
+    def make_hyperbola(
+        self, frame: gp_Ax2, major: float, minor: float, rotation: float = 0.0
+    ) -> TopoDS_Shape:
+        return BRepBuilderAPI_MakeEdge(
+            self._hyperbola(frame, major, minor, rotation)
+        ).Edge()
+
+    def make_hyperbola_arc(
+        self,
+        frame: gp_Ax2,
+        major: float,
+        minor: float,
+        start: float,
+        end: float,
+        sense: bool,
+        rotation: float = 0.0,
+    ) -> TopoDS_Shape:
+        arc = GC_MakeArcOfHyperbola(
+            self._hyperbola(frame, major, minor, rotation), start, end, sense
+        ).Value()
+        return BRepBuilderAPI_MakeEdge(arc).Edge()
+
+    def make_tangent_arc(
+        self, start: Point, tangent: Point, end: Point
+    ) -> TopoDS_Shape:
+        arc = GC_MakeArcOfCircle(gp_Pnt(*start), gp_Vec(*tangent), gp_Pnt(*end)).Value()
+        return BRepBuilderAPI_MakeEdge(arc).Edge()
+
+    def make_three_point_arc(self, p1: Point, p2: Point, p3: Point) -> TopoDS_Shape:
+        arc = GC_MakeArcOfCircle(gp_Pnt(*p1), gp_Pnt(*p2), gp_Pnt(*p3)).Value()
+        return BRepBuilderAPI_MakeEdge(arc).Edge()
+
+    def make_bezier(
+        self, poles: Sequence[Point], weights: Sequence[float] | None = None
+    ) -> TopoDS_Shape:
+        if weights:
+            curve = Geom_BezierCurve(_point_array(poles), _double_array(weights))
+        else:
+            curve = Geom_BezierCurve(_point_array(poles))
+        return BRepBuilderAPI_MakeEdge(curve).Edge()
+
+    def make_bspline(
+        self,
+        poles: Sequence[Point],
+        knots: Sequence[float],
+        multiplicities: Sequence[int],
+        degree: int,
+        periodic: bool,
+        weights: Sequence[float] | None = None,
+    ) -> TopoDS_Shape:
+        multiplicity_array = Array1_int(1, len(multiplicities))
+        for index, multiplicity in enumerate(multiplicities, start=1):
+            multiplicity_array.SetValue(index, multiplicity)
+        if weights:
+            curve = Geom_BSplineCurve(
+                _point_array(poles),
+                _double_array(weights),
+                _double_array(knots),
+                multiplicity_array,
+                degree,
+                periodic,
+            )
+        else:
+            curve = Geom_BSplineCurve(
+                _point_array(poles),
+                _double_array(knots),
+                multiplicity_array,
+                degree,
+                periodic,
+            )
+        return BRepBuilderAPI_MakeEdge(curve).Edge()
+
+    def make_spline_interpolated(
+        self,
+        points: Sequence[Point],
+        *,
+        periodic: bool,
+        tolerance: float,
+        parameters: Sequence[float] | None = None,
+        end_tangents: tuple[Point, Point] | None = None,
+        point_tangents: Sequence[Point | None] | None = None,
+        scale: bool = True,
+    ) -> TopoDS_Shape:
+        point_array = HArray1_gp_Pnt(1, len(points))
+        for index, point in enumerate(points, start=1):
+            point_array.SetValue(index, gp_Pnt(*point))
+        if parameters is None:
+            builder = GeomAPI_Interpolate(point_array, periodic, tolerance)
+        else:
+            parameter_array = HArray1_double(1, len(parameters))
+            for index, value in enumerate(parameters, start=1):
+                parameter_array.SetValue(index, value)
+            builder = GeomAPI_Interpolate(
+                point_array, parameter_array, periodic, tolerance
+            )
+        if end_tangents is not None:
+            builder.Load(gp_Vec(*end_tangents[0]), gp_Vec(*end_tangents[1]), scale)
+        elif point_tangents is not None:
+            tangent_array = Array1_gp_Vec(1, len(point_tangents))
+            enabled_array = HArray1_bool(1, len(point_tangents))
+            for index, tangent in enumerate(point_tangents, start=1):
+                enabled_array.SetValue(index, tangent is not None)
+                tangent_array.SetValue(index, gp_Vec(*(tangent or (0.0, 0.0, 0.0))))
+            builder.Load(tangent_array, enabled_array, scale)
+        builder.Perform()
+        if not builder.IsDone():
+            raise ValueError("B-spline interpolation failed")
+        return BRepBuilderAPI_MakeEdge(builder.Curve()).Edge()
+
+    def make_spline_fit(
+        self,
+        points: Sequence[Point],
+        tolerance: float,
+        min_degree: int,
+        max_degree: int,
+        smoothing: tuple[float, float, float] | None = None,
+    ) -> TopoDS_Shape:
+        point_array = _point_array(points)
+        if smoothing:
+            builder = GeomAPI_PointsToBSpline(
+                point_array, *smoothing, DegMax=max_degree, Tol3D=tolerance
+            )
+        else:
+            builder = GeomAPI_PointsToBSpline(
+                point_array, DegMin=min_degree, DegMax=max_degree, Tol3D=tolerance
+            )
+        if not builder.IsDone():
+            raise ValueError("B-spline approximation failed")
+        return BRepBuilderAPI_MakeEdge(builder.Curve()).Edge()
+
+    def make_helix(
+        self,
+        center: Point,
+        normal: Point,
+        radius: float,
+        pitch: float,
+        height: float,
+        cone_angle: float,
+        lefthand: bool,
+    ) -> TopoDS_Shape:
+        frame = gp_Ax3(gp_Pnt(*center), gp_Dir(*normal))
+        surface: Geom_Surface
+        if cone_angle == 0.0:
+            surface = Geom_CylindricalSurface(frame, radius)
+        else:
+            surface = Geom_ConicalSurface(frame, cone_angle, radius)
+
+        # the helix is a straight line in the surface's (u, v) parameters
+        line_x = (-1 if lefthand else 1) * 2 * pi
+        line_norm = sqrt(line_x * line_x + pitch * pitch)
+        line_x, line_y = line_x / line_norm, pitch / line_norm
+        line_length = (height / line_y) / cos(cone_angle)
+        line = Geom2d_Line(gp_Pnt2d(0, 0), gp_Dir2d(line_x, line_y))
+        segment = Geom2d_TrimmedCurve(line, 0, line_length, theAdjustPeriodic=True)
+
+        edge = BRepBuilderAPI_MakeEdge(segment, surface).Edge()
+        BRepLib.BuildCurves3d_s(edge, 1e-9, MaxSegment=2000)
+        return edge
+
+    # ---- edges from edges -----------------------------------------------------
+
+    def edge_range(self, edge: TopoDS_Shape) -> tuple[float, float]:
+        return BRep_Tool.Range_s(TopoDS.Edge(edge))
+
+    def vertex_param_on_edge(self, vertex: TopoDS_Shape, edge: TopoDS_Shape) -> float:
+        return BRep_Tool.Parameter_s(TopoDS.Vertex(vertex), TopoDS.Edge(edge))
+
+    def reversed_geometry(self, edge: TopoDS_Shape) -> TopoDS_Shape:
+        topods_edge = TopoDS.Edge(edge)
+        first, last = BRep_Tool.Range_s(topods_edge)
+        curve = BRep_Tool.Curve_s(topods_edge, first, last)
+        return BRepBuilderAPI_MakeEdge(
+            curve.Reversed(),
+            curve.ReversedParameter(last),
+            curve.ReversedParameter(first),
+        ).Edge()
+
+    def trim_edge(self, edge: TopoDS_Shape, start: float, end: float) -> TopoDS_Shape:
+        curve = BRep_Tool.Curve_s(TopoDS.Edge(edge), float(), float())
+        return BRepBuilderAPI_MakeEdge(curve, start, end).Edge()
+
+    def trim_edge_by_length(
+        self, edge: TopoDS_Shape, start: float, length: float
+    ) -> TopoDS_Shape:
+        curve = BRep_Tool.Curve_s(TopoDS.Edge(edge), float(), float())
+        end = GCPnts_AbscissaPoint(GeomAdaptor_Curve(curve), length, start).Parameter()
+        return BRepBuilderAPI_MakeEdge(Geom_TrimmedCurve(curve, start, end)).Edge()
+
+    def approximate_edge(
+        self, edge: TopoDS_Shape, tolerance: float, max_segments: int, max_degree: int
+    ) -> TopoDS_Shape:
+        adaptor = BRepAdaptor_Curve(TopoDS.Edge(edge))
+        approximation = GeomConvert_ApproxCurve(
+            Geom_TrimmedCurve(
+                adaptor.Curve().Curve(),
+                adaptor.FirstParameter(),
+                adaptor.LastParameter(),
+            ),
+            tolerance,
+            GeomAbs_C2,
+            max_segments,
+            max_degree,
+        )
+        if not approximation.HasResult():  # pragma: no cover
+            raise RuntimeError("the curve could not be converted to a spline")
+        return BRepBuilderAPI_MakeEdge(approximation.Curve()).Edge()
+
+    def wire_as_bspline_edge(
+        self, wire: TopoDS_Shape, tolerance: float
+    ) -> TopoDS_Shape:
+        builder = GeomConvert_CompCurveToBSplineCurve()
+        for edge in self.wire_edges(wire):
+            topods_edge = TopoDS.Edge(edge)
+            if BRep_Tool.Degenerated_s(topods_edge):
+                continue
+            first, last = BRep_Tool.Range_s(topods_edge)
+            curve = BRep_Tool.Curve_s(topods_edge, float(), float())
+            if not builder.Add(Geom_TrimmedCurve(curve, first, last), tolerance):
+                raise RuntimeError("Failed to build bspline.")
+        edge_builder = BRepBuilderAPI_MakeEdge(builder.BSplineCurve())
+        if not edge_builder.IsDone():
+            raise RuntimeError("Failed to build bspline.")
+        return edge_builder.Edge()
+
+    def wire_edges(self, wire: TopoDS_Shape) -> list[TopoDS_Shape]:
+        edges: list[TopoDS_Shape] = []
+        explorer = BRepTools_WireExplorer(TopoDS.Wire(wire))
+        while explorer.More():
+            edges.append(explorer.Current())
+            explorer.Next()
+        return edges
+
+    def build_curves_3d(
+        self, edge: TopoDS_Shape, tolerance: float, max_segments: int | None = None
+    ) -> None:
+        if max_segments is None:
+            BRepLib.BuildCurves3d_s(edge, tolerance)
+        else:
+            BRepLib.BuildCurves3d_s(edge, tolerance, MaxSegment=max_segments)
+
+    def find_plane(self, shape: TopoDS_Shape) -> tuple[Point, Point, Point] | None:
+        finder = BRepLib_FindSurface(shape, OnlyPlane=True)
+        if not finder.Found():
+            return None
+        surface = finder.Surface()
+        if not isinstance(surface, Geom_Plane):
+            return None
+        pln = surface.Pln()
+        return (
+            _pt(pln.Location()),
+            _pt(pln.Axis().Direction()),
+            _pt(pln.XAxis().Direction()),
+        )
+
+    def continuity_between(
+        self,
+        edge1: TopoDS_Shape,
+        edge2: TopoDS_Shape,
+        u1: float,
+        u2: float,
+        tolerance: float,
+    ) -> str:
+        continuity = BRepLProp.Continuity_s(
+            BRepAdaptor_Curve(TopoDS.Edge(edge1)),
+            BRepAdaptor_Curve(TopoDS.Edge(edge2)),
+            u1,
+            u2,
+            tolerance,
+            tolerance,
+        )
+        return _CONTINUITY_LABELS[continuity]
+
+    def planar_intersections(
+        self,
+        edge: TopoDS_Shape,
+        bounds: tuple[float, float],
+        other: TopoDS_Shape | None,
+        other_bounds: tuple[float, float] | None,
+        plane: gp_Pln,
+        tolerance: float,
+    ) -> list[tuple[float, float]]:
+        surface = BRep_Tool.Surface_s(BRepBuilderAPI_MakeFace(plane).Face())
+        curve = BRep_Tool.CurveOnPlane_s(
+            TopoDS.Edge(edge), surface, TopLoc_Location(), *bounds
+        )
+        if other is not None:
+            assert other_bounds is not None
+            other_curve = BRep_Tool.CurveOnPlane_s(
+                TopoDS.Edge(other), surface, TopLoc_Location(), *other_bounds
+            )
+            intersector = Geom2dAPI_InterCurveCurve(curve, other_curve, tolerance)
+        else:
+            intersector = Geom2dAPI_InterCurveCurve(curve, tolerance)
+        return [
+            (intersector.Point(i).X(), intersector.Point(i).Y())
+            for i in range(1, intersector.NbPoints() + 1)
+        ]
+
+    def nearest_edge(
+        self, shape: TopoDS_Shape, point: Point
+    ) -> tuple[TopoDS_Shape, float] | None:
+        extrema = BRepExtrema_DistShapeShape(self.make_vertex(point), shape)
+        extrema.Perform()
+        if not extrema.IsDone() or extrema.NbSolution() == 0:
+            return None
+        support = extrema.SupportTypeShape2(1)
+        if support == BRepExtrema_SupportType.BRepExtrema_IsOnEdge:
+            edge = TopoDS.Edge(extrema.SupportOnShape2(1))
+            return edge, extrema.ParOnEdgeS2(1)[0]
+        if support == BRepExtrema_SupportType.BRepExtrema_IsVertex:
+            vertex = TopoDS.Vertex(extrema.SupportOnShape2(1))
+            edge = TopoDS.Edge(
+                self.ancestors(shape, TopoKind.VERTEX, TopoKind.EDGE).get(vertex)[0]
+            )
+            return edge, BRep_Tool.Parameter_s(vertex, edge)
+        return None  # pragma: no cover
+
+    def edge_uv_on_face(
+        self, edge: TopoDS_Shape, face: TopoDS_Shape, params: Sequence[float]
+    ) -> list[tuple[float, float]]:
+        topods_edge = TopoDS.Edge(edge)
+        pcurve = BRep_Tool.CurveOnSurface_s(
+            topods_edge, TopoDS.Face(face), *BRep_Tool.Range_s(topods_edge)
+        )
+        return [(uv.X(), uv.Y()) for uv in (pcurve.Value(t) for t in params)]
+
+    def vertex_uv_on_face(
+        self, vertex: TopoDS_Shape, face: TopoDS_Shape
+    ) -> tuple[float, float]:
+        uv = BRep_Tool.Parameters_s(TopoDS.Vertex(vertex), TopoDS.Face(face))
+        return uv.X(), uv.Y()
+
+    def frame_at(
+        self, shape: TopoDS_Shape, param: float, corrected: bool
+    ) -> tuple[Point, Point, Point, Point]:
+        curve = OcctCurveView(shape).wrapped
+        law: GeomFill_TrihedronLaw = (
+            GeomFill_CorrectedFrenet() if corrected else GeomFill_Frenet()
+        )
+        law.SetCurve(curve)
+        tangent, normal, binormal = gp_Vec(), gp_Vec(), gp_Vec()
+        law.D0(param, tangent, normal, binormal)
+        return _pt(curve.Value(param)), _pt(tangent), _pt(normal), _pt(binormal)
+
+    def make_polygon(self, points: Sequence[Point]) -> TopoDS_Shape:
+        builder = BRepBuilderAPI_MakePolygon()
+        for point in points:
+            builder.Add(gp_Pnt(*point))
+        return builder.Wire()
+
+    def connect_edges_to_wires(
+        self, edges: Sequence[TopoDS_Shape], tolerance: float
+    ) -> list[TopoDS_Shape]:
+        edges_in = HSequence_TopoDS_Shape()
+        wires_out = HSequence_TopoDS_Shape()
+        for edge in edges:
+            edges_in.Append(edge)
+        ShapeAnalysis_FreeBounds.ConnectEdgesToWires_s(
+            edges_in, tolerance, False, wires_out
+        )
+        return [
+            TopoDS.Wire(wires_out.Value(i)) for i in range(1, wires_out.Length() + 1)
+        ]
+
+    def outer_wire(self, face: TopoDS_Shape) -> TopoDS_Shape:
+        return BRepTools.OuterWire_s(TopoDS.Face(face))
+
+    def fillet_2d(
+        self, face: TopoDS_Shape, corners: Sequence[tuple[TopoDS_Shape, float]]
+    ) -> tuple[TopoDS_Shape, Any]:
+        builder = BRepFilletAPI_MakeFillet2d(TopoDS.Face(face))
+        for vertex, radius in corners:
+            builder.AddFillet(TopoDS.Vertex(vertex), radius)
+        builder.Build()
+        return builder.Shape(), builder
+
+    def chamfer_2d(
+        self,
+        face: TopoDS_Shape,
+        corners: Sequence[tuple[TopoDS_Shape, TopoDS_Shape, float, float]],
+    ) -> tuple[TopoDS_Shape, Any]:
+        builder = BRepFilletAPI_MakeFillet2d(TopoDS.Face(face))
+        for edge1, edge2, distance1, distance2 in corners:
+            builder.AddChamfer(
+                TopoDS.Edge(edge1), TopoDS.Edge(edge2), distance1, distance2
+            )
+        builder.Build()
+        return builder.Shape(), builder
+
+    def fix_small_edges(
+        self, wire: TopoDS_Shape, precision: float, max_tolerance: float
+    ) -> TopoDS_Shape:
+        fixer = ShapeFix_Wireframe(wire)
+        fixer.SetPrecision(precision)
+        fixer.SetMaxTolerance(max_tolerance)
+        fixer.FixSmallEdges()
+        fixer.FixWireGaps()
+        return self.downcast(fixer.Shape())
+
+    def project(
+        self,
+        shape: TopoDS_Shape,
+        target: TopoDS_Shape,
+        *,
+        direction: Point | None = None,
+        center: Point | None = None,
+    ) -> list[TopoDS_Shape]:
+        if direction is not None:
+            projection = BRepProj_Projection(shape, target, gp_Dir(*direction))
+        else:
+            assert center is not None
+            projection = BRepProj_Projection(shape, target, gp_Pnt(*center))
+        wires: list[TopoDS_Shape] = []
+        while projection.More():
+            wires.append(projection.Current())
+            projection.Next()
+        return wires
+
+    def offset_2d(
+        self,
+        wire: TopoDS_Shape,
+        distance: float,
+        join: JoinKind,
+        plane: gp_Pln | None = None,
+    ) -> TopoDS_Shape | None:
+        builder = BRepOffsetAPI_MakeOffset()
+        if plane is not None:
+            builder.Init(BRepBuilderAPI_MakeFace(plane).Face(), _JOIN[join])
+        else:
+            builder.Init(_JOIN[join])
+        builder.AddWire(TopoDS.Wire(wire))
+        builder.Perform(distance)
+        if not builder.IsDone():
+            return None
+        return self.downcast(builder.Shape())
+
+    def offset_face(
+        self, face: TopoDS_Shape, amount: float, tolerance: float
+    ) -> TopoDS_Shape:
+        offsetter = BRepOffset_MakeOffset()
+        offsetter.Initialize(TopoDS.Face(face), Offset=amount, Tol=tolerance)
+        offsetter.MakeOffsetShape()
+        return offsetter.Shape()
+
+    def edge_uv_ends_on_face(
+        self, edge: TopoDS_Shape, face: TopoDS_Shape
+    ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+        curve = BRepAdaptor_Curve2d(TopoDS.Edge(edge), TopoDS.Face(face))
+        ends = []
+        for param, sign in (
+            (curve.FirstParameter(), 1.0),
+            (curve.LastParameter(), -1.0),
+        ):
+            point, tangent = gp_Pnt2d(), gp_Vec2d()
+            curve.D1(param, point, tangent)
+            ends.append(
+                ((point.X(), point.Y()), (sign * tangent.X(), sign * tangent.Y()))
+            )
+        return ends
 
     def vertex_point(self, vertex: TopoDS_Shape) -> Point:
         return _pt(BRep_Tool.Pnt_s(TopoDS.Vertex(vertex)))
@@ -1004,6 +1676,20 @@ _BOOLEAN_ALGORITHMS: dict[BoolOp, Callable[[], BRepAlgoAPI_BuilderAlgo]] = {
     BoolOp.SECTION: BRepAlgoAPI_Section,
     BoolOp.SPLIT: BRepAlgoAPI_Splitter,
 }
+
+
+def _point_array(points: Sequence[Point]) -> Array1_gp_Pnt:
+    array = Array1_gp_Pnt(1, len(points))
+    for index, point in enumerate(points, start=1):
+        array.SetValue(index, gp_Pnt(*point))
+    return array
+
+
+def _double_array(values: Sequence[float]) -> Array1_double:
+    array = Array1_double(1, len(values))
+    for index, value in enumerate(values, start=1):
+        array.SetValue(index, float(value))
+    return array
 
 
 def _fixed(shape: TopoDS_Shape) -> TopoDS_Shape:
