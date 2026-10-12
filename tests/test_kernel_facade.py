@@ -2,8 +2,18 @@
 
 import unittest
 
+from math import pi
+
 from build123d import Box, Cylinder, Location, Plane, Solid, Vector
-from build123d.kernel import TopoKind, OcctKernel, kernel
+from build123d.kernel import (
+    BoolOp,
+    DraftFailure,
+    JoinKind,
+    OcctKernel,
+    TopoKind,
+    WireStatus,
+    kernel,
+)
 
 
 class TestKernelFacade(unittest.TestCase):
@@ -189,3 +199,193 @@ class TestKernelFacadeGeometry(unittest.TestCase):
         points, triangles = triangulation
         self.assertEqual(len(points), 4)
         self.assertEqual(len(triangles), 2)
+
+
+class TestKernelFacadeTraversalAndBuilders(unittest.TestCase):
+    def test_children_ancestors_and_vertices(self):
+        box = Solid.make_box(1, 2, 3).wrapped
+        self.assertEqual(len(kernel.direct_children(box)), 1)  # one shell
+        edge_faces = kernel.ancestors(box, TopoKind.EDGE, TopoKind.FACE)
+        self.assertEqual(len(edge_faces), 12)
+        edge = edge_faces.keys()[0]
+        self.assertEqual(len(edge_faces.get(edge)), 2)
+        self.assertIn(kernel.reversed(edge), edge_faces)  # orientation is ignored
+        first, last = kernel.edge_vertices(edge)
+        self.assertEqual(kernel.kind(first), TopoKind.VERTEX)
+        self.assertNotEqual(kernel.vertex_point(first), kernel.vertex_point(last))
+        self.assertTrue(kernel.is_forward(edge) or kernel.is_reversed(edge))
+        self.assertFalse(kernel.same_orientation(edge, kernel.reversed(edge)))
+
+    def test_vertex_wire_face_builders(self):
+        a, b, c = kernel.make_vertex((0, 0, 0)), (1, 0, 0), (1, 1, 0)
+        self.assertEqual(kernel.vertex_point(a), (0.0, 0.0, 0.0))
+        edges = [
+            kernel.make_line((0, 0, 0), b),
+            kernel.make_line(b, c),
+            kernel.make_line(c, (0, 0, 0)),
+        ]
+        wire, status = kernel.make_wire(edges)
+        self.assertEqual(status, WireStatus.OK)
+        self.assertEqual(len(kernel.wire_edges(wire)), 3)
+        self.assertTrue(kernel.is_closed(wire))
+        _, status = kernel.make_wire([edges[0], kernel.make_line((5, 5, 5), (6, 5, 5))])
+        self.assertEqual(status, WireStatus.DISCONNECTED)
+        placed_wire, placed = kernel.make_wire_placed(edges)
+        self.assertEqual(len(placed), 3)
+        face = kernel.make_planar_face(placed_wire, [])
+        self.assertAlmostEqual(kernel.area(face), 0.5)
+        self.assertEqual(kernel.kind(kernel.outer_wire(face)), TopoKind.WIRE)
+        self.assertEqual(
+            kernel.kind(kernel.make_compound([face, wire])), TopoKind.COMPOUND
+        )
+        self.assertEqual(kernel.kind(kernel.make_shell([face])), TopoKind.SHELL)
+        sewn, _ = kernel.sew(
+            kernel.sub_shapes(Solid.make_box(1, 1, 1).wrapped, TopoKind.FACE)
+        )
+        self.assertEqual(kernel.kind(sewn), TopoKind.SHELL)
+        self.assertAlmostEqual(kernel.volume(kernel.solid_from_shell(sewn)), 1.0)
+        self.assertEqual(
+            len(kernel.make_polygon([(0, 0, 0), b, c, (0, 0, 0)]).__class__.__name__),
+            11,
+        )
+
+    def test_distances_and_classification(self):
+        box = Solid.make_box(1, 1, 1).wrapped
+        far = kernel.make_vertex((3, 0.5, 0.5))
+        self.assertAlmostEqual(kernel.distance(box, far), 2.0)
+        separation, on_box, on_vertex = kernel.closest_points(box, far)
+        self.assertAlmostEqual(separation, 2.0)
+        self.assertAlmostEqual(on_box[0], 1.0)
+        self.assertEqual(on_vertex, (3.0, 0.5, 0.5))
+        separation, pairs = kernel.extrema(box, kernel.make_vertex((0.5, 0.5, 1)))
+        self.assertAlmostEqual(separation, 0.0)
+        self.assertGreaterEqual(len(pairs), 1)
+        self.assertTrue(kernel.point_in_solid(box, (0.5, 0.5, 0.5), 1e-6))
+        self.assertFalse(kernel.point_in_solid(box, (2, 2, 2), 1e-6))
+        face = kernel.sub_shapes(box, TopoKind.FACE)[0]
+        surface = kernel.surface_of(face)
+        u_min, u_max, v_min, v_max = surface.uv_bounds()
+        middle = ((u_min + u_max) / 2, (v_min + v_max) / 2)
+        self.assertTrue(kernel.point_on_face(face, surface.value(*middle), 1e-6))
+        self.assertTrue(kernel.uv_in_face(face, middle, 1e-6))
+        self.assertFalse(kernel.uv_in_face(face, (5.0, 5.0), 1e-6))
+        self.assertEqual(
+            len(kernel.line_intersections(box, (0.5, 0.5, -1), (0, 0, 1), 1e-6)), 2
+        )
+
+    def test_curves(self):
+        frame = Plane.XY.to_gp_ax2()
+        arc = kernel.make_circle_arc(frame, 2.0, 0.0, pi / 2, True)
+        view = kernel.curve_of(arc)
+        self.assertEqual(view.geom_type, "CIRCLE")
+        self.assertAlmostEqual(view.circle()[2], 2.0)
+        self.assertAlmostEqual(view.length(), pi)
+        self.assertAlmostEqual(
+            kernel.curve_of(kernel.make_circle(frame, 1.0)).length(), 2 * pi
+        )
+        ellipse = kernel.curve_of(kernel.make_ellipse(frame, 3.0, 2.0))
+        self.assertEqual(ellipse.ellipse()[2:], (3.0, 2.0))
+        bezier = kernel.curve_of(kernel.make_bezier([(0, 0, 0), (1, 1, 0), (2, 0, 0)]))
+        self.assertEqual(bezier.bezier()[0], 2)
+        spline = kernel.make_spline_interpolated(
+            [(0, 0, 0), (1, 1, 0), (2, 0, 0)], periodic=False, tolerance=1e-6
+        )
+        self.assertEqual(kernel.curve_of(spline).geom_type, "BSPLINE")
+        degree, periodic, poles, _, knots, mults = kernel.curve_of(spline).bspline()
+        self.assertEqual((degree >= 2, periodic), (True, False))
+        self.assertEqual(len(knots), len(mults))
+        rebuilt = kernel.make_bspline(poles, knots, mults, degree, periodic)
+        self.assertAlmostEqual(
+            kernel.curve_of(rebuilt).length(), kernel.curve_of(spline).length()
+        )
+        helix = kernel.make_helix((0, 0, 0), (0, 0, 1), 1.0, 1.0, 2.0, 0.0, False)
+        self.assertAlmostEqual(kernel.curve_of(helix).value(0.0)[0], 1.0)
+        trimmed = kernel.trim_edge(arc, 0.0, pi / 4)
+        self.assertAlmostEqual(kernel.curve_of(trimmed).length(), pi / 2)
+        self.assertAlmostEqual(
+            kernel.curve_of(kernel.trim_edge_by_length(arc, 0.0, 1.0)).length(), 1.0
+        )
+        line = kernel.make_line((0, 0, 0), (1, 0, 0))
+        self.assertEqual(kernel.edge_range(line), (0.0, 1.0))
+        self.assertEqual(
+            kernel.vertex_param_on_edge(kernel.edge_vertices(line)[1], line), 1.0
+        )
+        self.assertEqual(
+            kernel.find_plane(
+                kernel.make_polygon([(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 0)])
+            )[1],
+            (0.0, 0.0, 1.0),
+        )
+        self.assertEqual(
+            kernel.planar_intersections(
+                kernel.make_line((0, 0, 0), (2, 2, 0)),
+                (0, 1),
+                kernel.make_line((0, 2, 0), (2, 0, 0)),
+                (0, 1),
+                Plane.XY.wrapped,
+                1e-6,
+            ),
+            [(1.0, 1.0)],
+        )
+
+    def test_operations(self):
+        box = Solid.make_box(1, 1, 1).wrapped
+        top = max(
+            kernel.sub_shapes(box, TopoKind.FACE),
+            key=lambda f: kernel.center_of_mass(f, TopoKind.FACE)[2],
+        )
+        side = min(
+            kernel.sub_shapes(box, TopoKind.FACE),
+            key=lambda f: kernel.center_of_mass(f, TopoKind.FACE)[0],
+        )
+        drafted, _ = kernel.draft(box, [(side, 0.1)], (0, 0, 1), Plane.XY.wrapped)
+        self.assertNotAlmostEqual(kernel.volume(drafted), 1.0)
+        with self.assertRaises(DraftFailure):
+            kernel.draft(box, [(top, 0.1)], (0, 0, 1), Plane.XY.wrapped)
+        prism, generated, _ = kernel.extrude_generated(top, (0, 0, 1))
+        self.assertAlmostEqual(kernel.volume(prism), 1.0)
+        self.assertEqual(len(generated), 4)
+        swept = kernel.sweep_multi(
+            [kernel.outer_wire(top)],
+            kernel.make_wire([kernel.make_line((0.5, 0.5, 1), (0.5, 0.5, 3))])[0],
+            is_frenet=False,
+            make_solid=True,
+        )
+        self.assertAlmostEqual(kernel.volume(swept), 2.0)
+        offset = kernel.offset_shape(
+            top,
+            0.5,
+            1e-5,
+            join=JoinKind.INTERSECTION,
+            intersection=True,
+            thicken=True,
+            remove_internal_edges=True,
+        )
+        self.assertAlmostEqual(kernel.volume(offset), 0.5)
+        lefts, rights = kernel.split_by_edges(
+            top, [kernel.make_line((0.5, 0, 1), (0.5, 1, 1))]
+        )
+        self.assertEqual((len(lefts), len(rights)), (1, 1))
+        transformed, _ = kernel.transformed(
+            box, Location((1, 0, 0)).wrapped.Transformation()
+        )
+        self.assertAlmostEqual(
+            kernel.center_of_mass(transformed, TopoKind.SOLID)[0], 1.5
+        )
+        self.assertEqual(len(kernel.inertia_matrix(box)), 3)
+        self.assertEqual(len(kernel.principal_inertia(box)), 3)
+        self.assertFalse(kernel.has_inconsistent_orientation(box))
+        self.assertEqual(
+            kernel.surface_axis(
+                kernel.sub_shapes(Cylinder(1, 2).wrapped, TopoKind.FACE)[0]
+            )[0],
+            "CYLINDER",
+        )
+        filling = kernel.filling()
+        for edge in kernel.sub_shapes(top, TopoKind.EDGE):
+            filling.add_edge(edge, "C0")
+        self.assertAlmostEqual(kernel.area(filling.build()), 1.0, places=3)
+        split, _ = kernel.boolean(
+            BoolOp.SPLIT, [box], [kernel.face_of_plane(Plane.XY.offset(0.5).wrapped)]
+        )
+        self.assertEqual(len(kernel.sub_shapes(split, TopoKind.SOLID)), 2)

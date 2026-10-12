@@ -63,7 +63,6 @@ from typing import cast as tcast
 from typing import overload
 
 import numpy as np
-import OCP.TopAbs as ta
 
 
 from OCP.BRepAdaptor import BRepAdaptor_CompCurve, BRepAdaptor_Curve
@@ -423,7 +422,7 @@ def _record_matching_vertices(
 ) -> None:
     """Record the vertices of a rebuilt edge as modified from those at the same points."""
     placed_vertices = [
-        v for v in tracked_subshapes([placed]) if v.ShapeType() == ta.TopAbs_VERTEX
+        v for v in tracked_subshapes([placed]) if kernel.is_kind(v, TopoKind.VERTEX)
     ]
     for old in tracked_subshapes([source]):
         if not kernel.is_kind(old, TopoKind.VERTEX):
