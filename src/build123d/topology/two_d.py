@@ -1789,9 +1789,11 @@ class Face(Mixin2D[TopoDS_Face]):
         # For each of the top level shapes create a ShapeList of Face
         for top_level_shape in top_level_shapes:
             if kernel.is_kind(top_level_shape, TopoKind.FACE):
-                sewn_faces.append(ShapeList([Face(top_level_shape)]))
+                sewn_faces.append(
+                    ShapeList([Face(tcast(TopoDS_Face, top_level_shape))])
+                )
             elif kernel.is_kind(top_level_shape, TopoKind.SHELL):
-                sewn_faces.append(Shell(top_level_shape).faces())
+                sewn_faces.append(Shell(tcast(TopoDS_Shell, top_level_shape)).faces())
             elif kernel.is_kind(top_level_shape, TopoKind.SOLID):
                 sewn_faces.append(
                     ShapeList(

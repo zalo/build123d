@@ -917,6 +917,12 @@ class KernelGeometry(ABC):
         trimmed to ``(u_min, u_max, v_min, v_max)`` in the plane's own axes."""
 
     @abstractmethod
+    def face_frame(self, face: Handle) -> tuple[Point, Point, Point]:
+        """The centre of a face, a direction along its surface's u axis and
+        the face's normal (taken where the surface passes nearest the world
+        origin): what a Plane is built from."""
+
+    @abstractmethod
     def planar_surface(self, face: Handle) -> Handle | None:
         """The plane (``gp_Pln`` for the OCCT backend, right-handed) a face's
         surface lies in within tolerance, whatever its type, or None."""

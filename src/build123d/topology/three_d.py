@@ -64,6 +64,7 @@ from bd_materials import FinishedMaterial
 
 
 from OCP.TopoDS import (
+    TopoDS_Shell,
     TopoDS,
     TopoDS_Compound,
     TopoDS_Face,
@@ -1278,9 +1279,13 @@ class Solid(Mixin3D[TopoDS_Solid]):
         # For each of the top level Shells and Faces
         for top_level_shape in top_level_shapes:
             if kernel.is_kind(top_level_shape, TopoKind.FACE):
-                modified_target_surfaces.append(Face(top_level_shape))
+                modified_target_surfaces.append(
+                    Face(tcast(TopoDS_Face, top_level_shape))
+                )
             elif kernel.is_kind(top_level_shape, TopoKind.SHELL):
-                modified_target_surfaces.append(Shell(top_level_shape))
+                modified_target_surfaces.append(
+                    Shell(tcast(TopoDS_Shell, top_level_shape))
+                )
             else:
                 raise RuntimeError(f"Invalid sewn shape {type(top_level_shape)}")
 

@@ -493,8 +493,8 @@ def topo_explore_common_vertex(
     edge1: Edge | TopoDS_Edge, edge2: Edge | TopoDS_Edge
 ) -> Vertex:
     """Given two edges, find the common vertex; the empty Vertex if there is none"""
-    topods_edge1 = edge1 if kernel.is_handle(edge1) else edge1.wrapped
-    topods_edge2 = edge2 if kernel.is_handle(edge2) else edge2.wrapped
+    topods_edge1 = edge1 if kernel.is_handle(edge1) else tcast("Edge", edge1).wrapped
+    topods_edge2 = edge2 if kernel.is_handle(edge2) else tcast("Edge", edge2).wrapped
 
     # Explore vertices of the first edge
     for vertex1 in kernel.sub_shapes(topods_edge1, TopoKind.VERTEX):

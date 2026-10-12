@@ -64,9 +64,8 @@ from OCP.Bnd import Bnd_Box, Bnd_OBB
 from OCP.BRep import BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-from OCP.BRepGProp import BRepGProp, BRepGProp_Face  # used for mass calculation
-from OCP.Geom import Geom_BoundedSurface, Geom_ElementarySurface, Geom_Line, Geom_Plane
-from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_IntSS, GeomAPI_ProjectPointOnSurf
+from OCP.Geom import Geom_ElementarySurface, Geom_Line, Geom_Plane
+from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_IntSS
 from OCP.gp import (
     gp_Ax1,
     gp_Ax2,
@@ -85,7 +84,6 @@ from OCP.gp import (
 )
 
 # properties used to store mass calculation result
-from OCP.GProp import GProp_GProps
 from OCP.Quantity import Quantity_Color, Quantity_ColorRGBA, Quantity_TypeOfColor
 
 from OCP.TopLoc import TopLoc_Location
@@ -3101,13 +3099,8 @@ class Plane(metaclass=PlaneMeta):
 
     @staticmethod
     def get_topods_face_normal(face: TopoDS_Face) -> Vector:
-        """Find the normal at the center of a TopoDS_Face"""
-        gp_pnt = gp_Pnt()
-        normal = gp_Vec()
-        projector = GeomAPI_ProjectPointOnSurf(gp_pnt, BRep_Tool.Surface_s(face))
-        u_val, v_val = projector.LowerDistanceParameters()
-        BRepGProp_Face(face).Normal(u_val, v_val, gp_pnt, normal)
-        return Vector(normal)
+        """Find the normal of a face where its surface passes nearest the origin"""
+        return Vector(kernel.face_frame(face)[2])
 
     @staticmethod
     def _single_arg_as_origin_and_dirs(
@@ -3243,7 +3236,6 @@ class Plane(metaclass=PlaneMeta):
         y_dir = None
         z_dir = None
         if arg_face:
-            surface = BRep_Tool.Surface_s(arg_face.wrapped)
             if not arg_face.is_planar:
                 raise ValueError("Planes can only be created from planar faces")
             if arg_origin is not None:
@@ -3251,23 +3243,11 @@ class Plane(metaclass=PlaneMeta):
                     "The origin parameter is ignored when creating a Plane from a Face",
                     stacklevel=2,
                 )
-            properties = GProp_GProps()
-            BRepGProp.SurfaceProperties_s(arg_face.wrapped, properties)
-            origin = Vector(properties.CentreOfMass())
-
-            if isinstance(surface, Geom_BoundedSurface):
-                point = gp_Pnt()
-                face_x_dir = gp_Vec()
-                tangent_v = gp_Vec()
-                surface.D1(0.5, 0.5, point, face_x_dir, tangent_v)
-            else:
-                assert isinstance(surface, Geom_ElementarySurface)  # for .Position()
-                face_x_dir = gp_Vec(surface.Position().XDirection())
-
+            face_origin, face_x_dir, face_normal = kernel.face_frame(arg_face.wrapped)
+            origin = Vector(face_origin)
             x_dir = Vector(arg_x_dir) if arg_x_dir else Vector(face_x_dir)
             x_dir = round(Vector(x_dir), 14)
-            z_dir = Plane.get_topods_face_normal(arg_face.wrapped)
-            z_dir = round(Vector(z_dir), 14)
+            z_dir = round(Vector(face_normal), 14)
         elif arg_location:
             topo_face = BRepBuilderAPI_MakeFace(
                 Plane.XY.wrapped, -1.0, 1.0, -1.0, 1.0

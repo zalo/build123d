@@ -634,8 +634,7 @@ class ExtensionLine(BaseSketchObject):
             # the in-plane right normal (path direction × Z) selects the side. The XY-
             # plane check above guarantees this in-plane component is non-zero.
             path_direction = (
-                object_to_dimension.position_at(1)
-                - object_to_dimension.position_at(0)
+                object_to_dimension.position_at(1) - object_to_dimension.position_at(0)
             ).normalized()
             along_line = offset_vector.normalized().dot(path_direction)
             if abs(along_line) > _OFFSET_ANGULAR_DOT_TOL:

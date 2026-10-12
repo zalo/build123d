@@ -160,6 +160,7 @@ class BaseCurveObject(Curve, BaseObject):
         self.mode = mode
         super().__init__(curve.wrapped)
 
+
 class BaseLineObject(Wire, BaseObject):
     """BaseLineObject specialized for Wire.
 
@@ -174,6 +175,7 @@ class BaseLineObject(Wire, BaseObject):
         self.mode = mode
         super().__init__(curve.wrapped)
 
+
 class BaseEdgeObject(Edge, BaseObject):
     """BaseEdgeObject specialized for Edge.
 
@@ -187,6 +189,7 @@ class BaseEdgeObject(Edge, BaseObject):
     def __init__(self, curve: Edge, mode: Mode = Mode.ADD):
         self.mode = mode
         super().__init__(curve.wrapped)
+
 
 class Airfoil(BaseLineObject):
     """
@@ -245,7 +248,6 @@ class Airfoil(BaseLineObject):
         # - x is the distance along the chord (0 at the leading edge, 1 at the trailing edge),
         # - t is the maximum thickness as a fraction of the chord (e.g. 0.12 for a NACA 2412),
         # - yₜ gives the half-thickness at each chordwise location.
-
 
         m, p, t = Airfoil.parse_naca4(airfoil_code)
 
@@ -870,7 +872,6 @@ class ConstrainedArcs(BaseCurveObject):
         **kwargs,
     ):
 
-
         selector = kwargs.pop("selector", lambda arcs: arcs)
         mode = kwargs.pop("mode", Mode.ADD)
 
@@ -1189,22 +1190,30 @@ class EllipticalCenterArc(BaseEdgeObject):
                 else AngularDirection.CLOCKWISE
             )
 
-            curve = Edge.make_ellipse(
-                x_radius=x_radius,
-                y_radius=y_radius,
-                start_angle=start_angle,
-                end_angle=end_a,
-                angular_direction=direction,
-            ).rotate(Axis.Z, rotation).translate(center_pnt)
+            curve = (
+                Edge.make_ellipse(
+                    x_radius=x_radius,
+                    y_radius=y_radius,
+                    start_angle=start_angle,
+                    end_angle=end_a,
+                    angular_direction=direction,
+                )
+                .rotate(Axis.Z, rotation)
+                .translate(center_pnt)
+            )
 
         else:
             # The whole ellipse, beginning and ending at the start of the arc
-            curve = Edge.make_ellipse(
-                x_radius=x_radius,
-                y_radius=y_radius,
-                start_angle=start_angle,
-                end_angle=start_angle + 360.0,
-            ).rotate(Axis.Z, rotation).translate(center_pnt)
+            curve = (
+                Edge.make_ellipse(
+                    x_radius=x_radius,
+                    y_radius=y_radius,
+                    start_angle=start_angle,
+                    end_angle=start_angle + 360.0,
+                )
+                .rotate(Axis.Z, rotation)
+                .translate(center_pnt)
+            )
 
             trimmed_curve = curve.trim_to_other(arc_factor)
             trimmed_curve2 = curve.reversed(reconstruct=True).trim_to_other(arc_factor)
@@ -1257,7 +1266,6 @@ class EllipticalStartArc(BaseEdgeObject):
         def proj_to_plane(v: Vector, n: Vector) -> Vector:
             n = n.normalized()
             return v - n * v.dot(n)
-
 
         start_pnt = Vector(start_pnt)
 
@@ -1377,12 +1385,16 @@ class ParabolicCenterArc(BaseEdgeObject):
                 else AngularDirection.CLOCKWISE
             )
 
-            curve = Edge.make_parabola(
-                focal_length=focal_length,
-                start_angle=start_angle,
-                end_angle=end_a,
-                angular_direction=direction,
-            ).rotate(Axis.Z, rotation).translate(vertex_pnt)
+            curve = (
+                Edge.make_parabola(
+                    focal_length=focal_length,
+                    start_angle=start_angle,
+                    end_angle=end_a,
+                    angular_direction=direction,
+                )
+                .rotate(Axis.Z, rotation)
+                .translate(vertex_pnt)
+            )
 
         else:
 
@@ -1470,13 +1482,17 @@ class HyperbolicCenterArc(BaseEdgeObject):
                 else AngularDirection.CLOCKWISE
             )
 
-            curve = Edge.make_hyperbola(
-                x_radius=x_radius,
-                y_radius=y_radius,
-                start_angle=start_angle,
-                end_angle=end_a,
-                angular_direction=direction,
-            ).rotate(Axis.Z, rotation).translate(center_pnt)
+            curve = (
+                Edge.make_hyperbola(
+                    x_radius=x_radius,
+                    y_radius=y_radius,
+                    start_angle=start_angle,
+                    end_angle=end_a,
+                    angular_direction=direction,
+                )
+                .rotate(Axis.Z, rotation)
+                .translate(center_pnt)
+            )
 
         else:
 
@@ -1858,7 +1874,6 @@ class Line(BaseEdgeObject):
         if len(points) != 2:
             raise ValueError("Line requires two pts")
 
-
         points_localized = _localize(*points)
 
         lines_pts = [Vector(p) for p in points_localized]
@@ -2160,9 +2175,7 @@ class Spline(BaseEdgeObject):
         spline_pts = _localize(*points)
 
         if tangents:
-            spline_tangents = [
-                Vector(tangent).normalized() for tangent in tangents
-            ]
+            spline_tangents = [Vector(tangent).normalized() for tangent in tangents]
         else:
             spline_tangents = None
 

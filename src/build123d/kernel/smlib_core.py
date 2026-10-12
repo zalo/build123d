@@ -162,7 +162,7 @@ class SmHandle:
         )
 
     def __repr__(self) -> str:
-        return f"<SmHandle {self.kind.name} {self.key()[1:]}>"
+        return f"<SmHandle {self.kind.name} {self.key()!r}>"
 
 
 class _Record:
@@ -194,6 +194,7 @@ class SmCurveView(CurveView):
             self.first, self.last = interval.GetMin(), interval.GetMax()
         else:
             self.curve = shape.curve
+            assert shape.interval is not None
             self.first, self.last = shape.interval
         self.geom_type = kernel.curve_type(self.curve)
 
@@ -393,7 +394,7 @@ class SmlibCoreKernel(Kernel):
         except TypeError:
             return self.sc.SmBrep(9876543.21, 9876543.21, None)
 
-    def _vec(self, point: Point) -> Any:
+    def _vec(self, point: Sequence[float]) -> Any:
         return self.sc.SmVector3d(float(point[0]), float(point[1]), float(point[2]))
 
     @staticmethod
@@ -726,7 +727,8 @@ class SmlibCoreKernel(Kernel):
             if shape.entity is None:
                 start, end = self._free_edge_vertices(shape)
                 return all(
-                    abs(a - b) < _TOLERANCE for a, b in zip(start.point, end.point)
+                    abs(a - b) < _TOLERANCE
+                    for a, b in zip(self.vertex_point(start), self.vertex_point(end))
                 )
             return bool(shape.entity.IsClosed())
         if shape.kind is TopoKind.WIRE:
@@ -1050,6 +1052,13 @@ class SmlibCoreKernel(Kernel):
             partner=shape.partner,
         )
 
+    def face_frame(self, face: SmHandle) -> tuple[Point, Point, Point]:
+        view = SmSurfaceView(self, face)
+        u_mid, v_mid = view._mid()  # pylint: disable=protected-access
+        _, du, _ = view.d1(u_mid, v_mid)
+        _, normal = view.normal(u_mid, v_mid)
+        return self.center_of_mass(face, TopoKind.FACE), du, normal
+
     def planar_surface(self, face: SmHandle) -> Any:
         plane = SmSurfaceView(self, face).plane()
         if plane is None:
@@ -1169,6 +1178,7 @@ class SmlibCoreKernel(Kernel):
                 t0, t1 = interval.GetMin(), interval.GetMax()
             else:
                 curve = edge.curve
+                assert edge.interval is not None
                 t0, t1 = edge.interval
             status, copy = curve.Copy(self.context)
             _check(status, "curve copy")

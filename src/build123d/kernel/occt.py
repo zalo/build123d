@@ -115,6 +115,7 @@ from OCP.BRepTools import BRepTools_ReShape
 from OCP.BRepFill import BRepFill
 from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
 from OCP.Geom import (
+    Geom_BoundedSurface,
     Geom_BezierSurface,
     Geom_OffsetSurface,
     Geom_RectangularTrimmedSurface,
@@ -1633,6 +1634,22 @@ class _OcctGeometry:
         if bounds is None:
             return BRepBuilderAPI_MakeFace(plane).Face()
         return BRepBuilderAPI_MakeFace(plane, *bounds).Face()
+
+    def face_frame(self, face: TopoDS_Shape) -> tuple[Point, Point, Point]:
+        topods_face = TopoDS.Face(face)
+        surface = BRep_Tool.Surface_s(topods_face)
+        properties = GProp_GProps()
+        BRepGProp.SurfaceProperties_s(topods_face, properties)
+        if isinstance(surface, Geom_BoundedSurface):
+            point, face_x_dir, tangent_v = gp_Pnt(), gp_Vec(), gp_Vec()
+            surface.D1(0.5, 0.5, point, face_x_dir, tangent_v)
+        else:
+            face_x_dir = gp_Vec(surface.Position().XDirection())  # type: ignore[attr-defined]
+        origin, normal = gp_Pnt(), gp_Vec()
+        projector = GeomAPI_ProjectPointOnSurf(origin, surface)
+        u_val, v_val = projector.LowerDistanceParameters()
+        BRepGProp_Face(topods_face).Normal(u_val, v_val, origin, normal)
+        return _pt(properties.CentreOfMass()), _pt(face_x_dir), _pt(normal)
 
     def planar_surface(self, face: TopoDS_Shape) -> gp_Pln | None:
         searcher = GeomLib_IsPlanarSurface(
