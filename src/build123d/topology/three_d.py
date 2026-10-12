@@ -63,7 +63,6 @@ from bd_materials import FinishedMaterial
 
 import OCP.TopAbs as ta
 from OCP.BRep import BRep_Builder
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Cut
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeSolid
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
@@ -88,11 +87,10 @@ from OCP.BRepPrimAPI import (
 )
 from OCP.GeomAbs import GeomAbs_Intersection, GeomAbs_JoinType
 from OCP.gp import gp_Ax2, gp_Pln, gp_Pnt, gp_Vec
-from OCP.GProp import GProp_GProps
 from OCP.ShapeFix import ShapeFix_Solid
 from OCP.Standard import Standard_Failure, Standard_TypeMismatch
 from OCP.StdFail import StdFail_NotDone
-from OCP.TopExp import TopExp, TopExp_Explorer
+from OCP.TopExp import TopExp
 from OCP.TopoDS import (
     TopoDS,
     TopoDS_Compound,
@@ -108,7 +106,7 @@ from OCP.collections import (
     List_TopoDS_Shape,
 )
 
-from build123d.kernel import TopoKind, kernel
+from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.build_enums import (
     CenterOf,
     GeomType,
@@ -140,7 +138,6 @@ from .shape_core import (
     _sew_topods_faces,
     downcast,
     get_top_level_topods_shapes,
-    shapetype,
     unwrap_topods_compound,
     _make_topods_compound_from_shapes,
 )
@@ -519,7 +516,7 @@ class Mixin3D(Shape[TOPODS]):
 
         # Solid + Solid/Face/Shell/Edge/Wire: use Common
         if isinstance(other, (Solid, Face, Shell, Edge, Wire)):
-            intersection = self._bool_op_list((self,), (other,), BRepAlgoAPI_Common())
+            intersection = self._bool_op_list((self,), (other,), BoolOp.COMMON)
             results.extend(intersection.expand())
         # Solid + Vertex: point containment check
         elif isinstance(other, Vertex):
@@ -869,7 +866,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
 
         def edge_on_face(e: Edge, f: Face) -> bool:
             # Can't use distance_to (e.g. normal vector would match), need Common
-            return bool(self._bool_op_list((e,), (f,), BRepAlgoAPI_Common()))
+            return bool(self._bool_op_list((e,), (f,), BoolOp.COMMON))
 
         # Multi shape versions for checking against multiple shapes
         def vertex_on_edges(v: Vertex, edges: Iterable[Edge]) -> bool:
@@ -1171,7 +1168,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
         inner_comp = _make_topods_compound_from_shapes(inner_solids)
 
         # subtract from the outer solid
-        difference = BRepAlgoAPI_Cut(outer_solid, inner_comp).Shape()
+        difference, _ = kernel.boolean(BoolOp.CUT, [outer_solid], [inner_comp])
 
         # convert to a TopoDS_Solid - might be wrapped in a TopoDS_Compound
         try:
@@ -1356,14 +1353,13 @@ class Solid(Mixin3D[TopoDS_Solid]):
         extrusion = Solid.extrude(profile, direction * max_dimension)
 
         # 2: Intersect the extrusion with the target to find the target's modified faces
-        intersect_op = BRepAlgoAPI_Common(target.wrapped, extrusion.wrapped)
-        intersect_op.Build()
-        intersection = intersect_op.Shape()
+        intersection, history = kernel.boolean(
+            BoolOp.COMMON, [target.wrapped], [extrusion.wrapped]
+        )
         if not kernel.sub_shapes(intersection, TopoKind.FACE):
             raise ValueError("No intersection: extrusion does not contact target")
 
         # Find the faces from the intersection that originated on the target
-        history = intersect_op.History()
         modified_target_faces = []
         for topods_face in kernel.sub_shapes(target.wrapped, TopoKind.FACE):
             target_face = TopoDS.Face(topods_face)

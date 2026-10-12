@@ -64,7 +64,6 @@ from typing_extensions import Self
 from bd_materials import FinishedMaterial
 
 import OCP.TopAbs as ta
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
 from OCP.Font import Font_SystemFont
 from OCP.gp import gp_Ax3
 from OCP.Graphic3d import (
@@ -76,7 +75,6 @@ from OCP.Graphic3d import (
     Graphic3d_VTA_TOP,
     Graphic3d_VTA_TOPFIRSTLINE,
 )
-from OCP.GProp import GProp_GProps
 from OCP.NCollection import NCollection_String
 from OCP.StdPrs import StdPrs_BRepTextBuilder as Font_BRepTextBuilder, StdPrs_BRepFont
 from OCP.TopAbs import TopAbs_ShapeEnum
@@ -87,7 +85,7 @@ from OCP.TopoDS import (
     TopoDS_Iterator,
 )
 from anytree import PreOrderIter
-from build123d.kernel import TopoKind, kernel
+from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.build_enums import Align, CenterOf, FontStyle, Select, TextAlign, Unit
 from build123d.geometry import (
     TOLERANCE,
@@ -525,10 +523,10 @@ class Compound(Mixin3D[TopoDS_Compound]):
         if len(summands) <= 1:
             result: Shape = Shape.make_composite(summands[0:1], self._dim)
         else:
-            fuse_op = BRepAlgoAPI_Fuse()
-            fuse_op.SetFuzzyValue(TOLERANCE)
             self.copy_attributes_to(summands[0], ["wrapped", "_NodeMixin__children"])
-            result = self._bool_op(summands[:1], summands[1:], fuse_op)
+            result = self._bool_op(
+                summands[:1], summands[1:], BoolOp.FUSE, fuzzy=TOLERANCE
+            )
             # the fuse ran self's first piece against all the rest; for the
             # record, everything of self was there before and `other` was brought in
             if result._history is not None:
@@ -671,7 +669,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
         # moved() would deep-copy the whole assembly for every part.
         children: list[Shape] = self._parts()
         placed: list[Shape] = [
-            Shape.cast(part.wrapped.Located(part.global_location.wrapped))
+            Shape.cast(kernel.located(part.wrapped, part.global_location.wrapped))
             for part in children
         ]
         if include_parent:
@@ -792,7 +790,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
         elements: list[Shape] = []
         for child in self.children:
             placed = copy.deepcopy(child, dict(outside))
-            placed.wrapped = downcast(child.wrapped.Moved(base.wrapped))
+            placed.wrapped = kernel.moved(child.wrapped, base.wrapped)
             elements.append(placed)
         return elements
 

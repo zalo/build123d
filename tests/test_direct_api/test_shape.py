@@ -33,7 +33,7 @@ from random import uniform
 from unittest.mock import PropertyMock, patch
 
 import numpy as np
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+from build123d.kernel import BoolOp
 from anytree import PreOrderIter
 from build123d.build_enums import CenterOf, GeomType, Keep, Transition
 from build123d.geometry import (
@@ -408,7 +408,7 @@ class TestShape(unittest.TestCase):
         box2 = Solid.make_box(1, 1, 1, Plane((2, 0, 0)))
         zero = Solid()
 
-        result = box1._bool_op((box1, box2), (zero,), BRepAlgoAPI_Cut())
+        result = box1._bool_op((box1, box2), (zero,), BoolOp.CUT)
         self.assertTrue(isinstance(result, Part))
         self.assertTrue(result.is_valid)
         self.assertEqual(len(result.solids()), 2)
@@ -419,7 +419,7 @@ class TestShape(unittest.TestCase):
         box2 = Solid.make_box(1, 1, 1, Plane((2, 0, 0)))
         zero = Solid()
 
-        result = box1._bool_op((box1, box2), (zero,), BRepAlgoAPI_Fuse())
+        result = box1._bool_op((box1, box2), (zero,), BoolOp.FUSE)
         self.assertTrue(isinstance(result, Part))
         self.assertTrue(result.is_valid)
         self.assertEqual(len(result.solids()), 2)
@@ -430,7 +430,7 @@ class TestShape(unittest.TestCase):
         box2 = Solid.make_box(1, 1, 1, Plane((2, 0, 0)))
         zero = Solid()
 
-        result = box1._bool_op((zero,), (box1, box2), BRepAlgoAPI_Fuse())
+        result = box1._bool_op((zero,), (box1, box2), BoolOp.FUSE)
         self.assertTrue(isinstance(result, Part))
         self.assertTrue(result.is_valid)
         self.assertEqual(len(result.solids()), 2)

@@ -59,7 +59,6 @@ from collections.abc import Iterable
 
 from OCP.BRep import BRep_Builder, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
 from OCP.BRepClass3d import BRepClass3d_SolidClassifier
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
@@ -71,8 +70,6 @@ from OCP.GProp import GProp_GProps
 from OCP.gp import gp_Pnt, gp_Vec
 from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
 from OCP.TopAbs import TopAbs_Orientation, TopAbs_ShapeEnum
-from OCP.TopExp import TopExp_Explorer
-from OCP.collections import List_TopoDS_Shape
 from OCP.TopoDS import (
     TopoDS,
     TopoDS_Compound,
@@ -83,7 +80,7 @@ from OCP.TopoDS import (
     TopoDS_Edge,
     TopoDS_Wire,
 )
-from build123d.kernel import TopoKind, kernel
+from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.geometry import TOLERANCE, BoundBox, Vector, VectorLike
 
 from .shape_core import (
@@ -407,26 +404,21 @@ def new_edges(*objects: Shape, combined: Shape) -> ShapeList[Edge]:
         ShapeList[Edge]: new edges
     """
     # Create a list of combined object edges
-    combined_topo_edges = List_TopoDS_Shape()
-    for edge in combined.edges():
-        if not edge.is_empty:
-            combined_topo_edges.Append(edge.wrapped)
+    combined_topo_edges = [
+        edge.wrapped for edge in combined.edges() if not edge.is_empty
+    ]
 
     # Create a list of original object edges
-    original_topo_edges = List_TopoDS_Shape()
-    for edge in [e for obj in objects for e in obj.edges()]:
-        if not edge.is_empty:
-            original_topo_edges.Append(edge.wrapped)
+    original_topo_edges = [
+        edge.wrapped
+        for edge in [e for obj in objects for e in obj.edges()]
+        if not edge.is_empty
+    ]
 
     # Cut the original edges from the combined edges
-    operation = BRepAlgoAPI_Cut()
-    operation.SetArguments(combined_topo_edges)
-    operation.SetTools(original_topo_edges)
-    operation.SetRunParallel(True)
-    operation.Build()
-
+    cut_result, _ = kernel.boolean(BoolOp.CUT, combined_topo_edges, original_topo_edges)
     edges = []
-    for topods_edge in kernel.sub_shapes(operation.Shape(), TopoKind.EDGE):
+    for topods_edge in kernel.sub_shapes(cut_result, TopoKind.EDGE):
         found_edge = combined.__class__.cast(downcast(topods_edge))
         found_edge.topo_parent = combined
         edges.append(found_edge)

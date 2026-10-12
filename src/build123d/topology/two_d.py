@@ -66,7 +66,6 @@ from typing import overload
 import OCP.TopAbs as ta
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Common, BRepAlgoAPI_Section
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Sewing
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepFeat import BRepFeat_SplitShape
@@ -133,7 +132,7 @@ from OCP.TopLoc import TopLoc_Location
 from ocp_gordon import interpolate_curve_network
 from typing_extensions import Self
 
-from build123d.kernel import TopoKind, kernel
+from build123d.kernel import BoolOp, kernel
 from build123d.build_enums import (
     CenterOf,
     ContinuityLevel,
@@ -181,7 +180,6 @@ from .shape_core import (
     _topods_face_normal_at,
     downcast,
     get_top_level_topods_shapes,
-    shapetype,
 )
 from .utils import (
     _extrude_topods_shape,
@@ -554,13 +552,13 @@ class Mixin2D(ABC, Shape[TOPODS]):
         # 2D + 2D: Common (coplanar overlap) AND Section (crossing curves)
         if isinstance(other, (Face, Shell)):
             # Common for coplanar overlap
-            common = self._bool_op_list((self,), (other,), BRepAlgoAPI_Common())
+            common = self._bool_op_list((self,), (other,), BoolOp.COMMON)
             common_faces = common.expand()
             results.extend(common_faces)
 
             # Section for crossing curves (only edges, not vertices)
             # Vertices from Section are boundary contacts (touch), not intersections
-            section = self._bool_op_list((self,), (other,), BRepAlgoAPI_Section())
+            section = self._bool_op_list((self,), (other,), BoolOp.SECTION)
             section_edges = ShapeList(
                 [s for s in section if isinstance(s, Edge)]
             ).expand()
@@ -578,7 +576,7 @@ class Mixin2D(ABC, Shape[TOPODS]):
 
         # 2D + Edge: Section for intersection
         elif isinstance(other, (Edge, Wire)):
-            section = self._bool_op_list((self,), (other,), BRepAlgoAPI_Section())
+            section = self._bool_op_list((self,), (other,), BoolOp.SECTION)
             results.extend(section)
 
         # 2D + Vertex: point containment on surface
@@ -2615,7 +2613,7 @@ class Face(Mixin2D[TopoDS_Face]):
             raise TypeError("projection to a vertex is not supported")
         if isinstance(target_object, Face):
             topods_shape = _topods_bool_op(
-                (extruded_topods_self,), (target_object.wrapped,), BRepAlgoAPI_Common()
+                (extruded_topods_self,), (target_object.wrapped,), BoolOp.COMMON
             )
             if not topods_shape.IsNull():
                 intersected_shapes.extend(
@@ -2627,7 +2625,7 @@ class Face(Mixin2D[TopoDS_Face]):
                 topods_shape = _topods_bool_op(
                     (extruded_topods_self,),
                     (target_shell.wrapped,),
-                    BRepAlgoAPI_Common(),
+                    BoolOp.COMMON,
                 )
                 for topods_shell in get_top_level_topods_shapes(topods_shape):
                     intersected_shapes.append(Shell(TopoDS.Shell(topods_shell)))

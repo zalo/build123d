@@ -67,10 +67,6 @@ import OCP.TopAbs as ta
 from OCP.BOPAlgo import BOPAlgo_Splitter
 from OCP.BRep import BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_CompCurve, BRepAdaptor_Curve
-from OCP.BRepAlgoAPI import (
-    BRepAlgoAPI_Common,
-    BRepAlgoAPI_Section,
-)
 from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_DisconnectedWire,
     BRepBuilderAPI_EmptyWire,
@@ -196,7 +192,7 @@ from scipy.optimize import minimize_scalar
 from scipy.spatial import ConvexHull
 from typing_extensions import Self
 
-from build123d.kernel import TopoKind, kernel
+from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.build_enums import (
     AngularDirection,
     CenterOf,
@@ -505,7 +501,7 @@ def _offset_curves_to_bsplines(wire: Wire) -> Wire:
             raise RuntimeError("2D offset curve could not be converted to a spline")
         fitted = BRepBuilderAPI_MakeEdge(approximation.Curve()).Edge()
         # The curve is stored without the placement or direction of its edge
-        fitted.Location(edge.wrapped.Location())
+        kernel.set_location(fitted, kernel.location_of(edge.wrapped))
         fitted.Orientation(edge.wrapped.Orientation())
         fitted_edges.append(Edge(fitted))
 
@@ -1090,14 +1086,14 @@ class Mixin1D(Shape[TOPODS]):
         # 1D + Plane: run Section directly with OCP Face
         if isinstance(other, Plane):
             face: Shape = Shape(BRepBuilderAPI_MakeFace(other.wrapped).Face())
-            section = self._bool_op_list((self,), (face,), BRepAlgoAPI_Section())
+            section = self._bool_op_list((self,), (face,), BoolOp.SECTION)
             results.extend(section.expand())
 
         # 1D + 1D: Common (collinear overlap) + Section (crossing vertices)
         elif isinstance(other, (Edge, Wire)):
-            common = self._bool_op_list((self,), (other,), BRepAlgoAPI_Common())
+            common = self._bool_op_list((self,), (other,), BoolOp.COMMON)
             results.extend(common.expand())
-            section = self._bool_op_list((self,), (other,), BRepAlgoAPI_Section())
+            section = self._bool_op_list((self,), (other,), BoolOp.SECTION)
             # Extract vertices from section (edges already in Common for wires)
             for shape in section:
                 if isinstance(shape, Vertex) and not shape.is_empty:
@@ -4313,7 +4309,9 @@ class Wire(Mixin1D[TopoDS_Wire]):
         new_loc = Location(self._wrapped.Location())
         geometry_adjust = new_loc.inverse() * old_loc
         trsf = geometry_adjust.wrapped.Transformation()
-        base_wire = globalized_filleted_wire.wrapped.Located(TopLoc_Location())
+        base_wire = kernel.located(
+            globalized_filleted_wire.wrapped, kernel.identity_location()
+        )
         record.merge(
             ShapeHistory.from_relocation(globalized_filleted_wire.wrapped, base_wire)
         )

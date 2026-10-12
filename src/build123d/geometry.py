@@ -56,6 +56,8 @@ from typing import (
 
 import numpy as np
 from sys import float_info
+
+from build123d.kernel import kernel
 import webcolors  # type: ignore
 from typing_extensions import deprecated
 from OCP.Bnd import Bnd_Box, Bnd_OBB
@@ -63,7 +65,6 @@ from OCP.BRep import BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face  # used for mass calculation
-from OCP.BRepTools import BRepTools
 from OCP.Geom import Geom_BoundedSurface, Geom_ElementarySurface, Geom_Line, Geom_Plane
 from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_IntSS, GeomAPI_ProjectPointOnSurf
 from OCP.gp import (
@@ -1187,16 +1188,12 @@ class BoundBox:
 
             bounding_box = Bnd_Box()
             if topo_shape is not None:
-                BRepTools.Clean_s(topo_shape)  # Remove mesh which may impact bbox
-
                 tolerance = (
                     TOLERANCE if tolerance is None else tolerance
                 )  # tol = TOLERANCE (by default)
-
-                if optimal:
-                    BRepBndLib.AddOptimal_s(topo_shape, bounding_box)
-                else:
-                    BRepBndLib.Add_s(topo_shape, bounding_box, True)
+                corners = kernel.bounding_box(topo_shape, optimal)
+                if corners is not None:
+                    bounding_box.Update(*corners)
 
         if bounding_box.IsVoid():
             x_min, y_min, z_min, x_max, y_max, z_max = (0.0,) * 6

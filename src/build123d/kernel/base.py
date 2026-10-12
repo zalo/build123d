@@ -38,8 +38,8 @@ license:
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Hashable, Sequence
 from enum import Enum
-from collections.abc import Hashable
 from typing import Any
 
 Handle = Any
@@ -80,6 +80,16 @@ _KIND_LABELS = {
     TopoKind.COMPOUND: "Compound",
 }
 _LABEL_KINDS = {label: kind for kind, label in _KIND_LABELS.items()}
+
+
+class BoolOp(Enum):
+    """The boolean operations the topology layer asks for."""
+
+    FUSE = "fuse"
+    CUT = "cut"
+    COMMON = "common"
+    SECTION = "section"
+    SPLIT = "split"
 
 
 class Kernel(ABC):
@@ -174,3 +184,66 @@ class Kernel(ABC):
     ) -> tuple[float, float, float]:
         """Centre of mass of ``shape`` measured as a ``kind``: edges by length,
         faces by area, solids by volume."""
+
+    @abstractmethod
+    def bounding_box(
+        self, shape: Handle, optimal: bool = True
+    ) -> tuple[float, float, float, float, float, float] | None:
+        """Axis-aligned bounds ``(xmin, ymin, zmin, xmax, ymax, zmax)`` of
+        ``shape``, enlarged by the backend's tolerances, or None for an empty
+        shape. ``optimal`` asks for the tight box rather than the quick one."""
+
+    # ---- operations ---------------------------------------------------------
+
+    @abstractmethod
+    def boolean(
+        self,
+        op: BoolOp,
+        args: Sequence[Handle],
+        tools: Sequence[Handle],
+        *,
+        glue: bool = False,
+        fuzzy: float | None = None,
+    ) -> tuple[Handle, Any]:
+        """Run ``op`` with ``tools`` against ``args``.
+
+        Returns the result and the backend's record of what the operation
+        generated and modified (opaque; consumed by ``topology.history``).
+        ``glue`` speeds up shapes that only touch; ``fuzzy`` is a merge tolerance.
+        """
+
+    @abstractmethod
+    def section(self, a: Handle, b: Handle) -> tuple[Handle, Any]:
+        """The vertices and edges where ``a`` and ``b`` meet, with the pcurves
+        on both and approximated section curves; plus the history record."""
+
+    @abstractmethod
+    def unify_same_domain(self, shape: Handle) -> tuple[Handle, Any]:
+        """``shape`` with faces and edges lying on the same geometry merged;
+        plus the history record. Raises when the backend cannot."""
+
+    # ---- placement ----------------------------------------------------------
+
+    @abstractmethod
+    def identity_location(self) -> Handle:
+        """The placement that leaves a shape where it is."""
+
+    @abstractmethod
+    def location_of(self, shape: Handle) -> Handle:
+        """The placement carried by ``shape``."""
+
+    @abstractmethod
+    def set_location(self, shape: Handle, location: Handle) -> None:
+        """Give ``shape`` the absolute placement ``location``, in place."""
+
+    @abstractmethod
+    def located(self, shape: Handle, location: Handle) -> Handle:
+        """A handle to the same geometry at the absolute placement ``location``."""
+
+    @abstractmethod
+    def moved(self, shape: Handle, location: Handle) -> Handle:
+        """A handle to the same geometry displaced by ``location`` from where it is."""
+
+    @abstractmethod
+    def relocation_between(self, source: Handle, target: Handle) -> Handle:
+        """The displacement that takes ``source``'s placement to ``target``'s."""

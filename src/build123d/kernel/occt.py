@@ -33,18 +33,34 @@ license:
 
 from __future__ import annotations
 
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Sequence
+from typing import Any
 
 import OCP.TopAbs as ta
+from OCP.Bnd import Bnd_Box
+from OCP.BOPAlgo import BOPAlgo_GlueEnum
+from OCP.BRepAlgoAPI import (
+    BRepAlgoAPI_BuilderAlgo,
+    BRepAlgoAPI_Common,
+    BRepAlgoAPI_Cut,
+    BRepAlgoAPI_Fuse,
+    BRepAlgoAPI_Section,
+    BRepAlgoAPI_Splitter,
+)
+from OCP.BRepBndLib import BRepBndLib
 from OCP.BRepBuilderAPI import BRepBuilderAPI_Copy
 from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepGProp import BRepGProp
+from OCP.BRepTools import BRepTools
+from OCP.collections import List_TopoDS_Shape
 from OCP.GProp import GProp_GProps
 from OCP.ShapeFix import ShapeFix_Shape
+from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCP.TopExp import TopExp_Explorer
+from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import TopoDS, TopoDS_Shape
 
-from build123d.kernel.base import Kernel, TopoKind
+from build123d.kernel.base import BoolOp, Kernel, TopoKind
 
 _KIND_TO_TOPABS = {
     TopoKind.VERTEX: ta.TopAbs_VERTEX,
@@ -171,6 +187,103 @@ class OcctKernel(Kernel):
         _MASS_PROPERTIES[kind](shape, properties)
         center = properties.CentreOfMass()
         return (center.X(), center.Y(), center.Z())
+
+    def bounding_box(
+        self, shape: TopoDS_Shape, optimal: bool = True
+    ) -> tuple[float, float, float, float, float, float] | None:
+        box = Bnd_Box()
+        BRepTools.Clean_s(shape)  # a stale mesh would widen the box
+        if optimal:
+            BRepBndLib.AddOptimal_s(shape, box)
+        else:
+            BRepBndLib.Add_s(shape, box, True)
+        if box.IsVoid():
+            return None
+        # the OCP stubs do not declare the per-axis getters
+        return (
+            box.GetXMin(),  # type: ignore[attr-defined]
+            box.GetYMin(),  # type: ignore[attr-defined]
+            box.GetZMin(),  # type: ignore[attr-defined]
+            box.GetXMax(),  # type: ignore[attr-defined]
+            box.GetYMax(),  # type: ignore[attr-defined]
+            box.GetZMax(),  # type: ignore[attr-defined]
+        )
+
+    # ---- operations ---------------------------------------------------------
+
+    def boolean(
+        self,
+        op: BoolOp,
+        args: Sequence[TopoDS_Shape],
+        tools: Sequence[TopoDS_Shape],
+        *,
+        glue: bool = False,
+        fuzzy: float | None = None,
+    ) -> tuple[TopoDS_Shape, Any]:
+        operation: Any = _BOOLEAN_ALGORITHMS[op]()  # Set* live on the subclasses
+        if glue:
+            operation.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueShift)
+        if fuzzy:
+            operation.SetFuzzyValue(fuzzy)
+        operation.SetArguments(_shape_list(args))
+        operation.SetTools(_shape_list(tools))
+        operation.SetRunParallel(True)
+        operation.Build()
+        return self.downcast(operation.Shape()), operation.History()
+
+    def section(self, a: TopoDS_Shape, b: TopoDS_Shape) -> tuple[TopoDS_Shape, Any]:
+        section = BRepAlgoAPI_Section(a, b)
+        section.SetRunParallel(True)
+        section.Approximation(True)
+        section.ComputePCurveOn1(True)
+        section.ComputePCurveOn2(True)
+        section.Build()
+        return section.Shape(), section.History()
+
+    def unify_same_domain(self, shape: TopoDS_Shape) -> tuple[TopoDS_Shape, Any]:
+        upgrader = ShapeUpgrade_UnifySameDomain(shape, True, True, True)
+        upgrader.AllowInternalEdges(False)
+        upgrader.Build()
+        return self.downcast(upgrader.Shape()), upgrader.History()
+
+    # ---- placement ----------------------------------------------------------
+
+    def identity_location(self) -> TopLoc_Location:
+        return TopLoc_Location()
+
+    def location_of(self, shape: TopoDS_Shape) -> TopLoc_Location:
+        return shape.Location()
+
+    def set_location(self, shape: TopoDS_Shape, location: TopLoc_Location) -> None:
+        shape.Location(location)
+
+    def located(self, shape: TopoDS_Shape, location: TopLoc_Location) -> TopoDS_Shape:
+        return self.downcast(shape.Located(location))
+
+    def moved(self, shape: TopoDS_Shape, location: TopLoc_Location) -> TopoDS_Shape:
+        return self.downcast(shape.Moved(location))
+
+    def relocation_between(
+        self, source: TopoDS_Shape, target: TopoDS_Shape
+    ) -> TopLoc_Location:
+        return target.Location().Multiplied(source.Location().Inverted())
+
+
+_BOOLEAN_ALGORITHMS: dict[BoolOp, Callable[[], BRepAlgoAPI_BuilderAlgo]] = {
+    BoolOp.FUSE: BRepAlgoAPI_Fuse,
+    BoolOp.CUT: BRepAlgoAPI_Cut,
+    BoolOp.COMMON: BRepAlgoAPI_Common,
+    BoolOp.SECTION: BRepAlgoAPI_Section,
+    BoolOp.SPLIT: BRepAlgoAPI_Splitter,
+}
+
+
+def _shape_list(shapes: Sequence[TopoDS_Shape]) -> List_TopoDS_Shape:
+    """A kernel list holding ``shapes`` in order."""
+    result = List_TopoDS_Shape()
+    for shape in shapes:
+        result.Append(shape)
+    return result
 
 
 def kind_to_topabs(kind: TopoKind) -> ta.TopAbs_ShapeEnum:

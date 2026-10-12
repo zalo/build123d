@@ -2,7 +2,7 @@
 
 import unittest
 
-from build123d import Box, Cylinder, Solid, Vector
+from build123d import Box, Cylinder, Location, Plane, Solid, Vector
 from build123d.kernel import TopoKind, OcctKernel, kernel
 
 
@@ -62,3 +62,57 @@ class TestKernelFacade(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKernelFacadeOperations(unittest.TestCase):
+    def test_bounding_box(self):
+        box = Solid.make_box(1, 2, 3)
+        corners = kernel.bounding_box(box.wrapped)
+        self.assertIsNotNone(corners)
+        xmin, ymin, zmin, xmax, ymax, zmax = corners
+        self.assertAlmostEqual(xmax - xmin, 1.0, 5)
+        self.assertAlmostEqual(ymax - ymin, 2.0, 5)
+        self.assertAlmostEqual(zmax - zmin, 3.0, 5)
+        quick = kernel.bounding_box(box.wrapped, optimal=False)
+        self.assertIsNotNone(quick)
+
+    def test_boolean_and_history(self):
+        from build123d.kernel import BoolOp
+
+        a = Solid.make_box(2, 2, 2).wrapped
+        b = Solid.make_box(1, 1, 1).wrapped
+        cut, record = kernel.boolean(BoolOp.CUT, [a], [b])
+        self.assertAlmostEqual(kernel.volume(cut), 7.0, 5)
+        self.assertIsNotNone(record)
+        fused, _ = kernel.boolean(BoolOp.FUSE, [a], [b], fuzzy=1e-6)
+        self.assertAlmostEqual(kernel.volume(fused), 8.0, 5)
+        common, _ = kernel.boolean(BoolOp.COMMON, [a], [b])
+        self.assertAlmostEqual(kernel.volume(common), 1.0, 5)
+        split, _ = kernel.boolean(BoolOp.SPLIT, [a], [b])
+        self.assertEqual(len(kernel.sub_shapes(split, TopoKind.SOLID)), 2)
+
+    def test_section_and_unify(self):
+        a = Solid.make_box(2, 2, 2).wrapped
+        b = Solid.make_box(2, 2, 2, Plane((1, 0, 0))).wrapped
+        curves, _ = kernel.section(a, b)
+        self.assertGreaterEqual(len(kernel.sub_shapes(curves, TopoKind.EDGE)), 4)
+        from build123d.kernel import BoolOp
+
+        fused, _ = kernel.boolean(BoolOp.FUSE, [a], [b])
+        unified, _ = kernel.unify_same_domain(fused)
+        self.assertEqual(len(kernel.sub_shapes(unified, TopoKind.FACE)), 6)
+
+    def test_placement(self):
+        box = Solid.make_box(1, 1, 1)
+        identity = kernel.identity_location()
+        self.assertTrue(kernel.location_of(box.wrapped).IsIdentity())
+        shift = Location((1, 2, 3)).wrapped
+        moved = kernel.moved(box.wrapped, shift)
+        self.assertTrue(kernel.is_partner(moved, box.wrapped))
+        self.assertFalse(kernel.is_same(moved, box.wrapped))
+        back = kernel.relocation_between(moved, box.wrapped)
+        self.assertTrue(kernel.is_same(kernel.moved(moved, back), box.wrapped))
+        placed = kernel.located(moved, identity)
+        self.assertTrue(kernel.is_same(placed, box.wrapped))
+        kernel.set_location(placed, shift)
+        self.assertTrue(kernel.is_same(placed, moved))

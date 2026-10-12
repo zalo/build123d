@@ -76,21 +76,11 @@ import OCP.TopAbs as ta
 from anytree import NodeMixin, RenderTree
 from IPython.lib.pretty import RepresentationPrinter, pretty
 from OCP.Bnd import Bnd_OBB
-from OCP.BOPAlgo import BOPAlgo_GlueEnum
 from OCP.BRep import BRep_TEdge, BRep_Tool
 from OCP.BRepAdaptor import BRepAdaptor_Curve, BRepAdaptor_Surface
 from OCP.GCPnts import GCPnts_AbscissaPoint
 from OCP.GeomAdaptor import GeomAdaptor_Curve
-from OCP.BRepAlgoAPI import (
-    BRepAlgoAPI_BooleanOperation,
-    BRepAlgoAPI_Common,
-    BRepAlgoAPI_Cut,
-    BRepAlgoAPI_Fuse,
-    BRepAlgoAPI_Section,
-    BRepAlgoAPI_Splitter,
-)
 from OCP.BRepBuilderAPI import (
-    BRepBuilderAPI_Copy,
     BRepBuilderAPI_GTransform,
     BRepBuilderAPI_MakeFace,
     BRepBuilderAPI_MakeVertex,
@@ -100,7 +90,6 @@ from OCP.BRepBuilderAPI import (
     BRepBuilderAPI_Transform,
     BRepBuilderAPI_Transformed,
 )
-from OCP.BRepCheck import BRepCheck_Analyzer
 from OCP.BRepExtrema import BRepExtrema_DistShapeShape
 from OCP.BRepGProp import BRepGProp, BRepGProp_Face
 from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
@@ -114,11 +103,9 @@ from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_TrsfForm, gp_Vec,
 from OCP.GProp import GProp_GProps
 from OCP.ShapeAnalysis import ShapeAnalysis_Curve, ShapeAnalysis_Shell
 from OCP.ShapeCustom import ShapeCustom, ShapeCustom_RestrictionParameters
-from OCP.ShapeFix import ShapeFix_Shape
-from OCP.ShapeUpgrade import ShapeUpgrade_UnifySameDomain
 from OCP.Standard import Standard_Failure
 from OCP.TopAbs import TopAbs_Orientation, TopAbs_ShapeEnum
-from OCP.TopExp import TopExp, TopExp_Explorer
+from OCP.TopExp import TopExp
 from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import (
     TopoDS,
@@ -143,7 +130,7 @@ from typing_extensions import Self, deprecated
 from bd_materials import FinishedMaterial, resolve as resolve_material
 
 from build123d.build_constants import UNITS_PER_KILOGRAM, UNITS_PER_METER
-from build123d.kernel import TopoKind, kernel
+from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.build_enums import (
     CenterOf,
     Convexity,
@@ -675,13 +662,13 @@ class Shape(NodeMixin, Generic[TOPODS]):
     def location(self) -> Location:
         """Get this Shape's Location"""
         self._needs_geometry("location")
-        return Location(self.wrapped.Location())
+        return Location(kernel.location_of(self.wrapped))
 
     @location.setter
     def location(self, value: Location):
         """Set Shape's Location to value"""
         if not self.is_empty:
-            self.wrapped.Location(value.wrapped)
+            kernel.set_location(self.wrapped, value.wrapped)
 
     @property
     def matrix_of_inertia(self) -> list[list[float]]:
@@ -1438,17 +1425,14 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         if self.is_empty:
             return self
-        upgrader = ShapeUpgrade_UnifySameDomain(self.wrapped, True, True, True)
-        upgrader.AllowInternalEdges(False)
-        # upgrader.SetAngularTolerance(1e-5)
         # OCP binds each OCCT failure straight to Exception, so
         # Standard_ConstructionError is not a Standard_Failure and there is no
         # base class to name here. Cleaning is best effort anyway: on failure
         # the uncleaned shape is still usable.
         try:
-            upgrader.Build()
-            self.wrapped = tcast(TOPODS, downcast(upgrader.Shape()))
-            unified = ShapeHistory.from_unify(upgrader)
+            unified_shape, record = kernel.unify_same_domain(self.wrapped)
+            self.wrapped = tcast(TOPODS, unified_shape)
+            unified = ShapeHistory(record)
             self._history = (
                 unified if self._history is None else self._history.merge(unified)
             )
@@ -1510,9 +1494,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
             Self | Compound: Resulting object may be of a different class than self
         """
 
-        cut_op = BRepAlgoAPI_Cut()
-
-        return self._bool_op((self,), to_cut, cut_op)
+        return self._bool_op((self,), to_cut, BoolOp.CUT)
 
     def distance(self, other: Shape) -> float:
         """Minimal distance between two shapes
@@ -1707,15 +1689,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         """
 
-        fuse_op = BRepAlgoAPI_Fuse()
-        if glue:
-            fuse_op.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueShift)
-        if tol:
-            fuse_op.SetFuzzyValue(tol)
-
-        return_value = self._bool_op((self,), to_fuse, fuse_op)
-
-        return return_value
+        return self._bool_op((self,), to_fuse, BoolOp.FUSE, glue=glue, fuzzy=tol)
 
     # def _entities_from(
     #     self, child_type: Shapes, parent_type: Shapes
@@ -1894,7 +1868,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         """
         if not self.is_empty:  # nothing is nothing wherever it is put
-            self.wrapped.Location(loc.wrapped)
+            kernel.set_location(self.wrapped, loc.wrapped)
 
         return self
 
@@ -1915,11 +1889,9 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if kernel.is_kind(self.wrapped, TopoKind.VERTEX):
             # Copying a Vertex folds its location into its point, so the copy
             # is rebuilt from the vertex without its location
-            unplaced = self.wrapped.Located(TopLoc_Location())
-            shape_copy.wrapped = tcast(
-                TOPODS, downcast(BRepBuilderAPI_Copy(unplaced).Shape())
-            )
-        shape_copy.wrapped.Location(loc.wrapped)
+            unplaced = kernel.located(self.wrapped, kernel.identity_location())
+            shape_copy.wrapped = tcast(TOPODS, kernel.copy_deep(unplaced))
+        kernel.set_location(shape_copy.wrapped, loc.wrapped)
         return shape_copy
 
     def mesh(self, tolerance: float, angular_tolerance: float = 0.1):
@@ -1991,9 +1963,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
             loc = loc.location
         shape_copy: Shape = copy.deepcopy(self, None)
         if not self.is_empty:  # nothing is nothing wherever it is put
-            shape_copy.wrapped = tcast(
-                TOPODS, downcast(self.wrapped.Moved(loc.wrapped))
-            )
+            shape_copy.wrapped = tcast(TOPODS, kernel.moved(self.wrapped, loc.wrapped))
         return shape_copy
 
     def oriented_bounding_box(self) -> OrientedBoundBox:
@@ -2322,29 +2292,15 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if keep in [Keep.INSIDE, Keep.OUTSIDE]:
             raise ValueError(f"{keep} is invalid")
 
-        shape_list = List_TopoDS_Shape()
-        shape_list.Append(self.wrapped)
-
         # Define the splitting tool
         trim_tool = (
             BRepBuilderAPI_MakeFace(tool.wrapped).Face()  # gp_Pln to Face
             if isinstance(tool, Plane)
             else tool.wrapped
         )
-        tool_list = List_TopoDS_Shape()
-        tool_list.Append(trim_tool)
-
-        # Create the splitter algorithm
-        splitter = BRepAlgoAPI_Splitter()
-
-        # Set the shape to be split and the splitting tool (plane face)
-        splitter.SetArguments(shape_list)
-        splitter.SetTools(tool_list)
-
-        # Perform the splitting operation
-        splitter.Build()
-
-        split_result = downcast(splitter.Shape())
+        split_result, _ = kernel.boolean(BoolOp.SPLIT, [self.wrapped], [trim_tool])
+        if split_result.IsNull():
+            raise ValueError("Null TopoDS_Shape object")
         # Remove unnecessary TopoDS_Compound around single shape
         if kernel.is_kind(split_result, TopoKind.COMPOUND):
             split_result = unwrap_topods_compound(split_result, True)
@@ -2403,9 +2359,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
                 is_up = tool.to_local_coords(piece_center).Z >= 0
             else:
                 # Intersect self and the thickened tool
-                is_up_obj = _topods_bool_op(
-                    (part,), (tool_solid,), BRepAlgoAPI_Common()
-                )
+                is_up_obj = _topods_bool_op((part,), (tool_solid,), BoolOp.COMMON)
                 # Check for valid intersections
                 BRepGProp.LinearProperties_s(is_up_obj, properties)
                 # Mass represents the total length for linear properties
@@ -2880,7 +2834,10 @@ class Shape(NodeMixin, Generic[TOPODS]):
         self,
         args: Iterable[Shape],
         tools: Iterable[Shape],
-        operation: BRepAlgoAPI_BooleanOperation | BRepAlgoAPI_Splitter,
+        operation: BoolOp,
+        *,
+        glue: bool = False,
+        fuzzy: float | None = None,
     ) -> Self | Compound:
         """Generic boolean operation
 
@@ -2919,7 +2876,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         # Handle operations with "zero" shapes
         topo_result = None
-        if isinstance(operation, BRepAlgoAPI_Cut):
+        if operation is BoolOp.CUT:
             if arg.IsEmpty():  # nothing less anything is still nothing
                 return Shape._zero_of(
                     self, *Shape._operands(args), *Shape._operands(tools)
@@ -2929,7 +2886,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
                     topo_result = arg.First()
                 else:
                     topo_result = _make_topods_compound_from_shapes(arg)
-        elif isinstance(operation, BRepAlgoAPI_Fuse):
+        elif operation is BoolOp.FUSE:
             if tool.IsEmpty():
                 if arg.Extent() == 1:
                     topo_result = arg.First()
@@ -2940,7 +2897,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
                     topo_result = tool.First()
                 else:
                     topo_result = _make_topods_compound_from_shapes(tool)
-        elif isinstance(operation, BRepAlgoAPI_Common):
+        elif operation is BoolOp.COMMON:
             if tool.IsEmpty() or arg.IsEmpty():
                 return Shape._zero_of(
                     self, *Shape._operands(args), *Shape._operands(tools)
@@ -2953,24 +2910,19 @@ class Shape(NodeMixin, Generic[TOPODS]):
         brought = [o._wrapped for o in tools if not o.is_empty]
         history = ShapeHistory(before=before, brought=brought)
         if topo_result is None:
-            operation.SetArguments(arg)
-            operation.SetTools(tool)
-
-            operation.SetRunParallel(True)
-            operation.Build()
-
-            topo_result = downcast(operation.Shape())
-            history = ShapeHistory.from_boolean(operation, before, brought)
+            topo_result, record = kernel.boolean(
+                operation, before, brought, glue=glue, fuzzy=fuzzy
+            )
+            if topo_result.IsNull():
+                raise ValueError("Null TopoDS_Shape object")
+            history = ShapeHistory(record, before, brought)
 
         # Clean
         if SkipClean.clean:
-            upgrader = ShapeUpgrade_UnifySameDomain(topo_result, True, True, True)
-            upgrader.AllowInternalEdges(False)
             # see Shape.clean: OCP gives OCCT failures no common base class
             try:
-                upgrader.Build()
-                topo_result = downcast(upgrader.Shape())
-                history.merge(ShapeHistory.from_unify(upgrader))
+                topo_result, record = kernel.unify_same_domain(topo_result)
+                history.merge(ShapeHistory(record))
             except Exception:  # pylint: disable=broad-exception-caught
                 warnings.warn("Boolean operation unable to clean", stacklevel=2)
 
@@ -2998,7 +2950,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         self,
         args: Iterable[Shape],
         tools: Iterable[Shape],
-        operation: BRepAlgoAPI_BooleanOperation | BRepAlgoAPI_Splitter,
+        operation: BoolOp,
     ) -> ShapeList:
         """Generic boolean operation that always returns ShapeList.
 
@@ -3049,15 +3001,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty or not other:
             return (ShapeList(), ShapeList())
 
-        section = BRepAlgoAPI_Section(self.wrapped, other.wrapped)
-        section.SetRunParallel(True)
-        section.Approximation(True)
-        section.ComputePCurveOn1(True)
-        section.ComputePCurveOn2(True)
-        section.Build()
-
         # Get the resulting shapes from the intersection
-        intersection_shape: TopoDS_Shape = section.Shape()
+        intersection_shape, _ = kernel.section(self.wrapped, other.wrapped)
 
         vertices: list[Vertex] = []
         # Iterate through the intersection shape to find intersection points/edges
@@ -3227,10 +3172,10 @@ def find_same_topods(
     """
     candidates = list(candidates)
     for candidate in candidates:
-        if candidate.IsSame(query):
+        if kernel.is_same(candidate, query):
             return candidate
     for candidate in candidates:
-        if candidate.IsPartner(query):
+        if kernel.is_partner(candidate, query):
             return candidate
     return None
 
@@ -3243,7 +3188,7 @@ def relocation_between(source: TopoDS_Shape, target: TopoDS_Shape) -> TopLoc_Loc
     ``Moved`` with it brings anything found beside ``source`` into ``target``'s
     frame.
     """
-    return target.Location().Multiplied(source.Location().Inverted())
+    return kernel.relocation_between(source, target)
 
 
 def topo_distance_to(
@@ -4189,7 +4134,7 @@ def _sew_topods_faces(faces: Iterable[TopoDS_Face]) -> TopoDS_Shape:
 def _topods_bool_op(
     args: Iterable[TopoDS_Shape],
     tools: Iterable[TopoDS_Shape],
-    operation: BRepAlgoAPI_BooleanOperation | BRepAlgoAPI_Splitter,
+    operation: BoolOp,
 ) -> TopoDS_Shape:
     """Generic boolean operation for TopoDS_Shapes
 
@@ -4201,23 +4146,9 @@ def _topods_bool_op(
     Returns: TopoDS_Shape
 
     """
-    args = list(args)
-    tools = list(tools)
-    arg = List_TopoDS_Shape()
-    for obj in args:
-        arg.Append(obj)
-
-    tool = List_TopoDS_Shape()
-    for obj in tools:
-        tool.Append(obj)
-
-    operation.SetArguments(arg)
-    operation.SetTools(tool)
-
-    operation.SetRunParallel(True)
-    operation.Build()
-
-    result = downcast(operation.Shape())
+    result, _ = kernel.boolean(operation, list(args), list(tools))
+    if result.IsNull():
+        raise ValueError("Null TopoDS_Shape object")
     # Remove unnecessary TopoDS_Compound around single shape
     if kernel.is_kind(result, TopoKind.COMPOUND):
         result = unwrap_topods_compound(result, True)
