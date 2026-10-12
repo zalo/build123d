@@ -17,7 +17,7 @@ from build123d.kernel.base import (
     TopoKind,
     WireStatus,
 )
-from build123d.kernel.base import AncestorMap
+from build123d.kernel.base import AncestorMap, DraftFailure, SurfaceFilling
 from build123d.kernel.occt import OcctKernel
 
 kernel: Kernel = OcctKernel()
@@ -25,6 +25,8 @@ kernel: Kernel = OcctKernel()
 __all__ = [
     "AncestorMap",
     "BoolOp",
+    "DraftFailure",
+    "SurfaceFilling",
     "CurveView",
     "Handle",
     "JoinKind",

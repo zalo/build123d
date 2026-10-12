@@ -71,31 +71,16 @@ from typing import cast as tcast
 from typing import overload
 
 import numpy as np
-import OCP.GeomAbs as ga
+
 
 from anytree import NodeMixin, RenderTree
 from IPython.lib.pretty import RepresentationPrinter, pretty
 from OCP.Bnd import Bnd_OBB
-from OCP.BRep import BRep_TEdge, BRep_Tool
-from OCP.GCPnts import GCPnts_AbscissaPoint
-from OCP.GeomAdaptor import GeomAdaptor_Curve
-from OCP.BRepBuilderAPI import (
-    BRepBuilderAPI_RightCorner,
-    BRepBuilderAPI_RoundCorner,
-    BRepBuilderAPI_Transformed,
-)
+from OCP.BRep import BRep_Tool
 
 
-from OCP.BRepGProp import BRepGProp, BRepGProp_Face
-from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
-from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
-from OCP.BRepTools import BRepTools
-from OCP.gce import gce_MakeLin
-from OCP.GeomLib import GeomLib_IsPlanarSurface
-from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_TrsfForm, gp_Vec, gp_XYZ
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Dir, gp_Pnt, gp_Trsf, gp_TrsfForm
 from OCP.GProp import GProp_GProps
-from OCP.ShapeAnalysis import ShapeAnalysis_Curve, ShapeAnalysis_Shell
-from OCP.ShapeCustom import ShapeCustom, ShapeCustom_RestrictionParameters
 
 
 from OCP.TopLoc import TopLoc_Location
@@ -108,8 +93,6 @@ from OCP.TopoDS import (
     TopoDS_Wire,
 )
 
-
-from OCP.collections import List_TopoDS_Shape
 
 from typing_extensions import Self, deprecated
 
@@ -124,9 +107,9 @@ from build123d.build_enums import (
     Keep,
     Select,
     SortBy,
-    Transition,
     Unit,
 )
+
 from build123d.geometry import (
     DEG2RAD,
     TOLERANCE,
@@ -197,36 +180,6 @@ class Shape(NodeMixin, Generic[TOPODS]):
     shape_LUT: dict[TopoKind, str] = {kind: kind.label for kind in TopoKind}
 
     inverse_shape_LUT: dict[str, TopoKind] = {v: k for k, v in shape_LUT.items()}
-
-    geom_LUT_EDGE: dict[ga.GeomAbs_CurveType, GeomType] = {
-        ga.GeomAbs_Line: GeomType.LINE,
-        ga.GeomAbs_Circle: GeomType.CIRCLE,
-        ga.GeomAbs_Ellipse: GeomType.ELLIPSE,
-        ga.GeomAbs_Hyperbola: GeomType.HYPERBOLA,
-        ga.GeomAbs_Parabola: GeomType.PARABOLA,
-        ga.GeomAbs_BezierCurve: GeomType.BEZIER,
-        ga.GeomAbs_BSplineCurve: GeomType.BSPLINE,
-        ga.GeomAbs_OffsetCurve: GeomType.OFFSET,
-        ga.GeomAbs_OtherCurve: GeomType.OTHER,
-    }
-    geom_LUT_FACE: dict[ga.GeomAbs_SurfaceType, GeomType] = {
-        ga.GeomAbs_Plane: GeomType.PLANE,
-        ga.GeomAbs_Cylinder: GeomType.CYLINDER,
-        ga.GeomAbs_Cone: GeomType.CONE,
-        ga.GeomAbs_Sphere: GeomType.SPHERE,
-        ga.GeomAbs_Torus: GeomType.TORUS,
-        ga.GeomAbs_BezierSurface: GeomType.BEZIER,
-        ga.GeomAbs_BSplineSurface: GeomType.BSPLINE,
-        ga.GeomAbs_SurfaceOfRevolution: GeomType.REVOLUTION,
-        ga.GeomAbs_SurfaceOfExtrusion: GeomType.EXTRUSION,
-        ga.GeomAbs_OffsetSurface: GeomType.OFFSET,
-        ga.GeomAbs_OtherSurface: GeomType.OTHER,
-    }
-    _transModeDict = {
-        Transition.TRANSFORMED: BRepBuilderAPI_Transformed,
-        Transition.ROUND: BRepBuilderAPI_RoundCorner,
-        Transition.RIGHT: BRepBuilderAPI_RightCorner,
-    }
 
     _color: Color | None
     _material: FinishedMaterial | None
@@ -542,10 +495,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
             # In a closed shell each edge is used once in each direction; faces
             # joined with the same direction on both sides are not manifold.
-            orientation = ShapeAnalysis_Shell()
-            orientation.LoadShells(shape)
-            orientation.CheckOrientedShells(shape, True, True)
-            if orientation.HasBadEdges():
+            if kernel.has_inconsistent_orientation(shape):
                 return False
 
         return True
@@ -636,13 +586,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         if self.is_empty:
             return [[0.0, 0.0, 0.0] for _ in range(3)]
-        properties = GProp_GProps()
-        BRepGProp.VolumeProperties_s(self.wrapped, properties)
-        inertia_matrix = properties.MatrixOfInertia()
-        matrix = []
-        for i in range(3):
-            matrix.append([inertia_matrix.Value(i + 1, j + 1) for j in range(3)])
-        return matrix
+        return kernel.inertia_matrix(self.wrapped)
 
     @property
     def orientation(self) -> Vector:
@@ -691,14 +635,9 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         self._needs_geometry("principal axes")
 
-        properties = GProp_GProps()
-        BRepGProp.VolumeProperties_s(self.wrapped, properties)
-        principal_props = properties.PrincipalProperties()
-        principal_moments = principal_props.Moments()
         return [
-            (Vector(principal_props.FirstAxisOfInertia()), principal_moments[0]),
-            (Vector(principal_props.SecondAxisOfInertia()), principal_moments[1]),
-            (Vector(principal_props.ThirdAxisOfInertia()), principal_moments[2]),
+            (Vector(axis), moment)
+            for axis, moment in kernel.principal_inertia(self.wrapped)
         ]
 
     @property
@@ -736,9 +675,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty:
             return (0.0, 0.0, 0.0)
 
-        properties = GProp_GProps()
-        BRepGProp.VolumeProperties_s(self.wrapped, properties)
-        return properties.StaticMoments()
+        return kernel.static_moments(self.wrapped)
 
     # ---- Class Methods ----
 
@@ -1481,7 +1418,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         edge_list = Shape.get_shape_list(self, "Edge")
         return self._select(
             edge_list.filter_by(
-                lambda e: BRep_Tool.Degenerated_s(e.wrapped), reverse=True
+                lambda e: kernel.is_degenerate(e.wrapped), reverse=True
             ),
             select,
         )
@@ -1539,25 +1476,13 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty:
             return ShapeList()
 
-        line = gce_MakeLin(axis.wrapped).Value()
-
-        intersect_maker = BRepIntCurveSurface_Inter()
-        intersect_maker.Init(self.wrapped, line, tol)
-
         faces_dist = []  # using a list instead of a dictionary to be able to sort it
-        while intersect_maker.More():
-            inter_pt = intersect_maker.Pnt()
-
-            distance = axis.position.to_pnt().SquareDistance(inter_pt)
-
-            faces_dist.append(
-                (
-                    intersect_maker.Face(),
-                    abs(distance),
-                )
-            )  # will sort all intersected faces by distance whatever the direction is
-
-            intersect_maker.Next()
+        for face, inter_pt in kernel.line_intersections(
+            self.wrapped, tuple(axis.position), tuple(axis.direction), tol
+        ):
+            distance = (axis.position - Vector(inter_pt)).length ** 2
+            # will sort all intersected faces by distance whatever the direction is
+            faces_dist.append((face, abs(distance)))
 
         faces_dist.sort(key=lambda x: x[1])
         faces = [face[0] for face in faces_dist]
@@ -1976,9 +1901,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         self._needs_geometry("radius of gyration")
 
-        properties = GProp_GProps()
-        BRepGProp.VolumeProperties_s(self.wrapped, properties)
-        return properties.RadiusOfGyration(axis.wrapped)
+        return kernel.radius_of_gyration(self.wrapped, axis.wrapped)
 
     def rotate(self, axis: Axis, angle: float, transform: bool = False) -> Self:
         """rotate a copy
@@ -2003,7 +1926,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if transform:
             rotated_self = self._apply_transform(transformation)
         else:
-            rotated_self = self.moved(Location(TopLoc_Location(transformation)))
+            rotated_self = self.moved(Location(transformation))
         return rotated_self
 
     def scale(
@@ -2232,11 +2155,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
             ref_point = surface_point + normalized_surface_normal
 
             # Create a HalfSpace - Solidish object to determine top/bottom
-            # Note: BRepPrimAPI_MakeHalfSpace takes either a TopoDS_Shell or TopoDS_Face but the
-            # mypy expects only a TopoDS_Shell here
-            half_space_maker = BRepPrimAPI_MakeHalfSpace(trim_tool, ref_point.to_pnt())
-            # type: ignore
-            tool_solid = half_space_maker.Solid()
+            tool_solid = kernel.half_space(trim_tool, tuple(ref_point))
 
         tops: list[Shape] = []
         bottoms: list[Shape] = []
@@ -2422,18 +2341,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
                 u_max, v_max = uv_max
                 arc_w, arc_h = float(uv_range[0]), float(uv_range[1])
                 try:
-                    surface = BRep_Tool.Surface_s(face.wrapped)
-                    u_center = (u_min + u_max) * 0.5
-                    v_center = (v_min + v_max) * 0.5
-                    viso = surface.VIso(v_center)
-                    uiso = surface.UIso(u_center)
-                    u_adaptor = GeomAdaptor_Curve(viso)
-                    v_adaptor = GeomAdaptor_Curve(uiso)
-                    arc_w = GCPnts_AbscissaPoint.Length_s(
-                        u_adaptor, u_min, u_max, TOLERANCE
-                    )
-                    arc_h = GCPnts_AbscissaPoint.Length_s(
-                        v_adaptor, v_min, v_max, TOLERANCE
+                    arc_w, arc_h = kernel.surface_of(face.wrapped).iso_lengths(
+                        u_min, u_max, v_min, v_max, TOLERANCE
                     )
                 except kernel.failure_types:
                     # Degenerate/unsupported surface parameterization — fall back
@@ -2540,22 +2449,9 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if self.is_empty:
             raise ValueError("Cannot approximate an empty shape")
 
-        params = ShapeCustom_RestrictionParameters()
-
-        result = ShapeCustom.BSplineRestriction_s(
-            self.wrapped,
-            tolerance,  # 3D tolerance
-            tolerance,  # 2D tolerance
-            degree,
-            1,  # dummy value, degree is leading
-            ga.GeomAbs_C0,
-            ga.GeomAbs_C0,
-            True,  # set degree to be leading
-            not nurbs,
-            params,
+        return self.__class__.cast(
+            kernel.to_splines(self.wrapped, degree, tolerance, nurbs)
         )
-
-        return self.__class__.cast(result)
 
     def transform_geometry(self, t_matrix: Matrix) -> Self:
         """Apply affine transform
@@ -2662,7 +2558,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if transform:
             self_translated = self._apply_transform(transformation)
         else:
-            self_translated = self.moved(Location(TopLoc_Location(transformation)))
+            self_translated = self.moved(Location(transformation))
         return self_translated
 
     def wire(self) -> Wire:
@@ -2725,50 +2621,44 @@ class Shape(NodeMixin, Generic[TOPODS]):
         # The base of the operation
         base = args[0] if isinstance(args, (list, tuple)) else args
 
-        arg = List_TopoDS_Shape()
-        for obj in args:
-            if not obj.is_empty:
-                arg.Append(obj._wrapped)
-
-        tool = List_TopoDS_Shape()
-        for obj in tools:
-            if not obj.is_empty:
-                tool.Append(obj._wrapped)
+        # The arguments were there before and the tools are brought in
+        before = [o._wrapped for o in args if not o.is_empty]
+        brought = [o._wrapped for o in tools if not o.is_empty]
 
         # Handle operations with "zero" shapes
         topo_result = None
         if operation is BoolOp.CUT:
-            if arg.IsEmpty():  # nothing less anything is still nothing
+            if not before:  # nothing less anything is still nothing
                 return Shape._zero_of(
                     self, *Shape._operands(args), *Shape._operands(tools)
                 )
-            if tool.IsEmpty():
-                if arg.Extent() == 1:
-                    topo_result = arg.First()
-                else:
-                    topo_result = _make_topods_compound_from_shapes(arg)
+            if not brought:
+                topo_result = (
+                    before[0]
+                    if len(before) == 1
+                    else _make_topods_compound_from_shapes(before)
+                )
         elif operation is BoolOp.FUSE:
-            if tool.IsEmpty():
-                if arg.Extent() == 1:
-                    topo_result = arg.First()
-                else:
-                    topo_result = _make_topods_compound_from_shapes(arg)
-            elif arg.IsEmpty():
-                if tool.Extent() == 1:
-                    topo_result = tool.First()
-                else:
-                    topo_result = _make_topods_compound_from_shapes(tool)
+            if not brought:
+                topo_result = (
+                    before[0]
+                    if len(before) == 1
+                    else _make_topods_compound_from_shapes(before)
+                )
+            elif not before:
+                topo_result = (
+                    brought[0]
+                    if len(brought) == 1
+                    else _make_topods_compound_from_shapes(brought)
+                )
         elif operation is BoolOp.COMMON:
-            if tool.IsEmpty() or arg.IsEmpty():
+            if not brought or not before:
                 return Shape._zero_of(
                     self, *Shape._operands(args), *Shape._operands(tools)
                 )
 
-        # The arguments were there before and the tools are brought in. An
-        # empty record means every input sub-shape came through untouched,
+        # An empty record means every input sub-shape came through untouched,
         # which is what the shortcuts above produce
-        before = [o._wrapped for o in args if not o.is_empty]
-        brought = [o._wrapped for o in tools if not o.is_empty]
         history = ShapeHistory(before=before, brought=brought)
         if topo_result is None:
             topo_result, record = kernel.boolean(
@@ -3418,39 +3308,31 @@ class ShapeList(list[T]):
         """
 
         # could be moved out maybe?
+        def planar_face_normal(shape: Shape) -> Vector | None:
+            """The unit normal at the corner of a face lying in a plane, else None."""
+            if not kernel.is_kind(shape.wrapped, TopoKind.FACE):
+                return None
+            surface = kernel.surface_of(shape.wrapped)
+            if surface.plane() is None:
+                return None
+            u_val, _, v_val, _ = surface.uv_bounds()
+            return Vector(surface.normal(u_val, v_val)[1]).normalized()
+
         def axis_parallel_predicate(axis: Axis, tolerance: float):
             def pred(shape: Shape):
+                normal = planar_face_normal(shape)
+                if normal is not None:
+                    shape_axis = Axis(shape.center(), normal)
+                    return axis.is_parallel(shape_axis, tolerance)
                 if (
-                    kernel.is_kind(shape.wrapped, TopoKind.FACE)
-                    and GeomLib_IsPlanarSurface(
-                        BRep_Tool.Surface_s(shape.wrapped), TOLERANCE
-                    ).IsPlanar()
-                ):
-                    gp_pnt = gp_Pnt()
-                    surface_normal = gp_Vec()
-                    u_val, _, v_val, _ = BRepTools.UVBounds_s(shape.wrapped)
-                    BRepGProp_Face(shape.wrapped).Normal(
-                        u_val, v_val, gp_pnt, surface_normal
-                    )
-                    normalized_surface_normal = Vector(
-                        surface_normal.X(), surface_normal.Y(), surface_normal.Z()
-                    ).normalized()
-                    shape_axis = Axis(shape.center(), normalized_surface_normal)
-                elif (
                     kernel.is_kind(shape.wrapped, TopoKind.EDGE)
                     and shape.geom_type == GeomType.LINE
                 ):
-                    curve = shape.geom_adaptor()
-                    umin = curve.FirstParameter()
-                    tmp = gp_Pnt()
-                    res = gp_Vec()
-                    curve.D1(umin, tmp, res)
-                    start_pos = Vector(tmp)
-                    start_dir = Vector(gp_Dir(res))
-                    shape_axis = Axis(start_pos, start_dir)
-                else:
-                    return False
-                return axis.is_parallel(shape_axis, tolerance)
+                    curve = kernel.curve_of(shape.wrapped)
+                    start_pos, start_dir = curve.d1(curve.first)
+                    shape_axis = Axis(Vector(start_pos), Vector(start_dir).normalized())
+                    return axis.is_parallel(shape_axis, tolerance)
+                return False
 
             return pred
 
@@ -3458,40 +3340,21 @@ class ShapeList(list[T]):
             plane_axis = Axis(plane.origin, plane.z_dir)
 
             def pred(shape: Shape):
-
-                if (
-                    kernel.is_kind(shape.wrapped, TopoKind.FACE)
-                    and GeomLib_IsPlanarSurface(
-                        BRep_Tool.Surface_s(shape.wrapped), TOLERANCE
-                    ).IsPlanar()
-                ):
-                    gp_pnt: gp_Pnt = gp_Pnt()
-                    surface_normal: gp_Vec = gp_Vec()
-                    u_val, _, v_val, _ = BRepTools.UVBounds_s(shape.wrapped)
-                    BRepGProp_Face(shape.wrapped).Normal(
-                        u_val, v_val, gp_pnt, surface_normal
-                    )
-                    normalized_surface_normal = Vector(surface_normal).normalized()
-                    shape_axis = Axis(shape.center(), normalized_surface_normal)
+                normal = planar_face_normal(shape)
+                if normal is not None:
+                    shape_axis = Axis(shape.center(), normal)
                     return plane_axis.is_parallel(shape_axis, tolerance)
                 if kernel.is_kind(shape.wrapped, TopoKind.WIRE):
                     return all(pred(e) for e in shape.edges())
                 if kernel.is_kind(shape.wrapped, TopoKind.EDGE):
                     if shape.location is None:
                         return False
-                    plane_xyz = tcast(
-                        gp_XYZ,
-                        (
-                            tcast(Plane, Location(shape.location).inverse() * plane)
-                        ).z_dir.wrapped.XYZ(),
+                    local_normal = (
+                        tcast(Plane, Location(shape.location).inverse() * plane)
+                    ).z_dir
+                    return kernel.edge_in_plane(
+                        shape.wrapped, tuple(local_normal), tolerance
                     )
-                    t_edge = tcast(BRep_TEdge, shape.wrapped.TShape())
-                    for curve in t_edge.Curves():
-                        if curve.IsCurve3D():
-                            return ShapeAnalysis_Curve.IsPlanar_s(
-                                curve.Curve3D(), plane_xyz, tolerance
-                            )
-                    return False
                 return False
 
             return pred
@@ -3999,12 +3862,10 @@ def _topods_entities(shape: TopoDS_Shape, topo_type: Shapes) -> list[TopoDS_Shap
     return kernel.sub_shapes(shape, TopoKind.from_label(topo_type))
 
 
-def _topods_face_normal_at(face: TopoDS_Face, surface_point: gp_Pnt) -> Vector:
+def _topods_face_normal_at(face: TopoDS_Face, surface_point: VectorLike) -> Vector:
     """Find the normal at a point on surface"""
     surface = kernel.surface_of(face)
-    u_val, v_val = surface.closest_uv(
-        (surface_point.X(), surface_point.Y(), surface_point.Z())
-    )
+    u_val, v_val = surface.closest_uv(tuple(Vector(surface_point)))
     return Vector(surface.normal(u_val, v_val)[1]).normalized()
 
 

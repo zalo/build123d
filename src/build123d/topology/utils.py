@@ -58,16 +58,6 @@ from typing import cast as tcast
 
 from collections.abc import Iterable
 
-from OCP.BRep import BRep_Tool
-from OCP.BRepAdaptor import BRepAdaptor_Curve
-
-
-from OCP.BRepGProp import BRepGProp, BRepGProp_Face
-from OCP.BRepTools import BRepTools
-
-from OCP.GProp import GProp_GProps
-from OCP.gp import gp_Pnt, gp_Vec
-
 
 from OCP.TopoDS import (
     TopoDS,
@@ -100,29 +90,25 @@ if TYPE_CHECKING:  # pragma: no cover
 def _topods_face_position(face: TopoDS_Face, u: float, v: float) -> Vector:
     """The point of a face at normalized (u, v), each from 0 to 1 across the
     face's own parameter range."""
-    u_min, u_max, v_min, v_max = BRepTools.UVBounds_s(face)
-    surface = BRep_Tool.Surface_s(face)
+    surface = kernel.surface_of(face)
+    u_min, u_max, v_min, v_max = surface.uv_bounds()
     return Vector(
-        surface.Value(u_min + u * (u_max - u_min), v_min + v * (v_max - v_min))
+        surface.value(u_min + u * (u_max - u_min), v_min + v * (v_max - v_min))
     )
 
 
 def _topods_face_normal(face: TopoDS_Face, u: float = 0.5, v: float = 0.5) -> Vector:
     """The unit normal of a face at normalized (u, v), with the face's own
     orientation: reversed faces point the other way from their surface."""
-    u_min, u_max, v_min, v_max = BRepTools.UVBounds_s(face)
-    point, normal = gp_Pnt(), gp_Vec()
-    BRepGProp_Face(face).Normal(
-        u_min + u * (u_max - u_min), v_min + v * (v_max - v_min), point, normal
-    )
+    surface = kernel.surface_of(face)
+    u_min, u_max, v_min, v_max = surface.uv_bounds()
+    _, normal = surface.normal(u_min + u * (u_max - u_min), v_min + v * (v_max - v_min))
     return Vector(normal).normalized()
 
 
 def _topods_face_center(face: TopoDS_Face) -> Vector:
     """The centre of mass of a face's area."""
-    properties = GProp_GProps()
-    BRepGProp.SurfaceProperties_s(face, properties)
-    return Vector(properties.CentreOfMass())
+    return Vector(kernel.center_of_mass(face, TopoKind.FACE))
 
 
 def _topods_point_on_face(
@@ -172,12 +158,12 @@ def _topods_material_side(face: TopoDS_Face, edge: TopoDS_Edge) -> Vector:
             occurrence = TopoDS.Edge(use)
     if occurrence is None:
         raise ValueError("the edge is not an edge of the face")
-    curve = BRepAdaptor_Curve(occurrence)
-    point, tangent = gp_Pnt(), gp_Vec()
-    curve.D1((curve.FirstParameter() + curve.LastParameter()) / 2, point, tangent)
+    curve = kernel.curve_of(occurrence)
+    point, tangent_xyz = curve.d1((curve.first + curve.last) / 2)
+    tangent = Vector(tangent_xyz)
     if kernel.is_reversed(occurrence):
-        tangent.Reverse()
-    return _topods_face_normal_at(face, point).cross(Vector(tangent).normalized())
+        tangent = -tangent
+    return _topods_face_normal_at(face, point).cross(tangent.normalized())
 
 
 def _extrude_topods_shape(obj: TopoDS_Shape, direction: VectorLike) -> TopoDS_Shape:

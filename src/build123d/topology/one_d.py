@@ -64,8 +64,8 @@ from typing import overload
 
 import numpy as np
 import OCP.TopAbs as ta
-from OCP.BOPAlgo import BOPAlgo_Splitter
-from OCP.BRep import BRep_Tool
+
+
 from OCP.BRepAdaptor import BRepAdaptor_CompCurve, BRepAdaptor_Curve
 
 
@@ -84,7 +84,6 @@ from OCP.HLRAlgo import HLRAlgo_Projector
 from OCP.HLRBRep import HLRBRep_Algo, HLRBRep_HLRToShape
 
 
-from OCP.TopLoc import TopLoc_Location
 from OCP.TopoDS import (
     TopoDS,
     TopoDS_Compound,
@@ -220,12 +219,9 @@ def _topods_edge_contains_vertex(
 def _split_edge_at_vertex(edge: Edge, split_vertex: Vertex) -> list[TopoDS_Edge]:
     """Split an edge at a vertex and return the resulting edge segments."""
 
-    splitter = BOPAlgo_Splitter()
-    splitter.AddArgument(edge.wrapped)
-    splitter.AddTool(split_vertex.wrapped)
-    splitter.Perform()
-
-    split_shape = splitter.Shape()
+    split_shape, _ = kernel.boolean(
+        BoolOp.SPLIT, [edge.wrapped], [split_vertex.wrapped]
+    )
     split_edges = [
         TopoDS.Edge(edge) for edge in kernel.sub_shapes(split_shape, TopoKind.EDGE)
     ]
@@ -1076,7 +1072,7 @@ class Mixin1D(Shape[TOPODS]):
             transformation.SetTransformation(
                 gp_Ax3(pnt, gp_Dir(tangent.XYZ()), gp_Dir(normal.XYZ())), gp_Ax3()
             )
-        loc = Location(TopLoc_Location(transformation))
+        loc = Location(transformation)
 
         if self.is_forward:
             return loc
@@ -3078,7 +3074,7 @@ class Edge(Mixin1D[TopoDS_Edge]):
 
         pnt = Vector(point)
         # Extract the edge's end parameters
-        param_min, _ = BRep_Tool.Range_s(self.wrapped)
+        param_min, _ = kernel.edge_range(self.wrapped)
 
         # Method 1: the point is a Vertex
 
@@ -3089,7 +3085,7 @@ class Edge(Mixin1D[TopoDS_Edge]):
         if (
             Vector(nearest_vertex) - pnt
         ).length <= TOLERANCE and not nearest_vertex.is_empty:
-            param = BRep_Tool.Parameter_s(nearest_vertex.wrapped, self.wrapped)
+            param = kernel.vertex_param_on_edge(nearest_vertex.wrapped, self.wrapped)
             curve = kernel.curve_of(self.wrapped)
             u_value = curve.length(param_min, param) / curve.length()
             # The length is measured along the curve while position_at measures

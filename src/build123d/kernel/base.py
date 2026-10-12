@@ -120,6 +120,41 @@ class WireStatus(Enum):
 Point = tuple[float, float, float]
 
 
+class DraftFailure(Exception):
+    """A draft angle could not be added to a face or the draft could not be built."""
+
+    def __init__(self, stage: str, index: int | None, problematic: Handle | None):
+        super().__init__(stage)
+        self.stage = stage
+        """``"add"`` when a face refused the angle, ``"build"`` otherwise."""
+        self.index = index
+        """The position in the specs of the face that failed, for ``"add"``."""
+        self.problematic = problematic
+        """The sub-shape the backend blames, when it names one."""
+
+
+class SurfaceFilling(ABC):
+    """A surface being fitted through edge, edge-on-face and point constraints.
+
+    Constraints are added one at a time and :meth:`build` may be called more
+    than once as they accumulate.
+    """
+
+    @abstractmethod
+    def add_edge(
+        self, edge: Handle, continuity: str, face: Handle | None = None
+    ) -> None:
+        """Constrain the surface to pass through ``edge`` with ``continuity``
+        ("C0", "G1" or "G2") to ``face`` when one is given."""
+
+    @abstractmethod
+    def add_point(self, point: Point) -> None: ...
+
+    @abstractmethod
+    def build(self) -> Handle:
+        """The face fitted so far; raises the backend's failure types."""
+
+
 class AncestorMap:
     """Sub-shapes of one kind inside a parent and, for each, the sub-shapes
     of a higher kind that contain it (an edge's faces, a vertex's edges).
@@ -298,6 +333,24 @@ class SurfaceView(ABC):
     def torus_radii(self) -> tuple[float, float]:
         """Major and minor radii of a TORUS surface."""
 
+    @abstractmethod
+    def curvatures(
+        self, u: float, v: float, tolerance: float
+    ) -> tuple[float, float, Point] | None:
+        """Minimum and maximum principal curvature and the surface's own
+        normal direction at ``(u, v)``; None where curvature is undefined."""
+
+    @abstractmethod
+    def uv_of_point(self, point: Point, tolerance: float) -> tuple[float, float, float]:
+        """Parameters of ``point`` on the surface and how far it is from it."""
+
+    @abstractmethod
+    def iso_lengths(
+        self, u_min: float, u_max: float, v_min: float, v_max: float, tolerance: float
+    ) -> tuple[float, float]:
+        """Lengths of the middle v-isoparametric curve over ``[u_min, u_max]``
+        and of the middle u-isoparametric curve over ``[v_min, v_max]``."""
+
 
 class KernelGeometry(ABC):
     """Curve/surface views, construction and tessellation: the second half of
@@ -389,6 +442,7 @@ class KernelGeometry(ABC):
         binormal: Point | None = None,
         binormal_origin: Point | None = None,
         auxiliary_spine: Handle | None = None,
+        curvilinear_equivalence: bool = True,
     ) -> Handle:
         """Sweep a wire profile along a wire path."""
 
@@ -690,6 +744,132 @@ class KernelGeometry(ABC):
         (``gp_Pln``) when the wire does not fix one; None when it fails."""
 
     @abstractmethod
+    def offset_shape(
+        self,
+        shape: Handle,
+        amount: float,
+        tolerance: float,
+        *,
+        join: JoinKind = JoinKind.ARC,
+        intersection: bool = False,
+        thicken: bool = False,
+        remove_internal_edges: bool = False,
+    ) -> Handle:
+        """The surface offset of a face or shell by ``amount``, or with
+        ``thicken`` the solid between it and its offset; a null handle when
+        the backend produces nothing."""
+
+    @abstractmethod
+    def make_bezier_surface(
+        self,
+        points: Sequence[Sequence[Point]],
+        weights: Sequence[Sequence[float]] | None = None,
+    ) -> Handle:
+        """A face on the Bezier surface with the grid of ``points`` as poles."""
+
+    @abstractmethod
+    def make_spline_surface_fit(
+        self,
+        points: Sequence[Sequence[Point]],
+        tolerance: float,
+        min_degree: int,
+        max_degree: int,
+        smoothing: tuple[float, float, float] | None = None,
+    ) -> Handle:
+        """A face on a B-spline surface approximating the grid of ``points``;
+        raises ValueError when it cannot be built."""
+
+    @abstractmethod
+    def filling(self, **options: Any) -> SurfaceFilling:
+        """A new surface filling; ``options`` are the backend's own settings."""
+
+    @abstractmethod
+    def sweep_multi(
+        self,
+        profiles: Sequence[Handle],
+        path: Handle,
+        *,
+        is_frenet: bool,
+        make_solid: bool,
+        binormal: Point | None = None,
+        binormal_origin: Point | None = None,
+        auxiliary_spine: Handle | None = None,
+    ) -> Handle:
+        """Sweep several wire profiles along a wire path, one surface between
+        each pair of consecutive profiles."""
+
+    @abstractmethod
+    def draft_prism(
+        self,
+        shape: Handle,
+        face: Handle,
+        basis: Handle | None,
+        taper: float,
+        additive: bool,
+        *,
+        up_to_face: Handle | None = None,
+        depth: float | None = None,
+    ) -> Handle:
+        """Add to or cut from ``shape`` a prism grown from ``face`` with the
+        taper angle ``taper`` (radians), up to a face, to a depth, or through all."""
+
+    @abstractmethod
+    def extrude_generated(
+        self, shape: Handle, direction: Point
+    ) -> tuple[Handle, AncestorMap, Any]:
+        """:meth:`extrude` with, for each edge of ``shape``, the faces the
+        extrusion generated from it; plus the history record."""
+
+    @abstractmethod
+    def draft(
+        self,
+        shape: Handle,
+        specs: Sequence[tuple[Handle, float]],
+        direction: Point,
+        plane: Handle,
+    ) -> tuple[Handle, Any]:
+        """``shape`` with each ``(face, angle)`` face tilted by ``angle``
+        radians about its intersection with ``plane`` (``gp_Pln``), pulled
+        along ``direction``; plus the history record. Raises
+        :class:`DraftFailure`."""
+
+    @abstractmethod
+    def split_by_edges(
+        self, shape: Handle, edges: Sequence[Handle]
+    ) -> tuple[list[Handle], list[Handle]]:
+        """Split a face or shell along ``edges`` lying on it; the pieces to the
+        left and to the right of them."""
+
+    @abstractmethod
+    def line_intersections(
+        self, shape: Handle, origin: Point, direction: Point, tolerance: float
+    ) -> list[tuple[Handle, Point]]:
+        """Each face of ``shape`` the unbounded line crosses and where."""
+
+    @abstractmethod
+    def solid_from_shell(self, shell: Handle) -> Handle:
+        """The solid a closed shell bounds, oriented so its volume is positive."""
+
+    @abstractmethod
+    def remove_wires(self, face: Handle, wires: Sequence[Handle]) -> Handle:
+        """``face`` with ``wires`` (holes) taken out of its boundary."""
+
+    @abstractmethod
+    def is_seam(self, edge: Handle, face: Handle) -> bool:
+        """Whether an edge is used twice by a face, as the seam of a cylinder is."""
+
+    @abstractmethod
+    def to_splines(
+        self, shape: Handle, degree: int, tolerance: float, nurbs: bool
+    ) -> Handle:
+        """``shape`` with its geometry approximated by B-splines of ``degree``."""
+
+    @abstractmethod
+    def edge_in_plane(self, edge: Handle, normal: Point, tolerance: float) -> bool:
+        """Whether an edge's own 3D curve (its placement left aside) lies in
+        a plane with ``normal``."""
+
+    @abstractmethod
     def offset_face(self, face: Handle, amount: float, tolerance: float) -> Handle:
         """The surface offset of ``face`` by ``amount``."""
 
@@ -730,8 +910,25 @@ class KernelGeometry(ABC):
         """``face`` with ``wires`` cut out of it as holes on its own surface."""
 
     @abstractmethod
-    def face_of_plane(self, plane: Handle) -> Handle:
-        """The unbounded face of a plane (``gp_Pln`` for the OCCT backend)."""
+    def face_of_plane(
+        self, plane: Handle, bounds: tuple[float, float, float, float] | None = None
+    ) -> Handle:
+        """The face of a plane (``gp_Pln`` for the OCCT backend), unbounded or
+        trimmed to ``(u_min, u_max, v_min, v_max)`` in the plane's own axes."""
+
+    @abstractmethod
+    def surface_axis(self, face: Handle) -> tuple[str, Point, Point] | None:
+        """The build123d ``GeomType`` name of the face's basis surface (any
+        trimming or offsetting stripped) with the origin and direction of
+        its axis of rotation; None for a surface that has none."""
+
+    @abstractmethod
+    def half_space(self, shape: Handle, point: Point) -> Handle:
+        """The half-space solid bounded by a face or shell that contains ``point``."""
+
+    @abstractmethod
+    def ruled_surface(self, a: Handle, b: Handle) -> Handle:
+        """A face ruled between two edges, or a shell between two wires."""
 
     @abstractmethod
     def make_shell(self, faces: Sequence[Handle]) -> Handle:
@@ -959,6 +1156,27 @@ class Kernel(KernelGeometry):
     ) -> tuple[float, float, float]:
         """Centre of mass of ``shape`` measured as a ``kind``: edges by length,
         faces by area, solids by volume."""
+
+    @abstractmethod
+    def inertia_matrix(self, shape: Handle) -> list[list[float]]:
+        """The 3x3 matrix of inertia of the solids in ``shape`` about their centre of mass."""
+
+    @abstractmethod
+    def principal_inertia(self, shape: Handle) -> list[tuple[Point, float]]:
+        """The three principal axes of inertia of ``shape`` with their moments."""
+
+    @abstractmethod
+    def static_moments(self, shape: Handle) -> tuple[float, float, float]:
+        """The first moments of the solids in ``shape`` about the coordinate planes."""
+
+    @abstractmethod
+    def radius_of_gyration(self, shape: Handle, axis: Handle) -> float:
+        """The radius of gyration of the solids in ``shape`` about ``axis`` (``gp_Ax1``)."""
+
+    @abstractmethod
+    def has_inconsistent_orientation(self, shape: Handle) -> bool:
+        """Whether the shells of ``shape`` have an edge used in the same
+        direction by both of its faces."""
 
     @abstractmethod
     def bounding_box(

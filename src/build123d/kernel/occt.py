@@ -36,6 +36,7 @@ from __future__ import annotations
 from collections.abc import Callable, Hashable, Sequence
 from math import cos, pi, sqrt
 from typing import Any
+from typing import cast as tcast
 
 import OCP.TopAbs as ta
 from OCP.Bnd import Bnd_Box
@@ -98,7 +99,38 @@ from OCP.GeomFill import (
 )
 from OCP.ShapeAnalysis import ShapeAnalysis_FreeBounds
 from OCP.ShapeFix import ShapeFix_Wireframe
-from OCP.collections import HSequence_TopoDS_Shape
+from OCP.collections import (
+    HSequence_TopoDS_Shape,
+    HArray2_double,
+    HArray2_gp_Pnt,
+    Sequence_TopoDS_Shape,
+)
+from OCP.BRep import BRep_TEdge
+from OCP.BRepFeat import BRepFeat_MakeDPrism, BRepFeat_SplitShape
+from OCP.BRepIntCurveSurface import BRepIntCurveSurface_Inter
+from OCP.BRepLProp import BRepLProp_SLProps
+from OCP.BRepOffset import BRepOffset_Skin
+from OCP.BRepOffsetAPI import BRepOffsetAPI_DraftAngle, BRepOffsetAPI_MakeFilling
+from OCP.BRepTools import BRepTools_ReShape
+from OCP.BRepFill import BRepFill
+from OCP.BRepPrimAPI import BRepPrimAPI_MakeHalfSpace
+from OCP.Geom import (
+    Geom_BezierSurface,
+    Geom_OffsetSurface,
+    Geom_RectangularTrimmedSurface,
+)
+from OCP.GeomAdaptor import GeomAdaptor_Surface
+from OCP.GeomAPI import GeomAPI_PointsToBSplineSurface
+from OCP.Precision import Precision
+from OCP.ShapeAnalysis import (
+    ShapeAnalysis_Curve,
+    ShapeAnalysis_Edge,
+    ShapeAnalysis_Shell,
+    ShapeAnalysis_Surface,
+)
+from OCP.ShapeCustom import ShapeCustom, ShapeCustom_RestrictionParameters
+from OCP.ShapeFix import ShapeFix_Solid
+from OCP.gp import gp_Lin, gp_XYZ
 from OCP.IntTools import IntTools_FClass2d
 from OCP.ShapeFix import ShapeFix_Face
 from OCP.Standard import (
@@ -112,6 +144,7 @@ from OCP.TopExp import TopExp
 from OCP.TopoDS import (
     TopoDS_Builder,
     TopoDS_Compound,
+    TopoDS_Face,
     TopoDS_Iterator,
     TopoDS_Shell,
 )
@@ -196,15 +229,17 @@ import OCP.GeomAbs as ga
 from OCP.GeomAbs import GeomAbs_C2, GeomAbs_C3, GeomAbs_CN, GeomAbs_JoinType
 from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve, GeomAPI_ProjectPointOnSurf
 from OCP.GeomLib import GeomLib_IsPlanarSurface
-from OCP.gp import gp_Ax2, gp_Ax3, gp_Dir, gp_Pln, gp_Pnt, gp_Vec
+from OCP.gp import gp_Ax1, gp_Ax2, gp_Ax3, gp_Dir, gp_Pln, gp_Pnt, gp_Vec
 
 from build123d.kernel.base import (
     AncestorMap,
     BoolOp,
     CurveView,
+    DraftFailure,
     JoinKind,
     Kernel,
     Point,
+    SurfaceFilling,
     SurfaceView,
     SweepTransition,
     TopoKind,
@@ -271,6 +306,13 @@ _SURFACE_TYPE_LABELS = {
     ga.GeomAbs_SurfaceOfExtrusion: "EXTRUSION",
     ga.GeomAbs_OffsetSurface: "OFFSET",
     ga.GeomAbs_OtherSurface: "OTHER",
+}
+_CONTINUITY_FROM_LABEL = {
+    "C0": ga.GeomAbs_C0,
+    "G1": ga.GeomAbs_G1,
+    "C1": ga.GeomAbs_C1,
+    "G2": ga.GeomAbs_G2,
+    "C2": ga.GeomAbs_C2,
 }
 _CONTINUITY_LABELS = {
     ga.GeomAbs_C0: "C0",
@@ -523,6 +565,56 @@ class OcctSurfaceView(SurfaceView):
         torus = self.adaptor.Torus()
         return torus.MajorRadius(), torus.MinorRadius()
 
+    def curvatures(
+        self, u: float, v: float, tolerance: float
+    ) -> tuple[float, float, Point] | None:
+        props = BRepLProp_SLProps(self.adaptor, u, v, 2, tolerance)
+        if not props.IsCurvatureDefined():
+            return None
+        return props.MinCurvature(), props.MaxCurvature(), _pt(props.Normal())
+
+    def uv_of_point(self, point: Point, tolerance: float) -> tuple[float, float, float]:
+        location = TopLoc_Location()
+        surface = BRep_Tool.Surface_s(self._face, location)
+        local = gp_Pnt(*point).Transformed(location.Transformation().Inverted())
+        analysis = ShapeAnalysis_Surface(surface)
+        uv = analysis.ValueOfUV(local, tolerance)
+        return uv.X(), uv.Y(), analysis.Gap()
+
+    def iso_lengths(
+        self, u_min: float, u_max: float, v_min: float, v_max: float, tolerance: float
+    ) -> tuple[float, float]:
+        surface = BRep_Tool.Surface_s(self._face)
+        v_iso = GeomAdaptor_Curve(surface.VIso((v_min + v_max) * 0.5))
+        u_iso = GeomAdaptor_Curve(surface.UIso((u_min + u_max) * 0.5))
+        return (
+            GCPnts_AbscissaPoint.Length_s(v_iso, u_min, u_max, tolerance),
+            GCPnts_AbscissaPoint.Length_s(u_iso, v_min, v_max, tolerance),
+        )
+
+
+class OcctSurfaceFilling(SurfaceFilling):
+    """``SurfaceFilling`` over ``BRepOffsetAPI_MakeFilling``."""
+
+    def __init__(self, **options: Any):
+        self.wrapped = BRepOffsetAPI_MakeFilling(**options)
+
+    def add_edge(
+        self, edge: TopoDS_Shape, continuity: str, face: TopoDS_Shape | None = None
+    ) -> None:
+        order = _CONTINUITY_FROM_LABEL[continuity]
+        if face is None:
+            self.wrapped.Add(TopoDS.Edge(edge), order)
+        else:
+            self.wrapped.Add(TopoDS.Edge(edge), TopoDS.Face(face), order)
+
+    def add_point(self, point: Point) -> None:
+        self.wrapped.Add(gp_Pnt(*point))
+
+    def build(self) -> TopoDS_Shape:
+        self.wrapped.Build()
+        return self.wrapped.Shape()
+
 
 class _OcctGeometry:
     """The KernelGeometry half of OcctKernel; OcctKernel inherits it."""
@@ -530,6 +622,7 @@ class _OcctGeometry:
     # provided by OcctKernel
     downcast: Callable[[TopoDS_Shape], TopoDS_Shape]
     ancestors: Callable[[TopoDS_Shape, TopoKind, TopoKind], AncestorMap]
+    sub_shapes: Callable[[TopoDS_Shape, TopoKind], list[TopoDS_Shape]]
 
     # ---- views --------------------------------------------------------------
 
@@ -633,21 +726,63 @@ class _OcctGeometry:
         binormal: Point | None = None,
         binormal_origin: Point | None = None,
         auxiliary_spine: TopoDS_Shape | None = None,
+        curvilinear_equivalence: bool = True,
     ) -> TopoDS_Shape:
         builder = BRepOffsetAPI_MakePipeShell(TopoDS.Wire(path))
-        rotate = False
+        rotate = self._set_sweep_mode(
+            builder,
+            is_frenet,
+            binormal,
+            binormal_origin,
+            auxiliary_spine,
+            curvilinear_equivalence,
+        )
+        builder.SetTransitionMode(_TRANSITION[transition])
+        builder.Add(profile, False, rotate)
+        builder.Build()
+        if make_solid:
+            builder.MakeSolid()
+        return builder.Shape()
+
+    @staticmethod
+    def _set_sweep_mode(
+        builder: BRepOffsetAPI_MakePipeShell,
+        is_frenet: bool,
+        binormal: Point | None,
+        binormal_origin: Point | None,
+        auxiliary_spine: TopoDS_Shape | None,
+        curvilinear_equivalence: bool = True,
+    ) -> bool:
+        """Set how the profile turns along the path; True when it must rotate."""
         if binormal is not None:
             frame = gp_Ax2()
             frame.SetLocation(gp_Pnt(*(binormal_origin or (0.0, 0.0, 0.0))))
             frame.SetDirection(gp_Dir(*binormal))
             builder.SetMode(frame)
-            rotate = True
-        elif auxiliary_spine is not None:
-            builder.SetMode(TopoDS.Wire(auxiliary_spine), True)
+            return True
+        if auxiliary_spine is not None:
+            builder.SetMode(TopoDS.Wire(auxiliary_spine), curvilinear_equivalence)
         else:
             builder.SetMode(is_frenet)
-        builder.SetTransitionMode(_TRANSITION[transition])
-        builder.Add(profile, False, rotate)
+        return False
+
+    def sweep_multi(
+        self,
+        profiles: Sequence[TopoDS_Shape],
+        path: TopoDS_Shape,
+        *,
+        is_frenet: bool,
+        make_solid: bool,
+        binormal: Point | None = None,
+        binormal_origin: Point | None = None,
+        auxiliary_spine: TopoDS_Shape | None = None,
+    ) -> TopoDS_Shape:
+        builder = BRepOffsetAPI_MakePipeShell(TopoDS.Wire(path))
+        rotate = self._set_sweep_mode(
+            builder, is_frenet, binormal, binormal_origin, auxiliary_spine
+        )
+        for profile in profiles:
+            builder.Add(profile, False, rotate)
         builder.Build()
         if make_solid:
             builder.MakeSolid()
@@ -1202,6 +1337,195 @@ class _OcctGeometry:
             return None
         return self.downcast(builder.Shape())
 
+    def offset_shape(
+        self,
+        shape: TopoDS_Shape,
+        amount: float,
+        tolerance: float,
+        *,
+        join: JoinKind = JoinKind.ARC,
+        intersection: bool = False,
+        thicken: bool = False,
+        remove_internal_edges: bool = False,
+    ) -> TopoDS_Shape:
+        builder = BRepOffset_MakeOffset()
+        builder.Initialize(
+            shape,
+            Offset=amount,
+            Tol=tolerance,
+            Mode=BRepOffset_Skin,
+            Intersection=intersection,
+            SelfInter=False,
+            Join=_JOIN[join],
+            Thickening=thicken,
+            RemoveIntEdges=remove_internal_edges,
+        )
+        builder.MakeOffsetShape()
+        return builder.Shape()
+
+    def make_bezier_surface(
+        self,
+        points: Sequence[Sequence[Point]],
+        weights: Sequence[Sequence[float]] | None = None,
+    ) -> TopoDS_Shape:
+        if weights:
+            surface = Geom_BezierSurface(_point_grid(points), _double_grid(weights))
+        else:
+            surface = Geom_BezierSurface(_point_grid(points))
+        return BRepBuilderAPI_MakeFace(surface, Precision.Confusion_s()).Face()
+
+    def make_spline_surface_fit(
+        self,
+        points: Sequence[Sequence[Point]],
+        tolerance: float,
+        min_degree: int,
+        max_degree: int,
+        smoothing: tuple[float, float, float] | None = None,
+    ) -> TopoDS_Shape:
+        grid = _point_grid(points)
+        if smoothing:
+            builder = GeomAPI_PointsToBSplineSurface(
+                grid, *smoothing, DegMax=max_degree, Tol3D=tolerance
+            )
+        else:
+            builder = GeomAPI_PointsToBSplineSurface(
+                grid, DegMin=min_degree, DegMax=max_degree, Tol3D=tolerance
+            )
+        if not builder.IsDone():
+            raise ValueError("B-spline approximation failed")
+        return BRepBuilderAPI_MakeFace(
+            builder.Surface(), Precision.Confusion_s()
+        ).Face()
+
+    def filling(self, **options: Any) -> OcctSurfaceFilling:
+        return OcctSurfaceFilling(**options)
+
+    def draft_prism(
+        self,
+        shape: TopoDS_Shape,
+        face: TopoDS_Shape,
+        basis: TopoDS_Shape | None,
+        taper: float,
+        additive: bool,
+        *,
+        up_to_face: TopoDS_Shape | None = None,
+        depth: float | None = None,
+    ) -> TopoDS_Shape:
+        feature = BRepFeat_MakeDPrism(
+            shape,
+            TopoDS.Face(face),
+            TopoDS.Face(basis) if basis is not None else TopoDS_Face(),
+            taper,
+            additive,
+            False,
+        )
+        if up_to_face is not None:
+            feature.Perform(TopoDS.Face(up_to_face))
+        elif depth is None:
+            feature.PerformThruAll()
+        else:
+            feature.Perform(depth)
+        return feature.Shape()
+
+    def extrude_generated(
+        self, shape: TopoDS_Shape, direction: Point
+    ) -> tuple[TopoDS_Shape, AncestorMap, Any]:
+        builder = BRepPrimAPI_MakePrism(shape, gp_Vec(*direction))
+        prism = builder.Shape()
+        entries = [
+            (edge, list(builder.Generated(edge)))
+            for edge in self.sub_shapes(shape, TopoKind.EDGE)
+        ]
+        return prism, AncestorMap(self, entries), builder  # type: ignore[arg-type]
+
+    def draft(
+        self,
+        shape: TopoDS_Shape,
+        specs: Sequence[tuple[TopoDS_Shape, float]],
+        direction: Point,
+        plane: gp_Pln,
+    ) -> tuple[TopoDS_Shape, Any]:
+        builder = BRepOffsetAPI_DraftAngle(shape)
+        pull = gp_Dir(*direction)
+        for index, (face, angle) in enumerate(specs):
+            builder.Add(TopoDS.Face(face), pull, angle, plane, True)
+            if not builder.AddDone():
+                raise DraftFailure("add", index, builder.ProblematicShape())
+        try:
+            builder.Build()
+            done = builder.IsDone()
+        except self.failure_types as err:  # type: ignore[attr-defined]
+            raise DraftFailure("build", None, builder.ProblematicShape()) from err
+        if not done:
+            raise DraftFailure("build", None, builder.ProblematicShape())
+        return builder.Shape(), builder
+
+    def split_by_edges(
+        self, shape: TopoDS_Shape, edges: Sequence[TopoDS_Shape]
+    ) -> tuple[list[TopoDS_Shape], list[TopoDS_Shape]]:
+        splitter = BRepFeat_SplitShape(shape)
+        edge_sequence = Sequence_TopoDS_Shape()
+        for edge in edges:
+            edge_sequence.Append(edge)
+        splitter.Add(edge_sequence)
+        splitter.Build()
+        return (
+            [s for s in splitter.Left() if not s.IsNull()],
+            [s for s in splitter.Right() if not s.IsNull()],
+        )
+
+    def line_intersections(
+        self, shape: TopoDS_Shape, origin: Point, direction: Point, tolerance: float
+    ) -> list[tuple[TopoDS_Shape, Point]]:
+        intersector = BRepIntCurveSurface_Inter()
+        intersector.Init(shape, gp_Lin(gp_Pnt(*origin), gp_Dir(*direction)), tolerance)
+        found: list[tuple[TopoDS_Shape, Point]] = []
+        while intersector.More():
+            found.append((intersector.Face(), _pt(intersector.Pnt())))
+            intersector.Next()
+        return found
+
+    def solid_from_shell(self, shell: TopoDS_Shape) -> TopoDS_Shape:
+        return ShapeFix_Solid().SolidFromShell(TopoDS.Shell(shell))
+
+    def remove_wires(
+        self, face: TopoDS_Shape, wires: Sequence[TopoDS_Shape]
+    ) -> TopoDS_Shape:
+        reshaper = BRepTools_ReShape()
+        for wire in wires:
+            reshaper.Remove(wire)
+        return self.downcast(reshaper.Apply(face))
+
+    def is_seam(self, edge: TopoDS_Shape, face: TopoDS_Shape) -> bool:
+        return ShapeAnalysis_Edge().IsSeam(TopoDS.Edge(edge), TopoDS.Face(face))
+
+    def to_splines(
+        self, shape: TopoDS_Shape, degree: int, tolerance: float, nurbs: bool
+    ) -> TopoDS_Shape:
+        return ShapeCustom.BSplineRestriction_s(
+            shape,
+            tolerance,  # 3D tolerance
+            tolerance,  # 2D tolerance
+            degree,
+            1,  # dummy value, degree is leading
+            ga.GeomAbs_C0,
+            ga.GeomAbs_C0,
+            True,  # set degree to be leading
+            not nurbs,
+            ShapeCustom_RestrictionParameters(),
+        )
+
+    def edge_in_plane(
+        self, edge: TopoDS_Shape, normal: Point, tolerance: float
+    ) -> bool:
+        t_edge = tcast(BRep_TEdge, edge.TShape())
+        for curve in t_edge.Curves():
+            if curve.IsCurve3D():
+                return ShapeAnalysis_Curve.IsPlanar_s(
+                    curve.Curve3D(), gp_XYZ(*normal), tolerance
+                )
+        return False
+
     def offset_face(
         self, face: TopoDS_Shape, amount: float, tolerance: float
     ) -> TopoDS_Shape:
@@ -1303,8 +1627,46 @@ class _OcctGeometry:
             builder.Add(TopoDS.Wire(wire))
         return builder.Face()
 
-    def face_of_plane(self, plane: gp_Pln) -> TopoDS_Shape:
-        return BRepBuilderAPI_MakeFace(plane).Face()
+    def face_of_plane(
+        self, plane: gp_Pln, bounds: tuple[float, float, float, float] | None = None
+    ) -> TopoDS_Shape:
+        if bounds is None:
+            return BRepBuilderAPI_MakeFace(plane).Face()
+        return BRepBuilderAPI_MakeFace(plane, *bounds).Face()
+
+    def surface_axis(self, face: TopoDS_Shape) -> tuple[str, Point, Point] | None:
+        surface: Geom_Surface = BRep_Tool.Surface_s(TopoDS.Face(face))
+        # strip trimming and offsetting to get at the basis surface
+        while isinstance(surface, (Geom_RectangularTrimmedSurface, Geom_OffsetSurface)):
+            surface = surface.BasisSurface()
+        geom_type = _SURFACE_TYPE_LABELS[GeomAdaptor_Surface(surface).GetType()]
+        axis: gp_Ax1
+        if geom_type == "CONE":
+            axis = surface.Cone().Axis()  # type: ignore[attr-defined]
+        elif geom_type == "CYLINDER":
+            axis = surface.Cylinder().Axis()  # type: ignore[attr-defined]
+        elif geom_type == "SPHERE":
+            frame = surface.Position()  # type: ignore[attr-defined]
+            axis = gp_Ax1(frame.Location(), frame.Direction())
+        elif geom_type == "TORUS":
+            axis = surface.Torus().Axis()  # type: ignore[attr-defined]
+        elif geom_type == "REVOLUTION":
+            axis = surface.Axis()  # type: ignore[attr-defined]
+        else:
+            return None
+        return geom_type, _pt(axis.Location()), _pt(axis.Direction())
+
+    def half_space(self, shape: TopoDS_Shape, point: Point) -> TopoDS_Shape:
+        if shape.ShapeType() == ta.TopAbs_SHELL:
+            return BRepPrimAPI_MakeHalfSpace(
+                TopoDS.Shell(shape), gp_Pnt(*point)
+            ).Solid()
+        return BRepPrimAPI_MakeHalfSpace(TopoDS.Face(shape), gp_Pnt(*point)).Solid()
+
+    def ruled_surface(self, a: TopoDS_Shape, b: TopoDS_Shape) -> TopoDS_Shape:
+        if a.ShapeType() == ta.TopAbs_WIRE:
+            return BRepFill.Shell_s(TopoDS.Wire(a), TopoDS.Wire(b))
+        return BRepFill.Face_s(TopoDS.Edge(a), TopoDS.Edge(b))
 
     def make_shell(self, faces: Sequence[TopoDS_Shape]) -> TopoDS_Shape:
         shell = TopoDS_Shell()
@@ -1588,6 +1950,31 @@ class OcctKernel(_OcctGeometry, Kernel):
         center = properties.CentreOfMass()
         return (center.X(), center.Y(), center.Z())
 
+    def inertia_matrix(self, shape: TopoDS_Shape) -> list[list[float]]:
+        matrix = _volume_properties(shape).MatrixOfInertia()
+        return [[matrix.Value(i, j) for j in range(1, 4)] for i in range(1, 4)]
+
+    def principal_inertia(self, shape: TopoDS_Shape) -> list[tuple[Point, float]]:
+        principal = _volume_properties(shape).PrincipalProperties()
+        moments = principal.Moments()
+        return [
+            (_pt(principal.FirstAxisOfInertia()), moments[0]),
+            (_pt(principal.SecondAxisOfInertia()), moments[1]),
+            (_pt(principal.ThirdAxisOfInertia()), moments[2]),
+        ]
+
+    def static_moments(self, shape: TopoDS_Shape) -> tuple[float, float, float]:
+        return _volume_properties(shape).StaticMoments()
+
+    def radius_of_gyration(self, shape: TopoDS_Shape, axis: gp_Ax1) -> float:
+        return _volume_properties(shape).RadiusOfGyration(axis)
+
+    def has_inconsistent_orientation(self, shape: TopoDS_Shape) -> bool:
+        analyzer = ShapeAnalysis_Shell()
+        analyzer.LoadShells(shape)
+        analyzer.CheckOrientedShells(shape, True, True)
+        return analyzer.HasBadEdges()
+
     def bounding_box(
         self, shape: TopoDS_Shape, optimal: bool = True
     ) -> tuple[float, float, float, float, float, float] | None:
@@ -1676,6 +2063,28 @@ _BOOLEAN_ALGORITHMS: dict[BoolOp, Callable[[], BRepAlgoAPI_BuilderAlgo]] = {
     BoolOp.SECTION: BRepAlgoAPI_Section,
     BoolOp.SPLIT: BRepAlgoAPI_Splitter,
 }
+
+
+def _volume_properties(shape: TopoDS_Shape) -> GProp_GProps:
+    properties = GProp_GProps()
+    BRepGProp.VolumeProperties_s(shape, properties)
+    return properties
+
+
+def _point_grid(points: Sequence[Sequence[Point]]) -> HArray2_gp_Pnt:
+    grid = HArray2_gp_Pnt(1, len(points), 1, len(points[0]))
+    for i, row in enumerate(points, start=1):
+        for j, point in enumerate(row, start=1):
+            grid.SetValue(i, j, gp_Pnt(*point))
+    return grid
+
+
+def _double_grid(values: Sequence[Sequence[float]]) -> HArray2_double:
+    grid = HArray2_double(1, len(values), 1, len(values[0]))
+    for i, row in enumerate(values, start=1):
+        for j, value in enumerate(row, start=1):
+            grid.SetValue(i, j, float(value))
+    return grid
 
 
 def _point_array(points: Sequence[Point]) -> Array1_gp_Pnt:

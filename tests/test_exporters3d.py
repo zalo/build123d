@@ -557,7 +557,7 @@ class TestTessellateWithUVs(DirectApiTestCase):
     def test_zero_arc_lengths(self):
         """Degenerate arc lengths are replaced with usable atlas dimensions."""
         with patch(
-            "build123d.topology.shape_core.GCPnts_AbscissaPoint.Length_s",
+            "build123d.kernel.occt.GCPnts_AbscissaPoint.Length_s",
             return_value=0.0,
         ):
             _, triangles, _, uvs = Box(1, 1, 1).tessellate_with_uvs(0.1)
