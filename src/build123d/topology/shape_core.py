@@ -143,6 +143,7 @@ from typing_extensions import Self, deprecated
 from bd_materials import FinishedMaterial, resolve as resolve_material
 
 from build123d.build_constants import UNITS_PER_KILOGRAM, UNITS_PER_METER
+from build123d.kernel import TopoKind, kernel
 from build123d.build_enums import (
     CenterOf,
     Convexity,
@@ -402,10 +403,9 @@ class Shape(NodeMixin, Generic[TOPODS]):
         shape is cut away entirely. It is falsy, has no sub-shapes, and adding
         it to another shape leaves that shape unchanged.
         """
-        return (
-            isinstance(self._wrapped, TopoDS_Compound)
-            and not TopoDS_Iterator(self._wrapped).More()
-        )
+        return kernel.is_kind(
+            self._wrapped, TopoKind.COMPOUND
+        ) and not kernel.direct_children(self._wrapped)
 
     def __bool__(self):
         return not self.is_empty
@@ -652,9 +652,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         if self.is_empty:
             return True
-        chk = BRepCheck_Analyzer(self.wrapped)
-        chk.SetParallel(True)
-        return chk.IsValid()
+        return kernel.is_valid(self.wrapped)
 
     @property
     def global_location(self) -> Location:
@@ -877,8 +875,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         if (
             cls is not Shape
-            and isinstance(obj, TopoDS_Compound)
-            and not TopoDS_Iterator(obj).More()
+            and kernel.is_kind(obj, TopoKind.COMPOUND)
+            and not kernel.direct_children(obj)
         ):
             return cls._zero_class()()
 
@@ -1263,7 +1261,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
         cls = self.__class__
         result = cls.__new__(cls)
         memo[id(self)] = result
-        memo[id(self.wrapped)] = downcast(BRepBuilderAPI_Copy(self.wrapped).Shape())
+        if not self.is_empty:
+            memo[id(self.wrapped)] = kernel.copy_deep(self.wrapped)
         for key, value in self.__dict__.items():
             if key in ("topo_path", "_history"):
                 # provenance points at shapes outside the copy, so it is
@@ -1309,7 +1308,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """Return hash code"""
         if self.is_empty:
             return hash(type(self))
-        return hash(self.wrapped)
+        return hash(kernel.hash_key(self.wrapped))
 
     @overload
     def __rmul__(self, other: Plane | Location) -> Self: ...
@@ -1868,7 +1867,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         if self.is_empty or not other:
             return False
-        return self.wrapped.IsEqual(other.wrapped)
+        return kernel.is_equal(self.wrapped, other.wrapped)
 
     def is_same(self, other: Shape) -> bool:
         """Returns True if other and this shape are same, i.e. if they share the
@@ -1883,7 +1882,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         if self.is_empty or not other:
             return False
-        return self.wrapped.IsSame(other.wrapped)
+        return kernel.is_same(self.wrapped, other.wrapped)
 
     def locate(self, loc: Location) -> Self:
         """Apply a location in absolute sense to self
@@ -1913,7 +1912,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         shape_copy = copy.deepcopy(self, None)
         if self.is_empty:  # nothing is nothing wherever it is put
             return shape_copy
-        if isinstance(self.wrapped, TopoDS_Vertex):
+        if kernel.is_kind(self.wrapped, TopoKind.VERTEX):
             # Copying a Vertex folds its location into its point, so the copy
             # is rebuilt from the vertex without its location
             unplaced = self.wrapped.Located(TopLoc_Location())
@@ -2039,7 +2038,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         if (
             not isinstance(faces, (list, tuple))
             and not faces.is_empty
-            and isinstance(faces.wrapped, TopoDS_Compound)
+            and kernel.is_kind(faces.wrapped, TopoKind.COMPOUND)
         ):
             faces = faces.faces()
 
@@ -2240,7 +2239,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         if (
             not self.is_empty
-            and isinstance(self.wrapped, TopoDS_Compound)
+            and kernel.is_kind(self.wrapped, TopoKind.COMPOUND)
             and self.children
         ):
             show_center = False if show_center is None else show_center
@@ -2347,7 +2346,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         split_result = downcast(splitter.Shape())
         # Remove unnecessary TopoDS_Compound around single shape
-        if isinstance(split_result, TopoDS_Compound):
+        if kernel.is_kind(split_result, TopoKind.COMPOUND):
             split_result = unwrap_topods_compound(split_result, True)
 
         # For speed the user may just want all the objects which they
@@ -2360,9 +2359,8 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         if not isinstance(tool, Plane):
             # Get a TopoDS_Face to work with from the tool
-            if isinstance(trim_tool, TopoDS_Shell):
-                face_explorer = TopExp_Explorer(trim_tool, ta.TopAbs_FACE)
-                tool_face = TopoDS.Face(face_explorer.Current())
+            if kernel.is_kind(trim_tool, TopoKind.SHELL):
+                tool_face = TopoDS.Face(kernel.sub_shapes(trim_tool, TopoKind.FACE)[0])
             else:
                 tool_face = trim_tool
 
@@ -2977,10 +2975,10 @@ class Shape(NodeMixin, Generic[TOPODS]):
                 warnings.warn("Boolean operation unable to clean", stacklevel=2)
 
         # Remove unnecessary TopoDS_Compound around single shape
-        if isinstance(topo_result, TopoDS_Compound):
+        if kernel.is_kind(topo_result, TopoKind.COMPOUND):
             topo_result = unwrap_topods_compound(topo_result, True)
 
-        if isinstance(topo_result, TopoDS_Compound) and highest_order[1] != 4:
+        if kernel.is_kind(topo_result, TopoKind.COMPOUND) and highest_order[1] != 4:
             results = ShapeList(
                 highest_order[0].cast(s)
                 for s in get_top_level_topods_shapes(topo_result)
@@ -3019,7 +3017,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         result = self._bool_op(args, tools, operation)
         if result.is_empty:
             return ShapeList()
-        if isinstance(result.wrapped, TopoDS_Compound):
+        if kernel.is_kind(result.wrapped, TopoKind.COMPOUND):
             pieces = result.get_top_level_shapes()
             for piece in pieces:
                 piece._made_by(result._history)  # the same operation made them all
@@ -3063,15 +3061,11 @@ class Shape(NodeMixin, Generic[TOPODS]):
 
         vertices: list[Vertex] = []
         # Iterate through the intersection shape to find intersection points/edges
-        explorer = TopExp_Explorer(intersection_shape, TopAbs_ShapeEnum.TopAbs_VERTEX)
-        while explorer.More():
-            vertices.append(self.__class__.cast(downcast(explorer.Current())))
-            explorer.Next()
+        for topods_vertex in kernel.sub_shapes(intersection_shape, TopoKind.VERTEX):
+            vertices.append(self.__class__.cast(downcast(topods_vertex)))
         edges: ShapeList[Edge] = ShapeList()
-        explorer = TopExp_Explorer(intersection_shape, TopAbs_ShapeEnum.TopAbs_EDGE)
-        while explorer.More():
-            edges.append(self.__class__.cast(downcast(explorer.Current())))
-            explorer.Next()
+        for topods_edge in kernel.sub_shapes(intersection_shape, TopoKind.EDGE):
+            edges.append(self.__class__.cast(downcast(topods_edge)))
 
         return (ShapeList(dict.fromkeys(vertices)), edges)
 
@@ -3551,12 +3545,12 @@ class ShapeList(list[T]):
             if isinstance(shape, Vector):
                 expanded.append(shape)
             elif hasattr(shape, "wrapped"):
-                if isinstance(shape.wrapped, TopoDS_Compound):
+                if kernel.is_kind(shape.wrapped, TopoKind.COMPOUND):
                     # Recursively expand nested compounds
                     expanded.extend(ShapeList(list(shape)).expand())
-                elif isinstance(shape.wrapped, TopoDS_Shell):
+                elif kernel.is_kind(shape.wrapped, TopoKind.SHELL):
                     expanded.extend(shape.faces())
-                elif isinstance(shape.wrapped, TopoDS_Wire):
+                elif kernel.is_kind(shape.wrapped, TopoKind.WIRE):
                     expanded.extend(shape.edges())
                 elif not shape.is_empty:
                     expanded.append(shape)
@@ -3640,7 +3634,7 @@ class ShapeList(list[T]):
         def axis_parallel_predicate(axis: Axis, tolerance: float):
             def pred(shape: Shape):
                 if (
-                    isinstance(shape.wrapped, TopoDS_Face)
+                    kernel.is_kind(shape.wrapped, TopoKind.FACE)
                     and GeomLib_IsPlanarSurface(
                         BRep_Tool.Surface_s(shape.wrapped), TOLERANCE
                     ).IsPlanar()
@@ -3656,7 +3650,7 @@ class ShapeList(list[T]):
                     ).normalized()
                     shape_axis = Axis(shape.center(), normalized_surface_normal)
                 elif (
-                    isinstance(shape.wrapped, TopoDS_Edge)
+                    kernel.is_kind(shape.wrapped, TopoKind.EDGE)
                     and shape.geom_type == GeomType.LINE
                 ):
                     curve = shape.geom_adaptor()
@@ -3679,7 +3673,7 @@ class ShapeList(list[T]):
             def pred(shape: Shape):
 
                 if (
-                    isinstance(shape.wrapped, TopoDS_Face)
+                    kernel.is_kind(shape.wrapped, TopoKind.FACE)
                     and GeomLib_IsPlanarSurface(
                         BRep_Tool.Surface_s(shape.wrapped), TOLERANCE
                     ).IsPlanar()
@@ -3693,9 +3687,9 @@ class ShapeList(list[T]):
                     normalized_surface_normal = Vector(surface_normal).normalized()
                     shape_axis = Axis(shape.center(), normalized_surface_normal)
                     return plane_axis.is_parallel(shape_axis, tolerance)
-                if isinstance(shape.wrapped, TopoDS_Wire):
+                if kernel.is_kind(shape.wrapped, TopoKind.WIRE):
                     return all(pred(e) for e in shape.edges())
-                if isinstance(shape.wrapped, TopoDS_Edge):
+                if kernel.is_kind(shape.wrapped, TopoKind.EDGE):
                     if shape.location is None:
                         return False
                     plane_xyz = tcast(
@@ -4180,9 +4174,7 @@ def _faces_of(result: Shape | Iterable[Shape] | None) -> ShapeList[Face]:
 
 def _topods_area(shape: TopoDS_Shape) -> float:
     """The surface area of a shape's faces"""
-    properties = GProp_GProps()
-    BRepGProp.SurfaceProperties_s(shape, properties)
-    return properties.Mass()
+    return kernel.area(shape)
 
 
 def _sew_topods_faces(faces: Iterable[TopoDS_Face]) -> TopoDS_Shape:
@@ -4227,7 +4219,7 @@ def _topods_bool_op(
 
     result = downcast(operation.Shape())
     # Remove unnecessary TopoDS_Compound around single shape
-    if isinstance(result, TopoDS_Compound):
+    if kernel.is_kind(result, TopoKind.COMPOUND):
         result = unwrap_topods_compound(result, True)
 
     return result
@@ -4235,16 +4227,7 @@ def _topods_bool_op(
 
 def _topods_entities(shape: TopoDS_Shape, topo_type: Shapes) -> list[TopoDS_Shape]:
     """Return the TopoDS_Shapes of topo_type from this TopoDS_Shape"""
-    out = {}  # using dict to prevent duplicates
-
-    explorer = TopExp_Explorer(shape, Shape.inverse_shape_LUT[topo_type])
-
-    while explorer.More():
-        item = explorer.Current()
-        out[hash(item)] = item  # needed to avoid pseudo-duplicate entities
-        explorer.Next()
-
-    return list(out.values())
+    return kernel.sub_shapes(shape, TopoKind.from_label(topo_type))
 
 
 def _topods_face_normal_at(face: TopoDS_Face, surface_point: gp_Pnt) -> Vector:
@@ -4272,10 +4255,7 @@ def downcast(obj: TopoDS_Shape) -> TopoDS_Shape:
 
     """
 
-    f_downcast: Any = Shape.downcast_LUT[shapetype(obj)]
-    return_value = f_downcast(obj)
-
-    return return_value
+    return kernel.downcast(obj)
 
 
 def fix(obj: TopoDS_Shape) -> TopoDS_Shape:
@@ -4288,10 +4268,7 @@ def fix(obj: TopoDS_Shape) -> TopoDS_Shape:
 
     """
 
-    shape_fix = ShapeFix_Shape(obj)
-    shape_fix.Perform()
-
-    return downcast(shape_fix.Shape())
+    return kernel.fix(obj)
 
 
 def get_top_level_topods_shapes(
@@ -4322,12 +4299,12 @@ def get_top_level_topods_shapes(
 
     while stack:
         current_shape = stack.pop()
-        if isinstance(current_shape, TopoDS_Compound):
+        if kernel.is_kind(current_shape, TopoKind.COMPOUND):
             iterator = TopoDS_Iterator()
             iterator.Initialize(current_shape)
             while iterator.More():
                 child_shape = downcast(iterator.Value())
-                if isinstance(child_shape, TopoDS_Compound):
+                if kernel.is_kind(child_shape, TopoKind.COMPOUND):
                     # Traverse further into the compound
                     stack.append(child_shape)
                 else:
@@ -4361,7 +4338,7 @@ def topods_dim(topods: TopoDS_Shape) -> int | None:
         if isinstance(topods, shape_types):
             return dim
 
-    if isinstance(topods, TopoDS_Compound):
+    if kernel.is_kind(topods, TopoKind.COMPOUND):
         sub_dims = {topods_dim(s) for s in get_top_level_topods_shapes(topods)}
         return sub_dims.pop() if len(sub_dims) == 1 else None
 
@@ -4386,7 +4363,7 @@ def unwrap_topods_compound(
         single_element = downcast(iterator.Value())
 
         # If the single element is another TopoDS_Compound, unwrap it recursively
-        if isinstance(single_element, TopoDS_Compound):
+        if kernel.is_kind(single_element, TopoKind.COMPOUND):
             return unwrap_topods_compound(single_element, fully)
 
         return single_element if fully else compound

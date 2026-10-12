@@ -83,6 +83,7 @@ from OCP.TopoDS import (
     TopoDS_Edge,
     TopoDS_Wire,
 )
+from build123d.kernel import TopoKind, kernel
 from build123d.geometry import TOLERANCE, BoundBox, Vector, VectorLike
 
 from .shape_core import (
@@ -173,14 +174,12 @@ def _topods_material_side(face: TopoDS_Face, edge: TopoDS_Edge) -> Vector:
         ValueError: the edge is not an edge of the face
     """
     occurrence = None
-    explorer = TopExp_Explorer(face, TopAbs_ShapeEnum.TopAbs_EDGE)
-    while explorer.More():
-        if explorer.Current().IsSame(edge):
-            occurrence = TopoDS.Edge(explorer.Current())
+    for use in kernel.sub_shape_uses(face, TopoKind.EDGE):
+        if kernel.is_same(use, edge):
+            occurrence = TopoDS.Edge(use)
             break
-        if occurrence is None and explorer.Current().IsPartner(edge):
-            occurrence = TopoDS.Edge(explorer.Current())
-        explorer.Next()
+        if occurrence is None and kernel.is_partner(use, edge):
+            occurrence = TopoDS.Edge(use)
     if occurrence is None:
         raise ValueError("the edge is not an edge of the face")
     curve = BRepAdaptor_Curve(occurrence)
@@ -223,11 +222,9 @@ def _extrude_topods_shape(obj: TopoDS_Shape, direction: VectorLike) -> TopoDS_Sh
     extrusion = downcast(prism_builder.Shape())
     shape_type = extrusion.ShapeType()
     if shape_type == TopAbs_ShapeEnum.TopAbs_COMPSOLID:
-        solids = []
-        explorer = TopExp_Explorer(extrusion, TopAbs_ShapeEnum.TopAbs_SOLID)
-        while explorer.More():
-            solids.append(downcast(explorer.Current()))
-            explorer.Next()
+        solids = [
+            downcast(solid) for solid in kernel.sub_shapes(extrusion, TopoKind.SOLID)
+        ]
         extrusion = _make_topods_compound_from_shapes(solids)
     return extrusion
 
@@ -429,12 +426,10 @@ def new_edges(*objects: Shape, combined: Shape) -> ShapeList[Edge]:
     operation.Build()
 
     edges = []
-    explorer = TopExp_Explorer(operation.Shape(), TopAbs_ShapeEnum.TopAbs_EDGE)
-    while explorer.More():
-        found_edge = combined.__class__.cast(downcast(explorer.Current()))
+    for topods_edge in kernel.sub_shapes(operation.Shape(), TopoKind.EDGE):
+        found_edge = combined.__class__.cast(downcast(topods_edge))
         found_edge.topo_parent = combined
         edges.append(found_edge)
-        explorer.Next()
 
     return ShapeList(edges)
 

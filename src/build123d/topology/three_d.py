@@ -108,6 +108,7 @@ from OCP.collections import (
     List_TopoDS_Shape,
 )
 
+from build123d.kernel import TopoKind, kernel
 from build123d.build_enums import (
     CenterOf,
     GeomType,
@@ -215,11 +216,9 @@ class Mixin3D(Shape[TOPODS]):
         if center_of == CenterOf.GEOMETRY:
             raise ValueError("Center of GEOMETRY is not supported for this object")
         if center_of == CenterOf.MASS:
-            properties = GProp_GProps()
-            calc_function = Shape.shape_properties_LUT[shapetype(self.wrapped)]
-            assert calc_function is not None
-            calc_function(self.wrapped, properties)
-            middle = Vector(properties.CentreOfMass())
+            middle = Vector(
+                kernel.center_of_mass(self.wrapped, kernel.kind(self.wrapped))
+            )
         else:  # center_of == CenterOf.BOUNDING_BOX:
             middle = self.bounding_box().center()
         return middle
@@ -1360,19 +1359,16 @@ class Solid(Mixin3D[TopoDS_Solid]):
         intersect_op = BRepAlgoAPI_Common(target.wrapped, extrusion.wrapped)
         intersect_op.Build()
         intersection = intersect_op.Shape()
-        face_exp = TopExp_Explorer(intersection, ta.TopAbs_FACE)
-        if not face_exp.More():
+        if not kernel.sub_shapes(intersection, TopoKind.FACE):
             raise ValueError("No intersection: extrusion does not contact target")
 
         # Find the faces from the intersection that originated on the target
         history = intersect_op.History()
         modified_target_faces = []
-        face_explorer = TopExp_Explorer(target.wrapped, ta.TopAbs_FACE)
-        while face_explorer.More():
-            target_face = TopoDS.Face(face_explorer.Current())
+        for topods_face in kernel.sub_shapes(target.wrapped, TopoKind.FACE):
+            target_face = TopoDS.Face(topods_face)
             for modified in list_shapes(history.Modified(target_face)):
                 modified_target_faces.append(TopoDS.Face(modified))
-            face_explorer.Next()
 
         # 3: Sew the resulting faces into shells - one for each surface the extrusion
         #    passes through and sort by distance from the profile

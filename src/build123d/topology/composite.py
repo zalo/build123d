@@ -87,6 +87,7 @@ from OCP.TopoDS import (
     TopoDS_Iterator,
 )
 from anytree import PreOrderIter
+from build123d.kernel import TopoKind, kernel
 from build123d.build_enums import Align, CenterOf, FontStyle, Select, TextAlign, Unit
 from build123d.geometry import (
     TOLERANCE,
@@ -616,13 +617,12 @@ class Compound(Mixin3D[TopoDS_Compound]):
         if center_of == CenterOf.GEOMETRY:
             raise ValueError("Center of GEOMETRY is not supported for this object")
         if center_of == CenterOf.MASS:
-            properties = GProp_GProps()
-            calc_function = Shape.shape_properties_LUT[unwrapped_shapetype(self)]
-            if calc_function:
-                calc_function(self.wrapped, properties)
-                middle = Vector(properties.CentreOfMass())
-            else:
-                raise NotImplementedError
+            middle = Vector(
+                kernel.center_of_mass(
+                    self.wrapped,
+                    TopoKind.from_label(Shape.shape_LUT[unwrapped_shapetype(self)]),
+                )
+            )
         else:  # center_of == CenterOf.BOUNDING_BOX:
             middle = self.bounding_box().center()
         return middle

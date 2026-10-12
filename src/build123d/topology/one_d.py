@@ -196,6 +196,7 @@ from scipy.optimize import minimize_scalar
 from scipy.spatial import ConvexHull
 from typing_extensions import Self
 
+from build123d.kernel import TopoKind, kernel
 from build123d.build_enums import (
     AngularDirection,
     CenterOf,
@@ -325,11 +326,9 @@ def _split_edge_at_vertex(edge: Edge, split_vertex: Vertex) -> list[TopoDS_Edge]
     splitter.Perform()
 
     split_shape = splitter.Shape()
-    split_edges = []
-    explorer = TopExp_Explorer(split_shape, ta.TopAbs_EDGE)
-    while explorer.More():
-        split_edges.append(TopoDS.Edge(explorer.Current()))
-        explorer.Next()
+    split_edges = [
+        TopoDS.Edge(edge) for edge in kernel.sub_shapes(split_shape, TopoKind.EDGE)
+    ]
 
     return split_edges
 
@@ -4984,22 +4983,20 @@ def topo_explore_connected_edges(
 
 def _edge_is_seam_of(edge: TopoDS_Edge, face: TopoDS_Face) -> bool:
     """Does ``face`` meet itself along ``edge``, as a cylinder does at its seam?"""
-    count = 0
-    explorer = TopExp_Explorer(face, ta.TopAbs_EDGE)
-    while explorer.More():
-        if explorer.Current().IsSame(edge):
-            count += 1
-        explorer.Next()
-    return count > 1
+    return (
+        sum(
+            kernel.is_same(use, edge)
+            for use in kernel.sub_shape_uses(face, TopoKind.EDGE)
+        )
+        > 1
+    )
 
 
 def _edge_as_bounded_by(face: TopoDS_Face, edge: TopoDS_Edge) -> TopoDS_Edge:
     """``edge`` with the orientation it has in ``face``'s boundary."""
-    explorer = TopExp_Explorer(face, ta.TopAbs_EDGE)
-    while explorer.More():
-        if explorer.Current().IsSame(edge):
-            return TopoDS.Edge(explorer.Current())
-        explorer.Next()
+    for use in kernel.sub_shape_uses(face, TopoKind.EDGE):
+        if kernel.is_same(use, edge):
+            return TopoDS.Edge(use)
     raise ValueError("edge is not on the face")
 
 

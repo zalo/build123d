@@ -133,6 +133,7 @@ from OCP.TopLoc import TopLoc_Location
 from ocp_gordon import interpolate_curve_network
 from typing_extensions import Self
 
+from build123d.kernel import TopoKind, kernel
 from build123d.build_enums import (
     CenterOf,
     ContinuityLevel,
@@ -2881,11 +2882,7 @@ class Shell(Mixin2D[TopoDS_Shell]):
         """volume - the volume of this Shell if manifold, otherwise zero"""
         if self.is_manifold:
             solid_shell = ShapeFix_Solid().SolidFromShell(self.wrapped)
-            properties = GProp_GProps()
-            calc_function = Shape.shape_properties_LUT[shapetype(solid_shell)]
-            assert calc_function is not None
-            calc_function(solid_shell, properties)
-            return properties.Mass()
+            return kernel.volume(solid_shell)
         return 0.0
 
     def mass(self, mass_unit: Unit = Unit.G, length_unit: Unit = Unit.MM) -> float:

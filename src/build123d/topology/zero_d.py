@@ -80,6 +80,7 @@ from build123d.geometry import (
     Axis,
     Plane,
 )
+from build123d.kernel import TopoKind, kernel
 from build123d.build_enums import Convexity, Keep, Select, Unit
 from .kernel import list_shapes
 from .shape_core import Shape, ShapeList, TrimmingTool, downcast, find_same_topods
@@ -221,16 +222,13 @@ class Vertex(Shape[TopoDS_Vertex]):
         if parent is None or parent.is_empty or parent.solids() or parent.shells():
             return None
         holding = []
-        explorer = TopExp_Explorer(parent.wrapped, ta.TopAbs_FACE)
-        while explorer.More():
-            face = TopoDS.Face(explorer.Current())
-            vertices = TopExp_Explorer(face, ta.TopAbs_VERTEX)
-            while vertices.More():
-                if vertices.Current().IsSame(self.wrapped):
-                    holding.append(face)
-                    break
-                vertices.Next()
-            explorer.Next()
+        for topods_face in kernel.sub_shapes(parent.wrapped, TopoKind.FACE):
+            face = TopoDS.Face(topods_face)
+            if any(
+                kernel.is_same(vertex, self.wrapped)
+                for vertex in kernel.sub_shapes(face, TopoKind.VERTEX)
+            ):
+                holding.append(face)
         if len(holding) > 1:
             raise ValueError(
                 f"this vertex is a corner of {len(holding)} faces of the "
@@ -249,11 +247,9 @@ class Vertex(Shape[TopoDS_Vertex]):
         here = BRep_Tool.Parameters_s(self.wrapped, face)
         seen: list[TopoDS_Edge] = []
         directions: list[tuple[float, float]] = []
-        explorer = TopExp_Explorer(face, ta.TopAbs_EDGE)
-        while explorer.More():
-            edge = TopoDS.Edge(explorer.Current())
-            explorer.Next()
-            if any(edge.IsSame(other) for other in seen):
+        for topods_edge in kernel.sub_shape_uses(face, TopoKind.EDGE):
+            edge = TopoDS.Edge(topods_edge)
+            if any(kernel.is_same(edge, other) for other in seen):
                 continue  # a seam edge is met once per side
             seen.append(edge)
             curve = BRepAdaptor_Curve2d(edge, face)
@@ -526,21 +522,12 @@ def topo_explore_common_vertex(
     topods_edge2 = edge2 if isinstance(edge2, TopoDS_Edge) else edge2.wrapped
 
     # Explore vertices of the first edge
-    vert_exp = TopExp_Explorer(topods_edge1, ta.TopAbs_VERTEX)
-    while vert_exp.More():
-        vertex1 = vert_exp.Current()
-
+    for vertex1 in kernel.sub_shapes(topods_edge1, TopoKind.VERTEX):
         # Explore vertices of the second edge
-        explorer2 = TopExp_Explorer(topods_edge2, ta.TopAbs_VERTEX)
-        while explorer2.More():
-            vertex2 = explorer2.Current()
-
+        for vertex2 in kernel.sub_shapes(topods_edge2, TopoKind.VERTEX):
             # Check if the vertices are the same
-            if vertex1.IsSame(vertex2):
+            if kernel.is_same(vertex1, vertex2):
                 return Vertex(TopoDS.Vertex(vertex1))  # Common vertex found
-
-            explorer2.Next()
-        vert_exp.Next()
 
     return Vertex()  # No common vertex found
 
