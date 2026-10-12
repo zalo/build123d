@@ -558,6 +558,17 @@ class SmlibCoreKernel(Kernel):
             )
         if shape.point is not None:
             return SmHandle(TopoKind.VERTEX, point=shape.point, partner=shape.partner)
+        if shape.curve is not None:
+            status, curve = shape.curve.Copy(self.context)
+            _check(status, "curve copy")
+            return SmHandle(
+                TopoKind.EDGE,
+                curve=curve,
+                interval=shape.interval,
+                flip=shape.flip,
+                location=shape.location,
+                partner=shape.partner,
+            )
         brep = shape.entity.GetBrep()
         copy, forward = self._copy_body(brep)
         return SmHandle(
@@ -914,6 +925,15 @@ class SmlibCoreKernel(Kernel):
     def _tracked_copy(self, shape: SmHandle, record: _Record) -> Any:
         """A working copy of a body whose entities are recorded as what the
         input's entities became."""
+        if shape.kind is TopoKind.COMPOUND:
+            bodies = self._bodies(shape)
+            if len(bodies) != 1:
+                raise NotImplementedError(
+                    "smlib: operations on compounds of several bodies"
+                )
+            inner = self._tracked_copy(bodies[0], record)
+            record.modified[shape.key()] = record.modified[bodies[0].key()]
+            return inner
         copy, forward = self._copy_body(shape.entity)
         for kind in (TopoKind.VERTEX, TopoKind.EDGE, TopoKind.FACE):
             for sub in self.sub_shapes(shape, kind):

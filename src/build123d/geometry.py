@@ -63,8 +63,8 @@ from typing_extensions import deprecated
 from OCP.Bnd import Bnd_Box, Bnd_OBB
 from OCP.BRep import BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-from OCP.Geom import Geom_ElementarySurface, Geom_Line, Geom_Plane
+
+from OCP.Geom import Geom_Line, Geom_Plane
 from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_IntSS
 from OCP.gp import (
     gp_Ax1,
@@ -3249,17 +3249,11 @@ class Plane(metaclass=PlaneMeta):
             x_dir = round(Vector(x_dir), 14)
             z_dir = round(Vector(face_normal), 14)
         elif arg_location:
-            topo_face = BRepBuilderAPI_MakeFace(
-                Plane.XY.wrapped, -1.0, 1.0, -1.0, 1.0
-            ).Face()
-            topo_face.Move(arg_location.wrapped)
+            # the XY plane carried to the location: its axes are the location's
+            transformation = arg_location.wrapped.Transformation()
             origin = arg_location.position
-            surface = BRep_Tool.Surface_s(topo_face)
-            assert isinstance(surface, Geom_ElementarySurface)  # for .Position()
-            x_dir = Vector(surface.Position().XDirection())
-            x_dir = round(Vector(x_dir), 14)
-            z_dir = Plane.get_topods_face_normal(topo_face)
-            z_dir = round(Vector(z_dir), 14)
+            x_dir = round(Vector(gp_Dir(1, 0, 0).Transformed(transformation)), 14)
+            z_dir = round(Vector(gp_Dir(0, 0, 1).Transformed(transformation)), 14)
         elif arg_axis:
             origin = arg_axis.position
             x_dir = Vector(arg_x_dir) if arg_x_dir is not None else None

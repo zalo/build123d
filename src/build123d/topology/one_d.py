@@ -182,7 +182,7 @@ def _analyze_wire_fillet_corner(wire: Wire, vertex: Vertex) -> _WireFilletCorner
     all_edges = wire.edges()
     connected_edges = all_edges.filter_by(
         lambda edge: any(
-            edge_vertex.wrapped.IsSame(vertex.wrapped)
+            kernel.is_same(edge_vertex.wrapped, vertex.wrapped)
             for edge_vertex in edge.vertices()
         )
     )
@@ -412,7 +412,7 @@ def _joined_wire(
         match = placed[distances.index(min(distances))]
         if min(distances) > TOLERANCE:
             continue  # pragma: no cover - MakeWire keeps every edge it is given
-        if not match.wrapped.IsSame(source.wrapped):
+        if not kernel.is_same(match.wrapped, source.wrapped):
             history.add_modified(source.wrapped, match.wrapped)
         _record_matching_vertices(history, source.wrapped, match.wrapped)
     return wire._made_by(history)
@@ -4545,7 +4545,7 @@ def topo_explore_connected_edges(
 
     for topods_edge in topods_edges:
         # # Don't match with the given edge
-        if given_topods_edge.IsSame(topods_edge):
+        if kernel.is_same(given_topods_edge, topods_edge):
             continue
         # If the edge shares a vertex with the given edge they are connected
         common_topods_vertex = topo_explore_common_vertex(

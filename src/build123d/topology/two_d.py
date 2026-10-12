@@ -1924,7 +1924,7 @@ class Face(Mixin2D[TopoDS_Face]):
                 vertex
                 for vertex in vertices
                 if any(
-                    wire_vertex.wrapped.IsSame(vertex.wrapped)
+                    kernel.is_same(wire_vertex.wrapped, vertex.wrapped)
                     for wire_vertex in wire.vertices()
                 )
             ]
@@ -2020,7 +2020,7 @@ class Face(Mixin2D[TopoDS_Face]):
                 vertex
                 for vertex in vertices
                 if any(
-                    wire_vertex.wrapped.IsSame(vertex.wrapped)
+                    kernel.is_same(wire_vertex.wrapped, vertex.wrapped)
                     for wire_vertex in wire.vertices()
                 )
             ]

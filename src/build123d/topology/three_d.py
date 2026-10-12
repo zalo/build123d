@@ -1307,7 +1307,9 @@ class Solid(Mixin3D[TopoDS_Solid]):
         # 5: The profile is the extrusion's own base face and survives the
         #    split, so the piece to return is the one that holds it
         for piece in pieces:
-            if any(face.wrapped.IsSame(profile.wrapped) for face in piece.faces()):
+            if any(
+                kernel.is_same(face.wrapped, profile.wrapped) for face in piece.faces()
+            ):
                 return piece
         raise RuntimeError("Extrusion is None")  # None isn't an option here
 
