@@ -5830,7 +5830,17 @@ class SmlibCoreKernel(Kernel):
                     found.append(p)
         return found
 
-    uv_in_face = _unsupported("uv_in_face")
+    def uv_in_face(self, face: SmHandle, uv: tuple[float, float], tolerance: float) -> bool:
+        # the point the parameters give, classified against the face's own
+        # sheet: inside means strictly inside, as OCCT's IN (not on the rim)
+        point = SmSurfaceView(self, face).value(*uv)
+        zone = self.sc.SmZoneTol3d(tolerance)
+        classification = self.sc.SmPointClassification(zone, None)
+        _check(
+            self._sheet_of(face).Point3DClassify(self._vec(point), zone, 1, classification),
+            "point classification",
+        )
+        return classification.GetPointClass() == self.sc.SM_PC_FACE
 
     # ---- the rest of the facade -----------------------------------------------
 
@@ -5954,6 +5964,29 @@ class SmlibCoreKernel(Kernel):
         if best is None:
             return None
         return best[1], best[2]
+    def edge_uv_ends_on_face(
+        self, edge: SmHandle, face: SmHandle
+    ) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+        curve = SmCurveView(self, edge)
+        surface = SmSurfaceView(self, face)
+        ends = []
+        step = 1e-6 * max(1.0, abs(curve.last - curve.first))
+        for t, inward in ((curve.first, step), (curve.last, -step)):
+            here = surface.closest_uv(curve.value(t))
+            ahead = surface.closest_uv(curve.value(t + inward))
+            tangent = ((ahead[0] - here[0]) / step, (ahead[1] - here[1]) / step)
+            ends.append((here, tangent))
+        return ends
+
+    def surface_axis(self, face: SmHandle) -> tuple[str, Point, Point] | None:
+        view = SmSurfaceView(self, face)
+        surface = view.surface
+        if view.geom_type not in ("CYLINDER", "CONE", "SPHERE", "TORUS", "REVOLUTION"):
+            return None
+        if not (hasattr(surface, "GetOrigin") and hasattr(surface, "GetZAxis")):
+            return None
+        return view.geom_type, self._pt(surface.GetOrigin()), _unit(self._pt(surface.GetZAxis()))
+
     def edge_uv_on_face(
         self, edge: SmHandle, face: SmHandle, params: Sequence[float]
     ) -> list[tuple[float, float]]:
@@ -5963,7 +5996,6 @@ class SmlibCoreKernel(Kernel):
 
     def vertex_uv_on_face(self, vertex: SmHandle, face: SmHandle) -> tuple[float, float]:
         return SmSurfaceView(self, face).closest_uv(self.vertex_point(vertex))
-    edge_uv_ends_on_face = _unsupported("edge_uv_ends_on_face")
     def frame_at(
         self, shape: SmHandle, param: float, corrected: bool
     ) -> tuple[Point, Point, Point, Point]:
@@ -6774,7 +6806,6 @@ class SmlibCoreKernel(Kernel):
             abs(_dot([b - a for a, b in zip(origin, p)], axis)) <= tolerance
             for p in points
         )
-    surface_axis = _unsupported("surface_axis")
     half_space = _unsupported("half_space")
     def ruled_surface(self, a: SmHandle, b: SmHandle) -> SmHandle:
         """A face ruled between two edges, or a shell between two wires."""
