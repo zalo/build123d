@@ -2085,12 +2085,13 @@ class SmlibCoreKernel(Kernel):
         elif shape.kind is TopoKind.EDGE:
             view = SmCurveView(self, shape)
             extent = self.sc.SmExtent3d()
-            _check(
-                view.curve.CalculateTightBoundingBox(
-                    self.sc.SmExtent1d(view.first, view.last), extent
-                ),
-                "bounding box",
-            )
+            # the tight box of a trimmed copy: the interval alone is not
+            # always honoured on rational curves
+            status, copy = view.curve.Copy(self.context)
+            _check(status, "curve copy")
+            domain = self.sc.SmExtent1d(view.first, view.last)
+            _check(copy.Trim(domain, 0, 0), "curve trim")
+            _check(copy.CalculateTightBoundingBox(domain, extent), "bounding box")
             boxes.append(
                 tuple(extent.GetMin(i) for i in range(3))
                 + tuple(extent.GetMax(i) for i in range(3))
@@ -3386,11 +3387,14 @@ class SmlibCoreKernel(Kernel):
         )
         return self.loft([base, top], True, True)
 
-    def _loop_curves(self, wire: SmHandle) -> list[Any]:
+    def _loop_curves(
+        self, wire: SmHandle, cuts: dict[int, list[float]] | None = None
+    ) -> list[Any]:
         """Copies of the curves of a wire's edges, trimmed to the edges and
-        running the wire's way, for the kernel to consume."""
+        running the wire's way, for the kernel to consume. ``cuts`` maps an
+        edge's index to parameters (of its curve) to split it at."""
         curves = []
-        for edge in wire.members:
+        for k, edge in enumerate(wire.members):
             if edge.entity is not None:
                 curve = edge.entity.GetCurve()
                 interval = edge.entity.GetInterval()
@@ -3399,18 +3403,149 @@ class SmlibCoreKernel(Kernel):
                 curve = edge.curve
                 assert edge.interval is not None
                 t0, t1 = edge.interval
-            status, copy = curve.Copy(self.context)
-            _check(status, "curve copy")
-            domain = self.sc.SmExtent1d(t0, t1)
-            _check(copy.Trim(domain, 0, 0), "curve trim")
+            inner = sorted(t for t in (cuts or {}).get(k, []) if t0 < t < t1)
+            bounds = [t0, *inner, t1]
+            pieces = list(zip(bounds, bounds[1:]))
             if edge.flip:
-                reversed_domain = self.sc.SmExtent1d()
-                _check(
-                    copy.ReverseParameterization(domain, reversed_domain),
-                    "curve reverse",
-                )
-            curves.append(copy)
+                pieces.reverse()
+            for a, b in pieces:
+                status, copy = curve.Copy(self.context)
+                _check(status, "curve copy")
+                domain = self.sc.SmExtent1d(a, b)
+                _check(copy.Trim(domain, 0, 0), "curve trim")
+                if edge.flip:
+                    reversed_domain = self.sc.SmExtent1d()
+                    _check(
+                        copy.ReverseParameterization(domain, reversed_domain),
+                        "curve reverse",
+                    )
+                curves.append(copy)
         return curves
+
+    def _compatible_loop_curves(self, wires: Sequence[SmHandle]) -> list[list[Any]]:
+        """The curves of each loop, split so that every loop has an edge
+        ending at the same fractions of its length, closed loops first turned
+        to begin where they twist least against the first loop (what OCCT's
+        compatible wires do before a loft)."""
+        wires = list(wires)
+        closed = all(self.is_closed(w) for w in wires)
+        marks_of: list[list[float]] = []
+        lengths_of: list[list[float]] = []
+
+        def measure(k: int) -> None:
+            own = [SmCurveView(self, e).length() for e in wires[k].members]
+            total = sum(own) or 1.0
+            acc, marks = 0.0, []
+            for length in own:
+                marks.append(acc / total)
+                acc += length
+            marks_of[k:k + 1] = [marks]
+            lengths_of[k:k + 1] = [own]
+
+        for k in range(len(wires)):
+            measure(k)
+
+        def point_at(k: int, fraction: float) -> Point:
+            wire, marks, own = wires[k], marks_of[k], lengths_of[k]
+            fraction %= 1.0
+            total = sum(own) or 1.0
+            index = max(i for i, m in enumerate(marks) if m <= fraction + 1e-12)
+            edge = wire.members[index]
+            view = SmCurveView(self, edge)
+            distance = (fraction - marks[index]) * total
+            if edge.flip:
+                distance = own[index] - distance
+            return view.value(view.param_at_length(distance))
+
+        def turned(k: int) -> None:
+            wires[k] = SmHandle(
+                TopoKind.WIRE,
+                members=[e.with_flip(not e.flip) for e in reversed(wires[k].members)],
+            )
+            measure(k)
+
+        def winding(k: int) -> tuple[Point, Point]:
+            """Newell normal of the loop the way it runs, and its centre."""
+            pts = [point_at(k, i / 32) for i in range(32)]
+            nx = ny = nz = 0.0
+            for a, b in zip(pts, pts[1:] + pts[:1]):
+                nx += (a[1] - b[1]) * (a[2] + b[2])
+                ny += (a[2] - b[2]) * (a[0] + b[0])
+                nz += (a[0] - b[0]) * (a[1] + b[1])
+            centre = tuple(sum(p[i] for p in pts) / 32 for i in range(3))
+            return (nx, ny, nz), centre  # type: ignore[return-value]
+
+        if closed and len(wires) > 1:
+            # every loop runs counter-clockwise about the way the loft goes,
+            # so that the faces ruled between them face outwards
+            normal_0, centre_0 = winding(0)
+            _, centre_1 = winding(1)
+            towards = [b - a for a, b in zip(centre_0, centre_1)]
+            if _dot(normal_0, towards) < 0:
+                turned(0)
+                normal_0, _ = winding(0)
+            for k in range(1, len(wires)):
+                normal_k, _ = winding(k)
+                if _dot(normal_0, normal_k) < 0:
+                    turned(k)
+
+        # where each closed loop should begin: the turn that keeps it nearest
+        # the first loop point for point
+        offsets = [0.0]
+        samples = [i / 32 for i in range(32)]
+        reference = [point_at(0, u) for u in samples]
+        for k in range(1, len(wires)):
+            if not closed:
+                offsets.append(0.0)
+                continue
+            candidates = sorted({*marks_of[k], *(i / 64 for i in range(64))})
+            best, best_cost = 0.0, math.inf
+            for offset in candidates:
+                cost = sum(
+                    math.dist(r, point_at(k, u + offset)) ** 2
+                    for r, u in zip(reference, samples)
+                )
+                if cost < best_cost:
+                    best, best_cost = offset, cost
+            offsets.append(best)
+
+        # every vertex of every loop, as a fraction of the first loop
+        union: list[float] = []
+        for marks, offset in zip(marks_of, offsets):
+            for v in marks:
+                f = (v - offset) % 1.0
+                if f > 1 - 1e-6:
+                    f = 0.0
+                if all(abs(f - u) > 1e-6 for u in union):
+                    union.append(f)
+        union.sort()
+        result = []
+        for k, wire in enumerate(wires):
+            marks, own, offset = marks_of[k], lengths_of[k], offsets[k]
+            total = sum(own) or 1.0
+            wanted = sorted(((u + offset) % 1.0) for u in union)
+            wanted = [0.0 if w > 1 - 1e-6 else w for w in wanted]
+            cuts: dict[int, list[float]] = {}
+            spans = list(zip(marks, marks[1:] + [1.0]))
+            for i, (edge, (f0, f1)) in enumerate(zip(wire.members, spans)):
+                inside = [w for w in wanted if f0 + 1e-6 < w < f1 - 1e-6]
+                if not inside:
+                    continue
+                view = SmCurveView(self, edge)
+                params = []
+                for w in inside:
+                    distance = (w - f0) * total  # from the edge's oriented start
+                    if edge.flip:
+                        distance = own[i] - distance
+                    params.append(view.param_at_length(distance))
+                cuts[i] = params
+            pieces = self._loop_curves(wire, cuts)
+            # the pieces begin at the sorted fractions; start at the offset
+            begins = sorted(set(marks) | {w for w in wanted})
+            begins = [b for b in begins if all(abs(b - o) > 1e-6 for o in begins[:begins.index(b)])]
+            first = min(range(len(begins)), key=lambda i: min(abs(begins[i] - offset), abs(begins[i] - offset + 1), abs(begins[i] - offset - 1)))
+            result.append(pieces[first:] + pieces[:first])
+        return result
 
     def extrude(self, shape: SmHandle, direction: Point) -> SmHandle:
         distance = math.sqrt(sum(c * c for c in direction))
@@ -3537,16 +3672,58 @@ class SmlibCoreKernel(Kernel):
         kinds = [section.kind for section in sections]
         if TopoKind.VERTEX in kinds:
             return self._loft_to_points(sections, solid, ruled)
-        counts, curves = [], []
-        for section in sections:
-            loop = self._loop_curves(self._as_wire(section))
-            counts.append(len(loop))
-            curves.extend(loop)
+        wires = [self._as_wire(section) for section in sections]
+        loops = [self._loop_curves(wire) for wire in wires]
+        if len({len(loop) for loop in loops}) > 1:
+            # sections with different numbers of edges: split them alike
+            # (OCCT's compatible wires) and loft edge by edge, as the skin
+            # primitive would still twist between them
+            return self._loft_edgewise(
+                self._compatible_loop_curves(wires), wires, solid, ruled
+            )
+        counts = [len(loop) for loop in loops]
+        curves = [c for loop in loops for c in loop]
         return self._primitive(
             lambda c: c.CreateSkinPrimitive(
                 counts, curves, 0.0, 1 if ruled else 3, 1 if solid else 0, [], [], []
             )
         )
+
+    def _loft_edgewise(
+        self,
+        loops: Sequence[Sequence[Any]],
+        wires: Sequence[SmHandle],
+        solid: bool,
+        ruled: bool,
+    ) -> SmHandle:
+        """A loft as one surface per edge position across the sections
+        (ruled between neighbours, or skinned through all), capped and sewn."""
+        faces: list[SmHandle] = []
+        for j in range(len(loops[0])):
+            column = [self._as_nurbs(loop[j]) for loop in loops]
+            if ruled or len(column) == 2:
+                for a, b in zip(column, column[1:]):
+                    status, surface = self.sc.SmBSplineSurface.CreateRuledSurface(
+                        self.context, a, b, self.sc.SM_SP_V
+                    )
+                    _check(status, "ruled surface")
+                    faces.append(self._face_on_surface(surface))
+            else:
+                status, surface = self.sc.SmBSplineSurface.CreateSkinnedSurface(
+                    self.context, column, False, self.sc.SM_SP_V, _TOLERANCE
+                )
+                _check(status, "skinned surface")
+                faces.append(self._face_on_surface(surface))
+        if solid:
+            for wire in (wires[0], wires[-1]):
+                if self.is_closed(wire):
+                    faces.append(self.make_planar_face(wire, []))
+        _, record = self.sew(faces)
+        result = record.result
+        assert result is not None
+        if solid and result.kind is TopoKind.SHELL:
+            return self.solid_from_shell(result)
+        return result
 
     @staticmethod
     def _as_wire(section: SmHandle) -> SmHandle:
@@ -3581,11 +3758,11 @@ class SmlibCoreKernel(Kernel):
         faces: list[SmHandle] = []
         wires = [self._as_wire(s) for s in sections if s.kind is not TopoKind.VERTEX]
         if len(wires) > 1:
-            counts, curves = [], []
-            for wire in wires:
-                loop = self._loop_curves(wire)
-                counts.append(len(loop))
-                curves.extend(loop)
+            loops = [self._loop_curves(wire) for wire in wires]
+            if len({len(loop) for loop in loops}) > 1:
+                loops = self._compatible_loop_curves(wires)
+            counts = [len(loop) for loop in loops]
+            curves = [c for loop in loops for c in loop]
             skin = self._primitive(
                 lambda c: c.CreateSkinPrimitive(
                     counts, curves, 0.0, 1 if ruled else 3, 0, [], [], []
@@ -3614,12 +3791,21 @@ class SmlibCoreKernel(Kernel):
         _check(status, "knots")
         points = [(p.x, p.y, p.z) for p in poles]
         rational = bool(curve.IsRational()) and len(weights) == len(points)
-        return self._nurbs(
-            points,
-            [float(k) for k in knots],
-            int(curve.GetDegree()),
-            [float(w) for w in weights] if rational else None,
-        )
+        knots = [float(k) for k in knots]
+        weights = [float(w) for w in weights] if rational else None
+        # a curve whose parameterization was reversed keeps its control
+        # polygon the old way round: the rebuilt one must run as the curve does
+        domain = curve.GetNaturalInterval()
+        probe = self.sc.SmVector3d()
+        _check(curve.EvaluatePoint(domain.GetMin(), probe), "curve evaluation")
+        start = (probe.x, probe.y, probe.z)
+        if math.dist(start, points[-1]) < math.dist(start, points[0]):
+            points.reverse()
+            if weights:
+                weights.reverse()
+            low, high = knots[0], knots[-1]
+            knots = [low + high - k for k in reversed(knots)]
+        return self._nurbs(points, knots, int(curve.GetDegree()), weights)
 
     def _joined_curve(self, wire: SmHandle) -> Any:
         """One NURBS curve running along a wire."""
@@ -5516,7 +5702,17 @@ class SmlibCoreKernel(Kernel):
             counter_clockwise = (twice_area > 0) != runs_backwards
             signed = distance if counter_clockwise else -distance
             run = self._offset_run(edges, normal, signed, join, True)
-            return SmHandle(TopoKind.WIRE, members=run) if run else None
+            if not run:
+                return None
+            loops = self._pruned_offset_loops(run, edges, abs(distance))
+            if not loops:
+                return None
+            if len(loops) == 1:
+                return SmHandle(TopoKind.WIRE, members=loops[0])
+            return SmHandle(
+                TopoKind.COMPOUND,
+                members=[SmHandle(TopoKind.WIRE, members=loop) for loop in loops],
+            )
         right = self._offset_run(edges, normal, abs(distance), join, False)
         backwards = [e.with_flip(not e.flip) for e in reversed(edges)]
         left = self._offset_run(backwards, normal, abs(distance), join, False)
@@ -5556,7 +5752,92 @@ class SmlibCoreKernel(Kernel):
                     p_start,
                 )
             )
-        return SmHandle(TopoKind.WIRE, members=loop) if loop else None
+        if not loop:
+            return None
+        loops = self._pruned_offset_loops(loop, edges, abs(distance))
+        if not loops:
+            return None
+        if len(loops) == 1:
+            return SmHandle(TopoKind.WIRE, members=loops[0])
+        return SmHandle(
+            TopoKind.COMPOUND,
+            members=[SmHandle(TopoKind.WIRE, members=l) for l in loops],
+        )
+
+    def _pruned_offset_loops(
+        self, run: list[SmHandle], original: Sequence[SmHandle], distance: float
+    ) -> list[list[SmHandle]]:
+        """The closed loops of a raw offset with the parts that came closer
+        to the original wire than the offset distance cut away (where the
+        offset crossed itself, as at the end of a collapsing arm). A raw
+        loop that does not cross itself is returned as it is."""
+        views = [SmCurveView(self, e) for e in run]
+        boxes = []
+        for view in views:
+            pts = view.samples(9)
+            lo = tuple(min(p[i] for p in pts) for i in range(3))
+            hi = tuple(max(p[i] for p in pts) for i in range(3))
+            boxes.append((lo, hi))
+
+        def overlap(a: int, b: int) -> bool:
+            (alo, ahi), (blo, bhi) = boxes[a], boxes[b]
+            return all(alo[i] - _TOLERANCE <= bhi[i] and blo[i] - _TOLERANCE <= ahi[i] for i in range(3))
+
+        n = len(run)
+        cuts: dict[int, list[float]] = {}
+        for a in range(n):
+            for b in range(a + 1, n):
+                if not overlap(a, b):
+                    continue
+                neighbours = b == a + 1 or (a == 0 and b == n - 1)
+                va, vb = views[a], views[b]
+                points = self._crossings(
+                    va.curve,
+                    self.sc.SmExtent1d(va.first, va.last),
+                    ("curve", (vb.curve, self.sc.SmExtent1d(vb.first, vb.last))),
+                )
+                for point in points:
+                    if neighbours:
+                        _, end_a, _, _ = self._oriented_ends(run[a])
+                        start_b, _, _, _ = self._oriented_ends(run[b])
+                        joint = start_b if b == a + 1 else end_a
+                        if b == a + 1 and math.dist(point, end_a) <= 10 * _TOLERANCE:
+                            continue
+                        if b != a + 1 and math.dist(point, self._oriented_ends(run[b])[1]) <= 10 * _TOLERANCE:
+                            continue
+                    for k, view in ((a, va), (b, vb)):
+                        t, _ = view.drop_point(point)
+                        if view.first + _TOLERANCE < t < view.last - _TOLERANCE:
+                            cuts.setdefault(k, []).append(t)
+        if not cuts:
+            return [run]
+        pieces: list[SmHandle] = []
+        for k, edge in enumerate(run):
+            view = views[k]
+            bounds = [view.first, *sorted(set(cuts.get(k, []))), view.last]
+            spans = list(zip(bounds, bounds[1:]))
+            if edge.flip:
+                spans.reverse()
+            for t0, t1 in spans:
+                if t1 - t0 <= _TOLERANCE:
+                    continue
+                if edge.entity is None:
+                    pieces.append(self._free_edge(edge.curve, t0, t1, edge.flip))
+                else:
+                    pieces.append(self._free_edge(view.curve, t0, t1, edge.flip))
+        originals = [SmCurveView(self, e) for e in original]
+        kept = []
+        for piece in pieces:
+            view = SmCurveView(self, piece)
+            middle = view.value(0.5 * (view.first + view.last))
+            nearest = min(v.drop_point(middle)[1] for v in originals)
+            if nearest >= distance - 1e-6 * max(1.0, distance):
+                kept.append(piece)
+        loops = []
+        for wire in self.connect_edges_to_wires(kept, 10 * _TOLERANCE):
+            if self.is_closed(wire):
+                loops.append(list(wire.members))
+        return loops
 
     def _end_cap(self, before: SmHandle, after: SmHandle, centre: Point, radius: float) -> SmHandle:
         """The half circle about an end of an open wire from one side's offset to the other's."""
