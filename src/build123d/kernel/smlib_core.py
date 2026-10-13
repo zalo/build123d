@@ -5777,9 +5777,21 @@ class SmlibCoreKernel(Kernel):
         old = self.sc.SmExtent1d(view.first, view.last)
         new = self.sc.SmExtent1d()
         _check(curve.ReverseParameterization(old, new), "curve reverse")
-        # the kernel turns the curve round over its whole domain (and hands
-        # back the old interval): the edge's part of it moves accordingly
-        return self._free_edge(curve, low + high - view.last, low + high - view.first)
+        # the kernel turns some curves round over their whole domain and
+        # others over the interval given: the edge's part is whichever
+        # interval now begins where the edge ended
+        end = view.value(view.last)
+        candidates = (
+            (new.GetMin(), new.GetMax()),
+            (low + high - view.last, low + high - view.first),
+        )
+        probe = self.sc.SmVector3d()
+        for first, last in candidates:
+            if curve.EvaluatePoint(first, probe) == SM_SUCCESS and math.dist(
+                (probe.x, probe.y, probe.z), end
+            ) <= 10 * _TOLERANCE:
+                return self._free_edge(curve, first, last)
+        return self._free_edge(curve, *candidates[0])
 
     def trim_edge(self, edge: SmHandle, start: float, end: float) -> SmHandle:
         view = SmCurveView(self, edge)
