@@ -73,7 +73,7 @@ from build123d.kernel.base import (
 
 SM_SUCCESS = 1000
 _TOLERANCE = 1e-6
-_MASS_ACCURACY = 1e-4
+_MASS_ACCURACY = 1e-8  # ~1e-5 relative on spheres, well inside the test tolerances
 _INFINITE = 1e4  # half-size standing in for OCCT's unbounded lines and planes
 _HYPERBOLA_SPAN = 20.0  # parameter span standing in for a full hyperbola
 _HUGE = 1e300  # "best answer so far" that never prunes a solver
@@ -583,6 +583,35 @@ class SmlibCoreKernel(Kernel):
         kind = TopoKind.SOLID if brep.IsManifoldSolid() else TopoKind.SHELL
         return SmHandle(kind, brep)
 
+    def _lumps(self, brep: Any) -> list[Any]:
+        """The separate solid bodies of a brep, each copied into its own brep
+        when there are several; the brep itself when there is one."""
+        solid_shells = [
+            shell
+            for shell in brep.GetShells([])
+            if shell.GetRegion() != brep.GetInfiniteRegion()
+        ]
+        if len(solid_shells) <= 1:
+            return [brep]
+        lumps = []
+        for shell in solid_shells:
+            faces = list(
+                {fu.GetFace().address: fu.GetFace() for fu in shell.GetFaceuses([])}.values()
+            )
+            lump = self._new_brep()
+            _check(brep.CopyFaces(faces, lump, None, 1, None), "lump copy")
+            lumps.append(lump)
+        return lumps
+
+    def _bodies_handle(self, brep: Any) -> SmHandle:
+        """A solid, or a compound of solids when a brep holds several bodies."""
+        lumps = self._lumps(brep)
+        if len(lumps) == 1:
+            return self._solid_handle(brep)
+        return SmHandle(
+            TopoKind.COMPOUND, members=[self._solid_handle(l) for l in lumps]
+        )
+
     def _copy_body(self, brep: Any) -> tuple[Any, Any]:
         """A copy of ``brep`` and the map from its entities to the copy's."""
         forward = self.sc.SmCopyBrepMap()
@@ -691,8 +720,9 @@ class SmlibCoreKernel(Kernel):
     def is_same(self, a: SmHandle, b: SmHandle) -> bool:
         if a.key() == b.key():
             return True
-        if a.point is not None and b.point is not None:  # free vertices: by position
-            return math.dist(a.point, b.point) < _TOLERANCE
+        if a.kind is b.kind is TopoKind.VERTEX and (a.entity is None or b.entity is None):
+            # a free vertex is the same as any vertex at its place
+            return math.dist(self.vertex_point(a), self.vertex_point(b)) < _TOLERANCE
         return False
 
     def is_equal(self, a: SmHandle, b: SmHandle) -> bool:
@@ -757,7 +787,11 @@ class SmlibCoreKernel(Kernel):
     def sub_shapes(self, shape: SmHandle, kind: TopoKind) -> list[SmHandle]:
         found: dict[Hashable, SmHandle] = {}
         for item in self.sub_shape_uses(shape, kind):
-            found.setdefault(item.key(), item)
+            key = item.key()
+            if kind is TopoKind.VERTEX and shape.kind in (TopoKind.WIRE, TopoKind.COMPOUND):
+                # the vertices of chained edges of mixed origin meet by position
+                key = _point_key(self.vertex_point(item))
+            found.setdefault(key, item)
         return list(found.values())
 
     def sub_shape_uses(self, shape: SmHandle, kind: TopoKind) -> list[SmHandle]:
@@ -1176,10 +1210,30 @@ class SmlibCoreKernel(Kernel):
         }
         if op is BoolOp.SPLIT:
             return self._split(args, tools)
+        if op is BoolOp.SECTION and all(self._is_one_dimensional(a) for a in args):
+            return self._section_points(args, tools), _Record()
+        if op is BoolOp.SECTION and all(self._is_one_dimensional(t) for t in tools):
+            return self._section_points(tools, args), _Record()
         if op not in ops:
             raise NotImplementedError(f"smlib: boolean {op.value}")
         record = _Record()
+        if (
+            op is BoolOp.COMMON
+            and all(self._is_one_dimensional(a) for a in args)
+            and not any(self._is_one_dimensional(t) for t in tools)
+        ):
+            return self._edges_inside(args, tools), record
+        if (
+            op is BoolOp.COMMON
+            and all(self._is_one_dimensional(t) for t in tools)
+            and not any(self._is_one_dimensional(a) for a in args)
+        ):
+            return self._edges_inside(tools, args), record
         if all(self._is_one_dimensional(s) for s in (*args, *tools)):
+            if op is BoolOp.COMMON:
+                # overlaps of edges along their length are not found; the
+                # crossings come from the section
+                return SmHandle(TopoKind.COMPOUND), record
             if op is not BoolOp.FUSE:
                 raise NotImplementedError(f"smlib: {op.value} of edges and wires")
             # the edges are kept as they are (no splitting at crossings)
@@ -1204,7 +1258,7 @@ class SmlibCoreKernel(Kernel):
         for body in tool_bodies:
             result = self._merge(result, body, ops[op])
         self._finish_record(record, result)
-        return self._solid_handle(result), record
+        return self._bodies_handle(result), record
 
     def _split(
         self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
@@ -1212,6 +1266,10 @@ class SmlibCoreKernel(Kernel):
         """Split bodies by planar tools: each side of a tool's plane is kept
         as the part of the body inside a large box on that side."""
         record = _Record()
+        if all(a.kind is TopoKind.EDGE for a in args) and all(
+            t.kind is TopoKind.VERTEX for t in tools
+        ):
+            return self._split_edges_at_points(args, tools), record
         pieces: list[SmHandle] = [
             SmHandle(b.kind, b.entity, partner=b.partner) for a in args for b in self._bodies(a)
         ]
@@ -1243,11 +1301,116 @@ class SmlibCoreKernel(Kernel):
                         continue
                     for key, became in part_record.modified.items():
                         record.modified.setdefault(key, []).extend(became)
-                    next_pieces.append(part)
+                    next_pieces.extend(
+                        part.members if part.kind is TopoKind.COMPOUND else [part]
+                    )
             pieces = next_pieces
         if len(pieces) == 1:
             return pieces[0], record
         return SmHandle(TopoKind.COMPOUND, members=pieces), record
+
+    def _crossings(self, curve: Any, interval: Any, other: tuple[str, Any]) -> list[Point]:
+        """Where a curve meets another curve, a sheet or a body."""
+        sc = self.sc
+        solutions = sc.SmSolutionArray()
+        if other[0] == "curve":
+            other_curve, other_interval = other[1]
+            # the intersector, unlike the general solver, finds crossings at
+            # the seam of a closed curve
+            _check(
+                curve.GlobalCurveIntersect(
+                    interval, other_curve, other_interval, _TOLERANCE, solutions, 0
+                ),
+                "curve crossing",
+            )
+        elif other[0] == "body":
+            _check(
+                sc.SmTopologySolver.BrepCurveSolve(
+                    other[1], curve, interval, sc.SM_SO_INTERSECT, sc.SM_SR_ALL,
+                    _TOLERANCE, _HUGE, None, solutions,
+                ),
+                "curve to body crossing",
+            )
+        elif other[0] == "point":
+            solutions = None
+            view_point = other[1]
+            drop = curve.DropPoint(interval, self._vec(view_point), None, _TOLERANCE, None)
+            return [view_point] if drop[0] == SM_SUCCESS and drop[-1] <= _TOLERANCE else []
+        else:
+            raise NotImplementedError("smlib: section with a face of a body")
+        return [found[1] for found in self._solutions(solutions, 1)]
+
+    def _section_points(
+        self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
+    ) -> SmHandle:
+        """The vertices where edges and wires cross the tools."""
+        points: dict[tuple[Any, ...], Point] = {}
+        for arg in args:
+            for kind, data in self._atoms(arg):
+                if kind != "curve":
+                    continue
+                curve, interval = data
+                for tool in tools:
+                    for other in self._atoms(tool):
+                        for point in self._crossings(curve, interval, other):
+                            points.setdefault(_point_key(point), point)
+        return SmHandle(
+            TopoKind.COMPOUND,
+            members=[self.make_vertex(p) for p in points.values()],
+        )
+
+    def _edges_inside(
+        self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
+    ) -> SmHandle:
+        """The parts of edges that lie inside the solids: the edges are cut
+        where they cross the solids' faces and the pieces inside are kept."""
+        bodies = [b for t in tools for b in self._bodies(t)]
+        pieces = []
+        for arg in args:
+            for edge in self.sub_shapes(arg, TopoKind.EDGE):
+                view = SmCurveView(self, edge)
+                interval = self.sc.SmExtent1d(view.first, view.last)
+                cuts = set()
+                for body in bodies:
+                    for point in self._crossings(view.curve, interval, ("body", body.entity)):
+                        param, distance = view.drop_point(point)
+                        if distance <= _TOLERANCE:
+                            cuts.add(round(param, 9))
+                bounds = sorted({view.first, view.last, *cuts})
+                for t0, t1 in zip(bounds, bounds[1:]):
+                    if t1 - t0 <= _TOLERANCE:
+                        continue
+                    middle = view.value((t0 + t1) / 2)
+                    if any(self.point_in_solid(b, middle, _TOLERANCE) for b in bodies):
+                        piece = self.trim_edge(edge, t0, t1)
+                        piece.flip = edge.flip
+                        pieces.append(piece)
+        return SmHandle(TopoKind.COMPOUND, members=pieces)
+
+    def _split_edges_at_points(
+        self, edges: Sequence[SmHandle], vertices: Sequence[SmHandle]
+    ) -> SmHandle:
+        """Edges cut at the vertices that lie on them."""
+        pieces = []
+        for edge in edges:
+            view = SmCurveView(self, edge)
+            cuts = sorted(
+                param
+                for param, distance in (
+                    view.drop_point(self.vertex_point(v)) for v in vertices
+                )
+                if distance <= _TOLERANCE
+                and view.first + _TOLERANCE < param < view.last - _TOLERANCE
+            )
+            bounds = [view.first, *cuts, view.last]
+            if len(bounds) == 2:
+                pieces.append(edge)
+                continue
+            for t0, t1 in zip(bounds, bounds[1:]):
+                piece = self.trim_edge(edge, t0, t1)
+                piece.flip = edge.flip
+                pieces.append(piece)
+        return SmHandle(TopoKind.COMPOUND, members=pieces)
 
     def _merge(self, a: Any, b: Any, op: Any) -> Any:
         merge = self.sc.SmMerge(self.context, a, b, 0.0, 0.0, None)
@@ -2071,7 +2234,12 @@ class SmlibCoreKernel(Kernel):
         ]
         if not edges:
             return None, WireStatus.EMPTY
-        return SmHandle(TopoKind.WIRE, members=edges), WireStatus.OK
+        # like OCCT's wire builder, the edges are chained end to end whatever
+        # order and way round they were given in
+        chained = self.connect_edges_to_wires(edges, _TOLERANCE)
+        if len(chained) != 1:
+            return None, WireStatus.DISCONNECTED
+        return chained[0], WireStatus.OK
 
     def make_wire_placed(
         self, edges: Sequence[SmHandle]

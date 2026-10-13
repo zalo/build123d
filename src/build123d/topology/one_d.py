@@ -57,7 +57,7 @@ from bisect import bisect_right
 from collections.abc import Hashable, Iterable, Sequence
 from dataclasses import dataclass
 from itertools import combinations
-from math import atan2, ceil, copysign, floor, inf, isclose, pi, radians
+from math import acos, atan2, ceil, copysign, floor, inf, isclose, pi, radians, sin, tan
 from typing import TYPE_CHECKING, ClassVar
 from typing import cast as tcast
 from typing import overload
@@ -437,6 +437,59 @@ def _record_matching_vertices(
                 break
 
 
+def _solve_wire_fillet_corner_lines(
+    corner: _WireFilletCorner, radius: float
+) -> _WireFilletSolution | None:
+    """Fillet a corner of two straight edges by construction: the arc centre
+    lies on the bisector, ``radius / sin(half angle)`` from the corner."""
+    edge0, edge1 = corner.connected_edges
+    if edge0.geom_type != GeomType.LINE or edge1.geom_type != GeomType.LINE:
+        return None
+    corner_point = Vector(corner.vertex)
+    far = []
+    for edge in corner.connected_edges:
+        other = [v for v in edge.vertices() if not v.is_same(corner.vertex)]
+        if not other:
+            return None
+        far.append(Vector(other[0]))
+    dir0 = (far[0] - corner_point).normalized()
+    dir1 = (far[1] - corner_point).normalized()
+    cosine = max(-1.0, min(1.0, dir0.dot(dir1)))
+    half = acos(cosine) / 2
+    if half < 1e-9 or abs(half - pi / 2) < 1e-9:  # folded back or straight
+        return None
+    tangent_length = radius / tan(half)
+    reach = min((far[0] - corner_point).length, (far[1] - corner_point).length)
+    if tangent_length > reach + TOLERANCE:
+        return None
+    touch0 = corner_point + dir0 * tangent_length
+    touch1 = corner_point + dir1 * tangent_length
+    centre = corner_point + (dir0 + dir1).normalized() * (radius / sin(half))
+    midway = centre + (((touch0 + touch1) / 2) - centre).normalized() * radius
+    fillet_arc = Edge.make_three_point_arc(touch0, midway, touch1)
+    trimmed_topods_edges = []
+    for edge, touch in zip(corner.connected_edges, (touch0, touch1)):
+        other_vertex = [v for v in edge.vertices() if not v.is_same(corner.vertex)][0]
+        split_vertex = Vertex(kernel.make_vertex(tuple(touch)))
+        split_edges = _split_edge_at_vertex(copy.deepcopy(edge), split_vertex)
+        edge_result = next(
+            (
+                e
+                for e in split_edges
+                if _topods_edge_contains_vertex(e, other_vertex.wrapped)
+                and not _topods_edge_contains_vertex(e, corner.vertex.wrapped)
+            ),
+            None,
+        )
+        if edge_result is None:
+            return None
+        trimmed_topods_edges.append(edge_result)
+    return _WireFilletSolution(
+        trimmed_topods_edges=trimmed_topods_edges,
+        fillet_topods_edge=fillet_arc.wrapped,  # pylint: disable=no-member
+    )
+
+
 def _fillet_wire_corner(wire: Wire, vertex: Vertex, radius: float) -> Wire:
     """Fillet a single planar wire corner with the available 2D fillet solvers."""
 
@@ -445,7 +498,11 @@ def _fillet_wire_corner(wire: Wire, vertex: Vertex, radius: float) -> Wire:
         return wire
 
     vertex_label = str(vertex)
-    solution = _solve_wire_fillet_corner_geom2dgcc_circ2d2tanrad(corner, radius)
+    solution = None
+    if kernel.name != "occt":  # the constrained 2D solver below is OCCT's
+        solution = _solve_wire_fillet_corner_lines(corner, radius)
+    if solution is None:
+        solution = _solve_wire_fillet_corner_geom2dgcc_circ2d2tanrad(corner, radius)
 
     if solution is not None:
         new_wire = _splice_wire_fillet_corner(corner, solution)
