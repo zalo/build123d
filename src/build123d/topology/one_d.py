@@ -3992,8 +3992,12 @@ class Wire(Mixin1D[TopoDS_Wire]):
 
         reference_edge = edge
 
-        # Create a face to chamfer
-        unchamfered_face = _make_topods_face_from_wires(self.wrapped)
+        # Create a face to chamfer; a kernel other than OCCT cannot build a
+        # face on an open wire and chamfers the wire itself
+        if kernel.name != "occt" and not self.is_closed:
+            unchamfered_face = self.wrapped
+        else:
+            unchamfered_face = _make_topods_face_from_wires(self.wrapped)
 
         vertex_edge_map = kernel.ancestors(
             unchamfered_face, TopoKind.VERTEX, TopoKind.EDGE
@@ -4018,10 +4022,13 @@ class Wire(Mixin1D[TopoDS_Wire]):
         chamfered_face, chamfer_builder = kernel.chamfer_2d(unchamfered_face, corners)
         # Fix the shape
         chamfered_face = kernel.fix(chamfered_face)
-        if not kernel.is_kind(chamfered_face, TopoKind.FACE):
+        if kernel.is_kind(chamfered_face, TopoKind.WIRE):
+            result = Wire(chamfered_face)  # an open wire chamfered as it is
+        elif not kernel.is_kind(chamfered_face, TopoKind.FACE):
             raise RuntimeError("An internal error occured creating the chamfer")
-        # Return the outer wire
-        result = Wire(kernel.outer_wire(chamfered_face))
+        else:
+            # Return the outer wire
+            result = Wire(kernel.outer_wire(chamfered_face))
         return result._made_by(
             ShapeHistory.from_algorithm(chamfer_builder, [self.wrapped], result.wrapped)
         )

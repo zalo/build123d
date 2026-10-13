@@ -145,6 +145,7 @@ def _check(result: Any, what: str) -> Any:
 
 
 _partner_ids = itertools.count(1)
+_DROPPED = object()  # marks an offset edge used up at a corner
 
 
 class SmHandle:
@@ -1209,6 +1210,12 @@ class SmlibCoreKernel(Kernel):
             inner = self._tracked_copy(bodies[0], record)
             record.modified[shape.key()] = record.modified[bodies[0].key()]
             return inner
+        if shape.kind is TopoKind.FACE:
+            # a face is worked on through its sheet body
+            sheet = SmHandle(TopoKind.SHELL, shape.entity.GetBrep(), partner=shape.partner)
+            inner = self._tracked_copy(sheet, record)
+            record.modified[shape.key()] = record.modified.get(shape.key(), record.modified[sheet.key()])
+            return inner
         copy, forward = self._copy_body(shape.entity)
         for kind in (TopoKind.VERTEX, TopoKind.EDGE, TopoKind.FACE):
             for sub in self.sub_shapes(shape, kind):
@@ -1714,7 +1721,44 @@ class SmlibCoreKernel(Kernel):
             lambda c: c.CreateTorus(major_radius, minor_radius, 0.0, degrees, placement)
         )
 
-    make_wedge = _unsupported("make_wedge")
+    def make_wedge(
+        self,
+        frame: Any,
+        delta_x: float,
+        delta_y: float,
+        delta_z: float,
+        min_x: float,
+        min_z: float,
+        max_x: float,
+        max_z: float,
+    ) -> SmHandle:
+        """A wedge as a ruled loft from its base rectangle to its top one."""
+        origin, x_dir, y_dir, z_dir = (
+            frame.Location(), frame.XDirection(), frame.YDirection(), frame.Direction()
+        )
+
+        def at(x: float, y: float, z: float) -> Point:
+            return (
+                origin.X() + x * x_dir.X() + y * y_dir.X() + z * z_dir.X(),
+                origin.Y() + x * x_dir.Y() + y * y_dir.Y() + z * z_dir.Y(),
+                origin.Z() + x * x_dir.Z() + y * y_dir.Z() + z * z_dir.Z(),
+            )
+
+        if max_x - min_x <= _TOLERANCE or max_z - min_z <= _TOLERANCE:
+            raise NotImplementedError("smlib: wedges tapering to an edge or a point")
+        base = self.make_polygon(
+            [at(0, 0, 0), at(delta_x, 0, 0), at(delta_x, 0, delta_z), at(0, 0, delta_z), at(0, 0, 0)]
+        )
+        top = self.make_polygon(
+            [
+                at(min_x, delta_y, min_z),
+                at(max_x, delta_y, min_z),
+                at(max_x, delta_y, max_z),
+                at(min_x, delta_y, max_z),
+                at(min_x, delta_y, min_z),
+            ]
+        )
+        return self.loft([base, top], True, True)
 
     def _loop_curves(self, wire: SmHandle) -> list[Any]:
         """Copies of the curves of a wire's edges, trimmed to the edges and
@@ -2275,7 +2319,27 @@ class SmlibCoreKernel(Kernel):
         scale: bool = True,
     ) -> SmHandle:
         if point_tangents is not None and any(t is not None for t in point_tangents):
-            raise NotImplementedError("smlib: interpolation with tangents at points")
+            # tangents at every point; the ones not given follow the chords
+            tangents = []
+            for i, given in enumerate(point_tangents):
+                if given is not None:
+                    tangents.append(self._vec(given))
+                    continue
+                before = points[i - 1] if i > 0 else points[i]
+                after = points[i + 1] if i + 1 < len(points) else points[i]
+                tangents.append(self._vec(_unit([b - a for a, b in zip(before, after)])))
+            status, curve = self.sc.SmBSplineCurve.CreateInterpolatingCurve(
+                self.context,
+                self.sc.SM_CP_CHORDLENGTH,
+                3,
+                min(3, max(1, len(points) - 1)) if len(points) < 4 else 3,
+                [self._vec(p) for p in points],
+                tangents,
+                None,
+                1 if scale else 0,
+            )
+            _check(status, "interpolation with tangents")
+            return self._edge_on(curve)
         start_tangent = end_tangent = None
         if end_tangents is not None:
             start_tangent = self._vec(end_tangents[0])
@@ -2313,7 +2377,32 @@ class SmlibCoreKernel(Kernel):
         _check(status, "approximation")
         return self._edge_on(curve)
 
-    make_helix = _unsupported("make_helix")
+    def make_helix(
+        self,
+        center: Point,
+        normal: Point,
+        radius: float,
+        pitch: float,
+        height: float,
+        cone_angle: float,
+        lefthand: bool,
+    ) -> SmHandle:
+        frame = gp_Ax3(gp_Pnt(*center), gp_Dir(*normal))
+        placement = self._placement(frame.Ax2())
+        turns = height / pitch
+        end_radius = radius + height * math.tan(cone_angle)
+        status, helix = self.sc.SmBSplineCurve.CreateHelixSegment(
+            self.context,
+            placement,
+            height,
+            radius,
+            end_radius,
+            turns,
+            0 if lefthand else 1,
+            self.sc.SmApproxTol3d(_TOLERANCE / 10),
+        )
+        _check(status, "helix")
+        return self._edge_on(helix)
 
     def make_wire(
         self, shapes: Sequence[SmHandle]
@@ -2783,7 +2872,9 @@ class SmlibCoreKernel(Kernel):
         """The planar face with corners cut off: each loop is rebuilt from
         free copies of its edges, shortened at the corners and bridged."""
         loops = []
-        for loop in self.sub_shape_uses(face, TopoKind.WIRE):
+        wire_given = face.kind is TopoKind.WIRE
+        source_loops = [face] if wire_given else self.sub_shape_uses(face, TopoKind.WIRE)
+        for loop in source_loops:
             originals = list(loop.members)
             edges: list[SmHandle | None] = []
             for member in originals:
@@ -2803,9 +2894,10 @@ class SmlibCoreKernel(Kernel):
                 if len(indices) != 2:
                     continue
                 i, j = indices
-                if not (j == i + 1 or (i == 0 and j == count - 1 and count > 2)):
+                closing = i == 0 and j == count - 1 and count > 2 and self.is_closed(loop)
+                if not (j == i + 1 or closing):
                     continue
-                if i == 0 and j == count - 1:
+                if closing:
                     i, j = j, i  # the loop closes from the last edge to the first
                 along = {}
                 for k, member in ((i, originals[i]), (j, originals[j])):
@@ -2827,6 +2919,8 @@ class SmlibCoreKernel(Kernel):
                 if k in bridges:
                     rebuilt.append(bridges[k])
             loops.append(SmHandle(TopoKind.WIRE, members=rebuilt))
+        if wire_given:
+            return loops[0], _Record()
         return self.make_planar_face(loops[0], loops[1:]), _Record()
 
     def _shorten(self, edge: SmHandle, length: float, at_end: bool) -> SmHandle | None:
@@ -2988,12 +3082,18 @@ class SmlibCoreKernel(Kernel):
             crossing = self._line_crossing(first, second, normal)
             if crossing is None:
                 return first, second, self.make_line(p1, p0)
-            a0, _, _, _ = self._oriented_ends(first)
-            _, b1, _, _ = self._oriented_ends(second)
-            first_cut = self.make_line(a0, crossing).with_flip(False)
-            second_cut = self.make_line(crossing, b1).with_flip(False)
-            if math.dist(a0, crossing) <= _TOLERANCE or math.dist(crossing, b1) <= _TOLERANCE:
-                return first, second, self.make_line(p1, p0)
+            a0, a1, _, _ = self._oriented_ends(first)
+            b0, b1, _, _ = self._oriented_ends(second)
+            # where the crossing falls along each line: before the start of the
+            # first or past the end of the second means that line is used up
+            along_first = _dot([c - a for a, c in zip(a0, crossing)], _unit([b - a for a, b in zip(a0, a1)]))
+            along_second = _dot([b - c for b, c in zip(b1, crossing)], _unit([b - a for a, b in zip(b0, b1)]))
+            first_cut = (
+                self.make_line(a0, crossing).with_flip(False) if along_first > _TOLERANCE else _DROPPED
+            )
+            second_cut = (
+                self.make_line(crossing, b1).with_flip(False) if along_second > _TOLERANCE else _DROPPED
+            )
             return first_cut, second_cut, None
         if not turn_opens:
             view_first = SmCurveView(self, first)
@@ -3027,7 +3127,7 @@ class SmlibCoreKernel(Kernel):
                 offsets.append((edge, moved))
         if not offsets:
             return []
-        result: list[SmHandle] = [moved for _, moved in offsets]
+        result: list[SmHandle | None] = [moved for _, moved in offsets]
         pairs = list(range(len(offsets) - 1))
         if closed and len(offsets) > 1:
             pairs.append(len(offsets) - 1)
@@ -3040,21 +3140,33 @@ class SmlibCoreKernel(Kernel):
             turn = _dot(_cross(t_end, t_start), normal)
             # a left turn opens a gap on the right side, the offset side
             turn_opens = turn > 0 if distance > 0 else turn < 0
+            if result[i] is None or result[j] is None:
+                continue
             first, second, between = self._join_offsets(
                 result[i], result[j], corner, turn_opens, join, normal, distance
             )
             if first is not None:
-                result[i] = first
+                result[i] = None if first is _DROPPED else first
             if second is not None:
-                result[j] = second
+                result[j] = None if second is _DROPPED else second
             if between is not None:
                 inserted[i] = between
         ordered: list[SmHandle] = []
         for i, edge in enumerate(result):
-            ordered.append(edge)
+            if edge is not None:
+                ordered.append(edge)
             if i in inserted:
                 ordered.append(inserted[i])
-        return ordered
+        survivors = [e for e in ordered if self.length(e) > _TOLERANCE]
+        bridged: list[SmHandle] = []
+        for edge in survivors:
+            if bridged:
+                _, previous_end, _, _ = self._oriented_ends(bridged[-1])
+                next_start, _, _, _ = self._oriented_ends(edge)
+                if math.dist(previous_end, next_start) > _TOLERANCE:
+                    bridged.append(self.make_line(previous_end, next_start))
+            bridged.append(edge)
+        return bridged
 
     def offset_2d(
         self,
@@ -3100,8 +3212,33 @@ class SmlibCoreKernel(Kernel):
             loop.append(self._end_cap(right[-1], left[0], end, abs(distance)))
             loop.extend(left)
             loop.append(self._end_cap(left[-1], right[0], start, abs(distance)))
-        else:
-            loop.extend(right or left)
+        elif right or left:
+            # one side collapsed entirely (an inside offset beyond the bends):
+            # half circles round each end meet, or are joined, on that side
+            run = right or left
+            _, _, forward_start, _ = self._oriented_ends(edges[0])
+            _, _, _, forward_end = self._oriented_ends(edges[-1])
+            _, p_end, _, _ = self._oriented_ends(run[-1])
+            p_start, _, _, _ = self._oriented_ends(run[0])
+            far_end = tuple(2 * c - p for c, p in zip(end, p_end))
+            far_start = tuple(2 * c - p for c, p in zip(start, p_start))
+            loop.extend(run)
+            ahead = _unit(forward_end)
+            loop.append(
+                self.make_three_point_arc(
+                    p_end, tuple(c + abs(distance) * a for c, a in zip(end, ahead)), far_end
+                )
+            )
+            if math.dist(far_end, far_start) > _TOLERANCE:
+                loop.append(self.make_line(far_end, far_start))
+            behind = _unit(forward_start)
+            loop.append(
+                self.make_three_point_arc(
+                    far_start,
+                    tuple(c - abs(distance) * b for c, b in zip(start, behind)),
+                    p_start,
+                )
+            )
         return SmHandle(TopoKind.WIRE, members=loop) if loop else None
 
     def _end_cap(self, before: SmHandle, after: SmHandle, centre: Point, radius: float) -> SmHandle:
@@ -3226,7 +3363,11 @@ class SmlibCoreKernel(Kernel):
         return result, _Record()
     split_by_edges = _unsupported("split_by_edges")
     line_intersections = _unsupported("line_intersections")
-    solid_from_shell = _unsupported("solid_from_shell")
+    def solid_from_shell(self, shell: SmHandle) -> SmHandle:
+        brep = self._body(shell)
+        if not brep.IsManifoldSolid():
+            raise ValueError("the shell does not close a solid")
+        return SmHandle(TopoKind.SOLID, brep, partner=shell.partner)
     remove_wires = _unsupported("remove_wires")
     is_seam = _unsupported("is_seam")
     to_splines = _unsupported("to_splines")
