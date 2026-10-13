@@ -951,6 +951,10 @@ class KernelGeometry(ABC):
     def half_space(self, shape: Handle, point: Point) -> Handle:
         """The half-space solid bounded by a face or shell that contains ``point``."""
 
+    def is_inside_out(self, solid: Handle) -> bool:
+        """Whether a solid's shell faces inwards (its volume comes out negative)."""
+        return self.volume(solid) < 0
+
     def same_side(self, piece: Handle, tool: Handle, point: Point, tolerance: float) -> bool:
         """Whether ``piece`` lies on the side of the sheet ``tool`` that
         ``point`` is on: by default, whether it shares anything of length

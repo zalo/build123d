@@ -639,7 +639,7 @@ class Mixin3D(Shape[TOPODS]):
         assert not offset_solid.is_empty
 
         # The Solid can be inverted, if so reverse
-        if offset_solid.volume < 0:
+        if kernel.is_inside_out(offset_solid.wrapped):
             kernel.reverse(offset_solid.wrapped)
 
         return offset_solid

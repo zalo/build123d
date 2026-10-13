@@ -316,12 +316,27 @@ class SmCurveView(CurveView):
     def length(self, t0: float | None = None, t1: float | None = None) -> float:
         a = self.first if t0 is None else t0
         b = self.last if t1 is None else t1
+        if self.geom_type == "LINE":
+            return math.dist(self._point(a), self._point(b))
+        whole = t0 is None and t1 is None
+        if whole:
+            # the whole length is asked for again and again (every
+            # position_at): remembered by the curve and its ends
+            key = (self.curve.address, a, b, _point_key(self._point(a)), _point_key(self._point(b)))
+            known = self.kernel._lengths.get(key)  # pylint: disable=protected-access
+            if known is not None:
+                return known
         status, length = self.curve.Length(self.sc.SmExtent1d(a, b), 1e-10)
         _check(status, "curve length")
+        if whole:
+            self.kernel._lengths[key] = length  # pylint: disable=protected-access
         return length
 
     def param_at_length(self, length: float, t0: float | None = None) -> float:
         start = self.first if t0 is None else t0
+        if self.geom_type == "LINE":
+            whole = self.length()
+            return start if whole <= 0 else start + (self.last - self.first) * length / whole
         result = self.curve.FindParameterAtArcLength(start, length, None)
         status, param = result[0], result[1]
         _check(status, "parameter at length")
@@ -664,6 +679,7 @@ class SmlibCoreKernel(Kernel):
         self._bezier: set[int] = set()  # curve addresses made by make_bezier
         self._sheets: dict[int, tuple[Any, Any]] = {}  # face address -> (face, one-face body)
         self._boxes: dict[int, tuple[Point, Point]] = {}  # brep address -> box, during a boolean
+        self._lengths: dict[tuple[Any, ...], float] = {}  # whole curve lengths by curve and ends
 
     # ---- helpers --------------------------------------------------------------
 
@@ -827,6 +843,10 @@ class SmlibCoreKernel(Kernel):
 
     def _mass(self, brep: Any) -> tuple[float, float, Point]:
         """Area, volume and centre of mass of a body."""
+        try:
+            return self._mass_by_faces(brep)
+        except RuntimeError:
+            pass  # a face the integrators refuse: the body-wide one decides
         status, area, volume, mass, moments = brep.ComputePreciseProperties(
             _MASS_ACCURACY,
             self._vec((0.0, 0.0, 0.0)),
@@ -837,6 +857,108 @@ class SmlibCoreKernel(Kernel):
         first = moments[4] if len(moments) > 4 else moments[0]
         divisor = mass if abs(mass) > 1e-300 else (area or 1.0)
         return area, volume, (first.x / divisor, first.y / divisor, first.z / divisor)
+
+    _GAUSS = SmCurveView._GAUSS
+    _GAUSS3 = ((0.0, 0.8888888888888888), (-0.7745966692414834, 0.5555555555555556), (0.7745966692414834, 0.5555555555555556))
+    _GAUSS2 = ((-0.5773502691896257, 1.0), (0.5773502691896257, 1.0))
+
+    def _mass_by_faces(self, brep: Any) -> tuple[float, float, Point]:
+        """Area, volume and centroid summed over the faces (divergence
+        theorem): faces covering their whole surface domain by Gauss
+        quadrature on the knot spans, trimmed ones by the kernel's integrator.
+        The body-wide integrator is far slower at the accuracy wanted."""
+        area = volume = 0.0
+        moment = [0.0, 0.0, 0.0]
+        for face in self._entities(brep, TopoKind.FACE):
+            handle = SmHandle(TopoKind.FACE, face)
+            view = SmSurfaceView(self, handle)
+            planar = self._planar_face_integrals(view)
+            if planar is not None:
+                a, v, m = planar[0], planar[2], planar[3]
+            elif self._covers_its_surface(handle, view):
+                a, v, m = self._flux_quadrature(view)
+            else:
+                # the kernel's per-face flux is not reliable (zero on some
+                # trimmed walls): the body-wide integrator takes this body
+                raise RuntimeError("trimmed curved face")
+            area += a
+            volume += v
+            for i in range(3):
+                moment[i] += m[i]
+        divisor = volume if abs(volume) > 1e-300 else 1.0
+        centre = tuple(round(m / divisor, 12) + 0.0 for m in moment)  # rounding noise off
+        return area, volume, centre  # type: ignore[return-value]
+
+    def _covers_its_surface(self, face: SmHandle, view: SmSurfaceView) -> bool:
+        """Whether a face is a whole rectangle of its surface's parameter
+        space (its uv domain): one loop of at most four edge uses, with
+        every corner of the domain a vertex of the face."""
+        loops = face.entity.GetLoops([], 0, None)
+        if len(loops) != 1 or len(loops[0].GetEdgeuses([])) > 4:
+            return False
+        u0, u1, v0, v1 = view._bounds  # pylint: disable=protected-access
+        corners = [self.vertex_point(v) for v in self.sub_shapes(face, TopoKind.VERTEX)]
+        if not corners:
+            return False
+        scale = max(1.0, max(abs(c) for p in corners for c in p))
+        for u, v in ((u0, v0), (u1, v0), (u0, v1), (u1, v1)):
+            point = view.value(u, v)
+            if min(math.dist(point, c) for c in corners) > _TOLERANCE * scale:
+                return False
+        return True
+
+    def _flux_quadrature(self, view: SmSurfaceView) -> tuple[float, float, Point]:
+        """Area, flux volume (1/3 of the integral of x.n) and the volume's
+        first moments (1/2 of the integral of x_i^2 n_i) over a whole face."""
+        sc = self.sc
+        u0, u1, v0, v1 = view._bounds  # pylint: disable=protected-access
+        breaks = []
+        for direction, lo, hi in ((sc.SM_SP_U, u0, u1), (sc.SM_SP_V, v0, v1)):
+            status, knots = view.surface.GetKnots(direction, [])
+            inner = sorted({k for k in knots if lo + 1e-9 < k < hi - 1e-9}) if status == SM_SUCCESS else []
+            breaks.append([lo, *inner, hi])
+        # the outward normal may run against du x dv: settle the sign once
+        um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+        _, du_m, dv_m = view.d1(um, vm)
+        _, outward = view.normal(um, vm)
+        sign = 1.0 if _dot(_cross(du_m, dv_m), outward) >= 0 else -1.0
+        # a few spans are cut finer for the quadrature; a dense knot vector
+        # (a swept or approximated surface) is fine as it is, with fewer nodes
+        panels = []
+        rules = []
+        for lo_hi in breaks:
+            spans = len(lo_hi) - 1
+            parts = 3 if spans <= 4 else 1
+            rules.append(self._GAUSS if spans <= 16 else self._GAUSS3 if spans <= 64 else self._GAUSS2)
+            fine = []
+            for a, b in zip(lo_hi, lo_hi[1:]):
+                fine.extend(a + (b - a) * i / parts for i in range(parts))
+            fine.append(lo_hi[-1])
+            panels.append(fine)
+        point, du, dv = sc.SmVector3d(), sc.SmVector3d(), sc.SmVector3d()
+        evaluate = view.surface.Evaluate1stDerivatives
+        area = volume = 0.0
+        mx = my = mz = 0.0
+        gauss_u, gauss_v = rules
+        for ua, ub in zip(panels[0], panels[0][1:]):
+            hu, cu = 0.5 * (ub - ua), 0.5 * (ua + ub)
+            for va, vb in zip(panels[1], panels[1][1:]):
+                hv, cv = 0.5 * (vb - va), 0.5 * (va + vb)
+                for nu, wu in gauss_u:
+                    u = cu + hu * nu
+                    for nv, wv in gauss_v:
+                        _check(evaluate(sc.SmVector2d(u, cv + hv * nv), 0, 0, point, du, dv), "surface derivatives")
+                        nx = du.y * dv.z - du.z * dv.y
+                        ny = du.z * dv.x - du.x * dv.z
+                        nz = du.x * dv.y - du.y * dv.x
+                        w = wu * wv * hu * hv
+                        area += math.sqrt(nx * nx + ny * ny + nz * nz) * w
+                        w *= sign
+                        volume += (point.x * nx + point.y * ny + point.z * nz) * w / 3.0
+                        mx += point.x * point.x * nx * w / 2.0
+                        my += point.y * point.y * ny * w / 2.0
+                        mz += point.z * point.z * nz * w / 2.0
+        return area, volume, (mx, my, mz)
 
     # ---- handles and identity ------------------------------------------------
 
@@ -886,18 +1008,18 @@ class SmlibCoreKernel(Kernel):
 
     def _same_face(self, a: SmHandle, b: SmHandle) -> bool:
         """Whether two faces cover the same patch of the same surface."""
+        if self.surface_type(a.entity.GetSurface()) != self.surface_type(b.entity.GetSurface()):
+            return False
+        corners_a = {_point_key(p) for p in self._corner_points(a)}
+        corners_b = {_point_key(p) for p in self._corner_points(b)}
+        if corners_a != corners_b:
+            return False
         try:
             if abs(self.area(a) - self.area(b)) > _TOLERANCE:
                 return False
         except RuntimeError:
             return False
-        if math.dist(self.center_of_mass(a, TopoKind.FACE), self.center_of_mass(b, TopoKind.FACE)) > _TOLERANCE:
-            return False
-        if self.surface_type(a.entity.GetSurface()) != self.surface_type(b.entity.GetSurface()):
-            return False
-        corners_a = {_point_key(p) for p in self._corner_points(a)}
-        corners_b = {_point_key(p) for p in self._corner_points(b)}
-        return corners_a == corners_b
+        return math.dist(self.center_of_mass(a, TopoKind.FACE), self.center_of_mass(b, TopoKind.FACE)) <= _TOLERANCE
 
     def _corner_points(self, shape: SmHandle) -> list[Point]:
         return [self.vertex_point(v) for v in self.sub_shapes(shape, TopoKind.VERTEX)]
@@ -938,10 +1060,12 @@ class SmlibCoreKernel(Kernel):
                 )
                 return (TopoKind.EDGE, ends, round(view.length(), 4))
             if shape.kind is TopoKind.FACE:
+                # cheap: the kind of surface and where the corners are (the
+                # area would need an integration, costly on blend faces)
                 return (
                     TopoKind.FACE,
-                    round(self.area(shape), 4),
-                    _point_key(self.center_of_mass(shape, TopoKind.FACE), 5),
+                    self.surface_type(shape.entity.GetSurface()),
+                    frozenset(_point_key(p, 5) for p in self._corner_points(shape)),
                 )
         except RuntimeError:
             pass  # a face the kernel cannot measure keeps its own identity
@@ -1243,48 +1367,94 @@ class SmlibCoreKernel(Kernel):
         return area, (first.x / divisor, first.y / divisor, first.z / divisor)
 
     def _planar_face_properties(self, face: SmHandle) -> tuple[float, Point] | None:
-        """Area and centroid of a planar face by integrating around its
-        loops (Green's theorem, Gauss quadrature on each edge): exact to
-        rounding where the kernel's integrator is not."""
-        view = SmSurfaceView(self, face)
+        """Area and centroid of a planar face (None for a curved one)."""
+        integrals = self._planar_face_integrals(SmSurfaceView(self, face))
+        return None if integrals is None else (integrals[0], integrals[1])
+
+    def _planar_face_integrals(
+        self, view: SmSurfaceView
+    ) -> tuple[float, Point, float, Point] | None:
+        """Area, centroid, flux volume (1/3 of the integral of x.n) and the
+        volume's first moments (1/2 of the integral of x_i^2 n_i) of a planar
+        face, by integrating around its loops (Green's theorem, Gauss
+        quadrature on each edge): exact to rounding where the kernel's
+        integrator is not. None for a face that is not planar."""
         plane = view.plane()
         if plane is None:
             return None
-        origin, normal, x_dir = plane
-        y_dir = _cross(normal, x_dir)
-        area2 = 0.0  # twice the signed area
-        mx = my = 0.0  # 6 * area * centroid
-        for wire in self.sub_shape_uses(face, TopoKind.WIRE):
+        origin, normal, e1 = plane
+        _, outward = view.normal(*view._mid())  # pylint: disable=protected-access
+        e2 = _cross(normal, e1)
+        area = ia = ib = iaa = ibb = iab = 0.0
+        for wire in self.sub_shape_uses(view.face, TopoKind.WIRE):
             for curve in self._loop_curves(wire):
                 domain = curve.GetNaturalInterval()
                 edge = SmCurveView(self, self._free_edge(curve, domain.GetMin(), domain.GetMax()))
+                if edge.geom_type == "LINE":
+                    # a straight edge integrates in closed form
+                    p0, p1 = edge.value(edge.first), edge.value(edge.last)
+                    r0 = (p0[0] - origin[0], p0[1] - origin[1], p0[2] - origin[2])
+                    r1 = (p1[0] - origin[0], p1[1] - origin[1], p1[2] - origin[2])
+                    a0, b0, a1, b1 = _dot(r0, e1), _dot(r0, e2), _dot(r1, e1), _dot(r1, e2)
+                    da, db = a1 - a0, b1 - b0
+                    area += 0.5 * (a0 + a1) * db
+                    ia += (a0 * a0 + a0 * a1 + a1 * a1) / 6.0 * db
+                    ib -= (b0 * b0 + b0 * b1 + b1 * b1) / 6.0 * da
+                    iaa += (a0 * a0 * a0 + a0 * a0 * a1 + a0 * a1 * a1 + a1 * a1 * a1) / 12.0 * db
+                    ibb -= (b0 * b0 * b0 + b0 * b0 * b1 + b0 * b1 * b1 + b1 * b1 * b1) / 12.0 * da
+                    iab += 0.5 * db * (
+                        a0 * a0 * b0
+                        + 0.5 * (a0 * a0 * db + 2 * a0 * da * b0)
+                        + (2 * a0 * da * db + da * da * b0) / 3.0
+                        + da * da * db / 4.0
+                    )
+                    continue
                 breaks = edge._spans()  # pylint: disable=protected-access
                 for t0, t1 in zip(breaks, breaks[1:]):
                     pieces = 4
                     for i in range(pieces):
-                        a = t0 + (t1 - t0) * i / pieces
-                        b = t0 + (t1 - t0) * (i + 1) / pieces
-                        half, mid = 0.5 * (b - a), 0.5 * (a + b)
-                        for node, weight in edge._GAUSS:  # pylint: disable=protected-access
+                        lo = t0 + (t1 - t0) * i / pieces
+                        hi = t0 + (t1 - t0) * (i + 1) / pieces
+                        half, mid = 0.5 * (hi - lo), 0.5 * (lo + hi)
+                        for node, weight in self._GAUSS:
                             point, tangent = edge.d1(mid + half * node)
-                            rel = tuple(p - o for p, o in zip(point, origin))
-                            x, y = _dot(rel, x_dir), _dot(rel, y_dir)
-                            dx, dy = _dot(tangent, x_dir), _dot(tangent, y_dir)
+                            rel = (point[0] - origin[0], point[1] - origin[1], point[2] - origin[2])
+                            a, b = _dot(rel, e1), _dot(rel, e2)
+                            da, db = _dot(tangent, e1), _dot(tangent, e2)
                             w = half * weight
-                            area2 += (x * dy - y * dx) * w
-                            mx += x * (x * dy - y * dx) * w
-                            my += y * (x * dy - y * dx) * w
-        if abs(area2) < 1e-300:
+                            area += a * db * w
+                            ia += 0.5 * a * a * db * w
+                            ib -= 0.5 * b * b * da * w
+                            iaa += a * a * a / 3.0 * db * w
+                            ibb -= b * b * b / 3.0 * da * w
+                            iab += 0.5 * a * a * b * db * w
+        if abs(area) < 1e-300:
             return None
-        area = 0.5 * area2
-        cx, cy = mx / (3 * area2), my / (3 * area2)
-        centre = tuple(o + cx * xd + cy * yd for o, xd, yd in zip(origin, x_dir, y_dir))
-        return abs(area), centre  # type: ignore[return-value]
+        if area < 0:  # the loops run clockwise about the plane's normal
+            area, ia, ib, iaa, ibb, iab = -area, -ia, -ib, -iaa, -ibb, -iab
+        # the quadrature leaves rounding noise where OCCT is exact (a box
+        # face's centre at -5.000000000000001): trimmed to 12 decimals
+        centre = tuple(
+            round(o + (ia / area) * x + (ib / area) * y, 12) + 0.0
+            for o, x, y in zip(origin, e1, e2)
+        )
+        flux = _dot(origin, outward) * area / 3.0
+        moments = []
+        for i in range(3):
+            square = (
+                origin[i] * origin[i] * area
+                + 2 * origin[i] * (e1[i] * ia + e2[i] * ib)
+                + e1[i] * e1[i] * iaa
+                + 2 * e1[i] * e2[i] * iab
+                + e2[i] * e2[i] * ibb
+            )
+            moments.append(0.5 * square * outward[i])
+        return area, centre, flux, (moments[0], moments[1], moments[2])  # type: ignore[return-value]
 
     def _face_properties_by_mesh(self, face: SmHandle) -> tuple[float, Point]:
         """Area and centroid summed over a fine triangulation, for the faces
         whose loops the kernel's integrator does not accept."""
-        self.mesh(face, 1e-4, math.radians(5))
+        self.mesh(face, 1e-3, math.radians(5))
         triangulation = self.face_triangulation(face)
         if triangulation is None:
             raise RuntimeError("SMLib face properties failed")
@@ -1759,6 +1929,9 @@ class SmlibCoreKernel(Kernel):
         if len(pieces) == 1:
             return pieces[0], record
         return SmHandle(TopoKind.COMPOUND, members=pieces), record
+
+    def is_inside_out(self, solid: SmHandle) -> bool:
+        return False  # the kernel's regions keep the shells facing out
 
     def same_side(self, piece: SmHandle, tool: SmHandle, point: Point, tolerance: float) -> bool:
         """Whether a piece's centre of mass is on the side of the sheet that
