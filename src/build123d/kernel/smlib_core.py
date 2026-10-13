@@ -109,6 +109,121 @@ def _restore_locations(moved: SmHandle, original: SmHandle) -> None:
             _restore_locations(new_member, old_member)
 
 
+def _bspline_basis(flat: Sequence[float], degree: int, t: float, derivative: int = 0) -> list[float]:
+    """The values (or first derivatives) at ``t`` of every B-spline basis
+    function of ``degree`` on the flat knot vector ``flat``."""
+    count = len(flat) - degree - 1
+    if t >= flat[count]:
+        span = count - 1
+        while flat[span] == flat[span + 1]:
+            span -= 1
+    else:
+        span = degree
+        while flat[span + 1] <= t:
+            span += 1
+    table = [[0.0] * count for _ in range(degree + 1)]
+    table[0][span] = 1.0
+    for q in range(1, degree + 1):
+        for i in range(max(0, span - q), span + 1):
+            left = right = 0.0
+            if flat[i + q] > flat[i]:
+                left = (t - flat[i]) / (flat[i + q] - flat[i]) * table[q - 1][i]
+            if i + 1 < count and flat[i + q + 1] > flat[i + 1]:
+                right = (flat[i + q + 1] - t) / (flat[i + q + 1] - flat[i + 1]) * table[q - 1][i + 1]
+            table[q][i] = left + right
+    if derivative == 0:
+        return table[degree]
+    values = []
+    for i in range(count):
+        a = b = 0.0
+        if flat[i + degree] > flat[i]:
+            a = degree / (flat[i + degree] - flat[i]) * table[degree - 1][i]
+        if i + 1 < count and flat[i + degree + 1] > flat[i + 1]:
+            b = degree / (flat[i + degree + 1] - flat[i + 1]) * table[degree - 1][i + 1]
+        values.append(a - b)
+    return values
+
+
+def _lagrange_derivative(params: Sequence[float], points: Sequence[Point], at: float) -> Point:
+    """The derivative at ``at`` of the polynomial through ``points`` at ``params``."""
+    n = len(params)
+    result = [0.0, 0.0, 0.0]
+    for i in range(n):
+        weight = 0.0
+        for j in range(n):
+            if j == i:
+                continue
+            product = 1.0
+            for m in range(n):
+                if m not in (i, j):
+                    product *= (at - params[m]) / (params[i] - params[m])
+            weight += product / (params[i] - params[j])
+        result = [r + weight * c for r, c in zip(result, points[i])]
+    return (result[0], result[1], result[2])
+
+
+def _occt_interpolation(
+    points: Sequence[Point],
+    params: Sequence[float],
+    tangents: Sequence[Point | None],
+    scale: bool,
+) -> tuple[list[Point], list[float], int]:
+    """Poles, flat knots and degree of the B-spline OCCT's GeomAPI_Interpolate
+    makes through ``points`` at ``params``: a line or parabola for two or
+    three free points, otherwise a cubic with the knots at the parameters,
+    doubled where a tangent is held, and tangents built at free ends from
+    the Lagrange polynomial through the end points. Tangents given with
+    ``scale`` are resized to the derivative of a local quadratic."""
+    import numpy as np
+
+    n = len(points)
+    tangents = list(tangents)
+    asked = any(t is not None for t in tangents)
+    if scale and asked:
+        local_degree = 1 if n == 2 else 2
+        index = 0
+        for i in range(n):
+            if tangents[i] is None:
+                continue
+            window = range(index, index + local_degree + 1)
+            local = _lagrange_derivative(
+                [params[j] for j in window], [points[j] for j in window], params[i]
+            )
+            given = tangents[i]
+            ratio = sum(abs(c) for c in local) / max(sum(abs(c) for c in given), 1e-300)
+            tangents[i] = tuple(ratio * c for c in given)
+            if i != 0:
+                index += 1
+            index = min(index, n - 1 - local_degree)
+    if not asked and n == 2:
+        return [points[0], points[1]], [params[0], params[0], params[1], params[1]], 1
+    if not asked and n == 3:
+        flat = [params[0]] * 3 + [params[2]] * 3
+        rows = [_bspline_basis(flat, 2, u) for u in params]
+        poles = np.linalg.solve(np.array(rows), np.array(points, float))
+        return [tuple(p) for p in poles], flat, 2
+    end_degree = 2 if n == 3 else 3
+    for i in (0, n - 1):
+        if tangents[i] is None:
+            window = range(0, end_degree + 1) if i == 0 else range(n - 1 - end_degree, n)
+            tangents[i] = _lagrange_derivative(
+                [params[j] for j in window], [points[j] for j in window], params[i]
+            )
+    flat = [params[0]] * 4
+    for i in range(1, n - 1):
+        flat += [params[i]] * (2 if tangents[i] is not None else 1)
+    flat += [params[-1]] * 4
+    rows, rhs = [], []
+    for i in range(n):
+        rows.append(_bspline_basis(flat, 3, params[i]))
+        rhs.append(points[i])
+        if tangents[i] is not None:
+            rows.append(_bspline_basis(flat, 3, params[i], 1))
+            rhs.append(tangents[i])
+    poles = np.linalg.solve(np.array(rows), np.array(rhs, float))
+    return [tuple(p) for p in poles], flat, 3
+
+
 def _fresh_partners(shape: SmHandle) -> None:
     """Make ``shape`` and its members partners of nothing made before."""
     shape.partner = next(_partner_ids)
@@ -359,8 +474,28 @@ class SmCurveView(CurveView):
                 return self.last
         result = self.curve.FindParameterAtArcLength(start, length, None)
         status, param = result[0], result[1]
-        _check(status, "parameter at length")
+        if status != SM_SUCCESS or (param == start and abs(length) > 1e-12):
+            # the search fails quietly on some curves (a cusp near a double
+            # knot): find the parameter by bisection on the length instead
+            return self._param_at_length_by_bisection(start, length)
         return param
+
+    def _param_at_length_by_bisection(self, start: float, length: float) -> float:
+        if length >= 0:
+            low, high = start, self.last
+            measure = lambda t: self.length(start, t)  # noqa: E731
+        else:
+            low, high = self.first, start
+            measure = lambda t: -self.length(t, start)  # noqa: E731
+        for _ in range(100):
+            middle = 0.5 * (low + high)
+            if measure(middle) < length:
+                low = middle
+            else:
+                high = middle
+            if high - low <= 1e-13 * max(1.0, abs(self.last - self.first)):
+                break
+        return 0.5 * (low + high)
 
     def closest_param(self, point: Point) -> float:
         return self.drop_point(point)[0]
@@ -3916,44 +4051,33 @@ class SmlibCoreKernel(Kernel):
         point_tangents: Sequence[Point | None] | None = None,
         scale: bool = True,
     ) -> SmHandle:
-        if point_tangents is not None and any(t is not None for t in point_tangents):
-            # tangents at every point; the ones not given follow the chords
-            tangents = []
-            for i, given in enumerate(point_tangents):
-                if given is not None:
-                    tangents.append(self._vec(given))
-                    continue
-                before = points[i - 1] if i > 0 else points[i]
-                after = points[i + 1] if i + 1 < len(points) else points[i]
-                tangents.append(self._vec(_unit([b - a for a, b in zip(before, after)])))
-            status, curve = self.sc.SmBSplineCurve.CreateInterpolatingCurve(
+        if periodic:
+            status, curve = self.sc.SmBSplineCurve.InterpolatePoints(
                 self.context,
-                self.sc.SM_CP_CHORDLENGTH,
-                3,
-                min(3, max(1, len(points) - 1)) if len(points) < 4 else 3,
                 [self._vec(p) for p in points],
-                tangents,
+                [float(v) for v in parameters] if parameters is not None else None,
+                min(3, len(points) - 1),
                 None,
-                1 if scale else 0,
+                None,
+                1,
+                self.sc.SM_IT_CHORDLENGTH,
             )
-            _check(status, "interpolation with tangents")
+            _check(status, "interpolation")
             return self._edge_on(curve)
-        start_tangent = end_tangent = None
-        if end_tangents is not None:
-            start_tangent = self._vec(end_tangents[0])
-            end_tangent = self._vec(end_tangents[1])
-        status, curve = self.sc.SmBSplineCurve.InterpolatePoints(
-            self.context,
-            [self._vec(p) for p in points],
-            [float(v) for v in parameters] if parameters is not None else None,
-            min(3, len(points) - 1),
-            start_tangent,
-            end_tangent,
-            1 if periodic else 0,
-            self.sc.SM_IT_CHORDLENGTH,
-        )
-        _check(status, "interpolation")
-        return self._edge_on(curve)
+        pts = [tuple(float(c) for c in p) for p in points]
+        if parameters is not None:
+            params = [float(v) for v in parameters]
+        else:
+            params = [0.0]
+            for a, b in zip(pts, pts[1:]):
+                params.append(params[-1] + math.dist(a, b))
+        tangents: list[Point | None] = [None] * len(pts)
+        if point_tangents is not None:
+            tangents = [None if t is None else tuple(t) for t in point_tangents]
+        elif end_tangents is not None:
+            tangents[0], tangents[-1] = tuple(end_tangents[0]), tuple(end_tangents[1])
+        poles, flat, degree = _occt_interpolation(pts, params, tangents, scale)
+        return self._edge_on(self._nurbs(poles, flat, degree, None))
 
     def make_spline_fit(
         self,
@@ -3972,6 +4096,18 @@ class SmlibCoreKernel(Kernel):
             0,
             tolerance,
         )
+        if status != SM_SUCCESS and len(points) <= 4:
+            # too few points to fit: the curve through them is the fit
+            status, curve = self.sc.SmBSplineCurve.InterpolatePoints(
+                self.context,
+                [self._vec(p) for p in points],
+                None,
+                min(3, len(points) - 1),
+                None,
+                None,
+                0,
+                self.sc.SM_IT_CHORDLENGTH,
+            )
         _check(status, "approximation")
         return self._edge_on(curve)
 
@@ -4502,15 +4638,17 @@ class SmlibCoreKernel(Kernel):
         plane: gp_Pln,
         tolerance: float,
     ) -> list[tuple[float, float]]:
+        view = SmCurveView(self, edge)
         if other is None:
-            return []  # a curve crossing itself is not looked for
-        view, other_view = SmCurveView(self, edge), SmCurveView(self, other)
-        assert other_bounds is not None
-        points = self._crossings(
-            view.curve,
-            self.sc.SmExtent1d(*bounds),
-            ("curve", (other_view.curve, self.sc.SmExtent1d(*other_bounds))),
-        )
+            points = self._self_crossings(view, bounds, tolerance)
+        else:
+            other_view = SmCurveView(self, other)
+            assert other_bounds is not None
+            points = self._crossings(
+                view.curve,
+                self.sc.SmExtent1d(*bounds),
+                ("curve", (other_view.curve, self.sc.SmExtent1d(*other_bounds))),
+            )
         points.sort(key=lambda p: view.drop_point(p)[0])  # in the order met along the edge
         origin = plane.Location()
         x_axis, y_axis = plane.XAxis().Direction(), plane.YAxis().Direction()
@@ -4524,6 +4662,36 @@ class SmlibCoreKernel(Kernel):
                 )
             )
         return found
+    def _self_crossings(
+        self, view: SmCurveView, bounds: tuple[float, float], tolerance: float
+    ) -> list[Point]:
+        """Where a curve crosses itself: the crossings between its pieces,
+        less the joints neighbouring pieces share."""
+        first, last = bounds
+        pieces = 16
+        cuts = [first + (last - first) * i / pieces for i in range(pieces + 1)]
+        closed = math.dist(view.value(first), view.value(last)) <= tolerance
+        found: list[Point] = []
+        for i in range(pieces):
+            for j in range(i + 1, pieces):
+                joints = []
+                if j == i + 1:
+                    joints.append(view.value(cuts[j]))
+                if closed and i == 0 and j == pieces - 1:
+                    joints.append(view.value(first))
+                crossings = self._crossings(
+                    view.curve,
+                    self.sc.SmExtent1d(cuts[i], cuts[i + 1]),
+                    ("curve", (view.curve, self.sc.SmExtent1d(cuts[j], cuts[j + 1]))),
+                )
+                for p in crossings:
+                    if any(math.dist(p, q) <= 10 * tolerance for q in joints):
+                        continue
+                    if any(math.dist(p, q) <= tolerance for q in found):
+                        continue
+                    found.append(p)
+        return found
+
     uv_in_face = _unsupported("uv_in_face")
 
     # ---- the rest of the facade -----------------------------------------------
@@ -4851,6 +5019,17 @@ class SmlibCoreKernel(Kernel):
             raise ValueError("the wire has no plane to be offset in")
         return (nx / length, ny / length, nz / length)
 
+    def _some_normal_across(self, edges: Sequence[SmHandle]) -> Point:
+        """A unit vector across a straight wire, the nearest to +Z (then +Y, +X)."""
+        start, _, _, _ = self._oriented_ends(edges[0])
+        _, end, _, _ = self._oriented_ends(edges[-1])
+        along = _unit([b - a for a, b in zip(start, end)])
+        for axis in ((0.0, 0.0, 1.0), (0.0, 1.0, 0.0), (1.0, 0.0, 0.0)):
+            across = [a - _dot(axis, along) * t for a, t in zip(axis, along)]
+            if _dot(across, across) > 1e-6:
+                return _unit(across)
+        raise ValueError("the wire has no plane to be offset in")
+
     def _oriented_ends(self, edge: SmHandle) -> tuple[Point, Point, Point, Point]:
         """Start, end, start tangent and end tangent of an edge the way it runs."""
         view = SmCurveView(self, edge)
@@ -5077,7 +5256,11 @@ class SmlibCoreKernel(Kernel):
             direction = plane.Axis().Direction()
             normal: Point = (direction.X(), direction.Y(), direction.Z())
         else:
-            normal = self._wire_normal(edges)
+            try:
+                normal = self._wire_normal(edges)
+            except ValueError:
+                # a straight wire lies in many planes; OCCT picks one, so do we
+                normal = self._some_normal_across(edges)
             if not self.is_closed(wire):
                 # an open wire's offset is a loop counter-clockwise about the
                 # plane's normal, which OCCT's plane finder points so that its
