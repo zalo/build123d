@@ -448,21 +448,33 @@ class SmCurveView(CurveView):
         return (moment[0] / total, moment[1] / total, moment[2] / total)
 
     def _frame(self) -> tuple[Point, Point, Point, Point]:
-        """Origin, x, y and z axes of an analytic curve's placement."""
-        position = self.curve.GetPosition()
+        """Origin, x, y and z axes of an analytic curve's placement (for a
+        NURBS running on a circle: the circle's centre, the direction of the
+        curve's start, and the axis)."""
+        position = getattr(self.curve, "GetPosition", None)
+        if position is None:
+            fit = self.kernel._circle_fit(self.curve, self.first, self.last)  # pylint: disable=protected-access
+            if fit is None:
+                raise ValueError("not an analytic curve")
+            centre, _, axis = fit
+            x_axis = _unit(tuple(p - c for p, c in zip(self._point(self.first), centre)))
+            return centre, x_axis, _cross(axis, x_axis), axis
+        placement = position()
         pt = self.kernel._pt  # pylint: disable=protected-access
         return (
-            pt(position.GetOrigin()),
-            pt(position.GetXAxis()),
-            pt(position.GetYAxis()),
-            pt(position.GetZAxis()),
+            pt(placement.GetOrigin()),
+            pt(placement.GetXAxis()),
+            pt(placement.GetYAxis()),
+            pt(placement.GetZAxis()),
         )
 
     def circle(self) -> tuple[Point, Point, float]:
         if self.geom_type != "CIRCLE":
             raise ValueError("not a circle")
         origin, _, _, axis = self._frame()
-        return origin, axis, float(self.curve.GetRadius())
+        if hasattr(self.curve, "GetRadius"):
+            return origin, axis, float(self.curve.GetRadius())
+        return origin, axis, math.dist(origin, self._point(self.first))
 
     def ellipse(self) -> tuple[Point, Point, float, float]:
         if self.geom_type != "ELLIPSE":
@@ -647,7 +659,32 @@ class SmSurfaceView(SurfaceView):
         return float(self.surface.GetMajorRadius()), float(self.surface.GetMinorRadius())
 
     def curvatures(self, u: float, v: float, tolerance: float):  # type: ignore[override]
-        raise NotImplementedError("smlib: surface curvatures")
+        """Principal curvatures from the fundamental forms, with the
+        surface's own normal (not the face's outward one)."""
+        evaluate = getattr(self.surface, "EvaluateDerivatives", None)
+        if evaluate is None:
+            raise NotImplementedError("smlib: surface curvatures")
+        status, rows = evaluate(self.sc.SmVector2d(u, v), 2, 2, False, False)
+        _check(status, "surface evaluation")
+        su, sv = rows[1][0], rows[0][1]
+        suu, suv, svv = rows[2][0], rows[1][1], rows[0][2]
+        su, sv = (su.x, su.y, su.z), (sv.x, sv.y, sv.z)
+        cross = _cross(su, sv)
+        size = math.sqrt(_dot(cross, cross))
+        if size < 1e-12:
+            return None
+        normal = (cross[0] / size, cross[1] / size, cross[2] / size)
+        e, f, g = _dot(su, su), _dot(su, sv), _dot(sv, sv)
+        l = _dot((suu.x, suu.y, suu.z), normal)
+        m = _dot((suv.x, suv.y, suv.z), normal)
+        n = _dot((svv.x, svv.y, svv.z), normal)
+        denominator = e * g - f * f
+        if abs(denominator) < 1e-18:
+            return None
+        gaussian = (l * n - m * m) / denominator
+        mean = (e * n - 2 * f * m + g * l) / (2 * denominator)
+        root = math.sqrt(max(0.0, mean * mean - gaussian))
+        return mean - root, mean + root, normal
 
     def uv_of_point(self, point: Point, tolerance: float) -> tuple[float, float, float]:
         u, v = self.closest_uv(point)
@@ -790,10 +827,60 @@ class SmlibCoreKernel(Kernel):
             (sc.SmBSplineCurve, "BSPLINE"),
         ):
             if isinstance(curve, cls):
-                if label == "BSPLINE" and curve.address in self._bezier:
-                    return "BEZIER"
+                if label == "BSPLINE":
+                    if curve.address in self._bezier:
+                        return "BEZIER"
+                    return self._plain_nurbs_type(curve)
                 return label
         return "OTHER"
+
+    def _plain_nurbs_type(self, curve: Any) -> str:
+        """A NURBS that is a straight line or a circular arc in all but name
+        (the kernel's chamfers and sweeps make such) reports as one."""
+        if int(curve.GetDegree()) == 1:
+            status, poles, _ = curve.GetControlPolygon([], [])
+            if status == SM_SUCCESS and len(poles) == 2:
+                return "LINE"
+        domain = curve.GetNaturalInterval()
+        if self._circle_fit(curve, domain.GetMin(), domain.GetMax()) is not None:
+            return "CIRCLE"
+        return "BSPLINE"
+
+    def _circle_fit(
+        self, curve: Any, first: float, last: float
+    ) -> tuple[Point, float, Point] | None:
+        """Centre, radius and axis of the circle a curve runs on, if it does."""
+        point = self.sc.SmVector3d()
+
+        def at(t: float) -> Point:
+            _check(curve.EvaluatePoint(t, point), "curve evaluation")
+            return (point.x, point.y, point.z)
+
+        span = last - first
+        a, b, c = at(first), at(first + span / 3), at(first + 2 * span / 3)
+        ab = tuple(q - p for p, q in zip(a, b))
+        ac = tuple(q - p for p, q in zip(a, c))
+        normal = _cross(ab, ac)
+        size2 = _dot(normal, normal)
+        if size2 < 1e-24:
+            return None
+        # circumcentre of the three points
+        ab2, ac2 = _dot(ab, ab), _dot(ac, ac)
+        to_centre = tuple(
+            (ac2 * x - ab2 * y) / (2 * size2)
+            for x, y in zip(_cross(normal, ab), _cross(normal, ac))
+        )
+        centre = tuple(p + d for p, d in zip(a, to_centre))
+        radius = math.dist(centre, a)
+        if radius < _TOLERANCE:
+            return None
+        axis = _unit(normal)
+        for i in range(1, 12):
+            q = at(first + span * i / 12)
+            rel = tuple(x - y for x, y in zip(q, centre))
+            if abs(math.dist(q, centre) - radius) > 1e-9 * radius or abs(_dot(rel, axis)) > 1e-9 * radius:
+                return None
+        return centre, radius, axis  # type: ignore[return-value]
 
     def surface_type(self, surface: Any) -> str:
         sc = self.sc
@@ -4275,9 +4362,7 @@ class SmlibCoreKernel(Kernel):
             new_radius = radius + outward
             if new_radius <= _TOLERANCE:
                 return None
-            position = view.curve.GetPosition()
-            x_axis = self.kernel_pt(position.GetXAxis())
-            y_axis = self.kernel_pt(position.GetYAxis())
+            origin, x_axis, y_axis, _ = view._frame()  # pylint: disable=protected-access
 
             def angle_at(t: float) -> float:
                 """The angle on the circle of the point at parameter ``t``."""
@@ -4290,9 +4375,9 @@ class SmlibCoreKernel(Kernel):
             while a2 <= a1 + 1e-9:
                 a2 += 360.0
             circle = self.sc.SmCircle(
-                position.GetOrigin(),
-                position.GetXAxis(),
-                position.GetYAxis(),
+                self._vec(origin),
+                self._vec(x_axis),
+                self._vec(y_axis),
                 self.sc.SmExtent1d(a1, a2),
                 new_radius,
                 3,
