@@ -467,9 +467,13 @@ def _solve_wire_fillet_corner_lines(
     centre = corner_point + (dir0 + dir1).normalized() * (radius / sin(half))
     midway = centre + (((touch0 + touch1) / 2) - centre).normalized() * radius
     fillet_arc = Edge.make_three_point_arc(touch0, midway, touch1)
-    trimmed_topods_edges = []
+    trimmed_topods_edges: list[TopoDS_Edge | None] = []
     for edge, touch in zip(corner.connected_edges, (touch0, touch1)):
         other_vertex = [v for v in edge.vertices() if not v.is_same(corner.vertex)][0]
+        if (Vector(other_vertex) - touch).length <= TOLERANCE:
+            # the arc reaches the far end of the edge: nothing of it is left
+            trimmed_topods_edges.append(None)
+            continue
         split_vertex = Vertex(kernel.make_vertex(tuple(touch)))
         split_edges = _split_edge_at_vertex(copy.deepcopy(edge), split_vertex)
         edge_result = next(

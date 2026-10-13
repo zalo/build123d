@@ -3483,21 +3483,26 @@ class SmlibCoreKernel(Kernel):
             towards = [b - a for a, b in zip(centre_0, centre_1)]
             if _dot(normal_0, towards) < 0:
                 turned(0)
-                normal_0, _ = winding(0)
+            previous, _ = winding(0)
             for k in range(1, len(wires)):
+                # against the loop before: sections far along a curved
+                # path may face away from the first one entirely
                 normal_k, _ = winding(k)
-                if _dot(normal_0, normal_k) < 0:
+                if _dot(previous, normal_k) < 0:
                     turned(k)
+                    normal_k, _ = winding(k)
+                previous = normal_k
 
         # where each closed loop should begin: the turn that keeps it nearest
         # the first loop point for point
         offsets = [0.0]
         samples = [i / 32 for i in range(32)]
-        reference = [point_at(0, u) for u in samples]
         for k in range(1, len(wires)):
             if not closed:
                 offsets.append(0.0)
                 continue
+            # each loop follows the one before it (the first is far away)
+            reference = [point_at(k - 1, u + offsets[k - 1]) for u in samples]
             candidates = sorted({*marks_of[k], *(i / 64 for i in range(64))})
             best, best_cost = 0.0, math.inf
             for offset in candidates:
@@ -3507,7 +3512,19 @@ class SmlibCoreKernel(Kernel):
                 )
                 if cost < best_cost:
                     best, best_cost = offset, cost
-            offsets.append(best)
+            # a vertex nearly at a fraction where an earlier loop has one is
+            # put exactly there, so alike sections split alike
+            placed = [
+                (v - o) % 1.0 for marks, o in zip(marks_of[:k], offsets) for v in marks
+            ]
+            shift, snapped = 1 / 32, best
+            for v in marks_of[k]:
+                f = (v - best) % 1.0
+                for u in placed:
+                    gap = (f - u + 0.5) % 1.0 - 0.5
+                    if abs(gap) < shift:
+                        shift, snapped = abs(gap), (best + gap) % 1.0
+            offsets.append(snapped)
 
         # every vertex of every loop, as a fraction of the first loop
         union: list[float] = []
@@ -3699,9 +3716,30 @@ class SmlibCoreKernel(Kernel):
         """A loft as one surface per edge position across the sections
         (ruled between neighbours, or skinned through all), capped and sewn."""
         faces: list[SmHandle] = []
-        for j in range(len(loops[0])):
-            column = [self._as_nurbs(loop[j]) for loop in loops]
-            if ruled or len(column) == 2:
+        count, depth = len(loops[0]), len(loops)
+        columns = [[self._as_nurbs(loop[j]) for loop in loops] for j in range(count)]
+        rails: list[Any] = []
+        params: list[float] = []
+        if not ruled and depth > 2:
+            # neighbouring skins must share their side boundaries exactly:
+            # the rails through the piece ends are interpolated first, all
+            # with one parameterization, and the skins are built between them
+            starts = [
+                [self._pt(self._start_of(column[i])) for i in range(depth)]
+                for column in columns
+            ]
+            params = [0.0] * depth
+            for points in starts:
+                acc = 0.0
+                for i in range(1, depth):
+                    acc += math.dist(points[i - 1], points[i])
+                    params[i] += acc / count
+            for points in starts:
+                poles, flat, degree = _occt_interpolation(points, params, [None] * depth, True)
+                rails.append(self._nurbs(poles, flat, degree, None))
+            rails.append(rails[0])
+        for j, column in enumerate(columns):
+            if ruled or depth == 2:
                 for a, b in zip(column, column[1:]):
                     status, surface = self.sc.SmBSplineSurface.CreateRuledSurface(
                         self.context, a, b, self.sc.SM_SP_V
@@ -3710,7 +3748,16 @@ class SmlibCoreKernel(Kernel):
                     faces.append(self._face_on_surface(surface))
             else:
                 status, surface = self.sc.SmBSplineSurface.CreateSkinnedSurface(
-                    self.context, column, False, self.sc.SM_SP_V, _TOLERANCE
+                    self.context,
+                    column,
+                    False,
+                    self.sc.SM_SP_V,
+                    0.0,  # interpolate the sections
+                    rails[j],
+                    rails[j + 1],
+                    False,
+                    params,
+                    3,
                 )
                 _check(status, "skinned surface")
                 faces.append(self._face_on_surface(surface))
@@ -3724,6 +3771,12 @@ class SmlibCoreKernel(Kernel):
         if solid and result.kind is TopoKind.SHELL:
             return self.solid_from_shell(result)
         return result
+
+    def _start_of(self, curve: Any) -> Any:
+        """The point where a curve's natural interval begins."""
+        point = self.sc.SmVector3d()
+        _check(curve.EvaluatePoint(curve.GetNaturalInterval().GetMin(), point), "curve evaluation")
+        return point
 
     @staticmethod
     def _as_wire(section: SmHandle) -> SmHandle:
