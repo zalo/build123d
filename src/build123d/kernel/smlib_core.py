@@ -338,6 +338,13 @@ class SmCurveView(CurveView):
         if self.geom_type == "LINE":
             whole = self.length()
             return start if whole <= 0 else start + (self.last - self.first) * length / whole
+        if t0 is None:
+            # the ends exactly, as OCCT gives them (the search lands a hair off)
+            whole = self.length()
+            if abs(length) <= 1e-12 * max(1.0, whole):
+                return self.first
+            if abs(length - whole) <= 1e-12 * max(1.0, whole):
+                return self.last
         result = self.curve.FindParameterAtArcLength(start, length, None)
         status, param = result[0], result[1]
         _check(status, "parameter at length")
@@ -2088,14 +2095,48 @@ class SmlibCoreKernel(Kernel):
         if all(self._is_one_dimensional(s) for s in (*args, *tools)):
             if op is BoolOp.COMMON:
                 return self._edge_pieces(args, tools, True), record
-            # the edges are kept as they are (no splitting at crossings)
+            # the edges are split where other edges cross them or end on
+            # them, as OCCT's fuse of edges does
             edges: dict[Hashable, SmHandle] = {}
             for shape in (*args, *tools):
                 for edge in self.sub_shapes(shape, TopoKind.EDGE):
                     edges.setdefault(edge.key(), edge)
                 for sub in self._tracked_subshapes(shape):
                     record.modified[sub.key()] = [sub]
-            return SmHandle(TopoKind.COMPOUND, members=list(edges.values())), record
+            unique = list(edges.values())
+            views = [SmCurveView(self, e) for e in unique]
+            pieces: list[SmHandle] = []
+            for index, (edge, view) in enumerate(zip(unique, views)):
+                interval = self.sc.SmExtent1d(view.first, view.last)
+                cuts: list[Point] = []
+                for other_index, other in enumerate(views):
+                    if other_index == index:
+                        continue
+                    cuts.extend(
+                        self._crossings(
+                            view.curve, interval, ("curve", (other.curve, self.sc.SmExtent1d(other.first, other.last)))
+                        )
+                    )
+                    cuts.extend(other.value(t) for t in (other.first, other.last))
+                params = []
+                for param, distance in sorted(view.drop_point(p) for p in cuts):
+                    if distance > _TOLERANCE or not (view.first + _TOLERANCE < param < view.last - _TOLERANCE):
+                        continue
+                    if params and abs(param - params[-1]) <= 1e-9:
+                        continue  # the same cut found twice: keep the exact parameter
+                    params.append(param)
+                if not params:
+                    pieces.append(edge)
+                    continue
+                bounds = [view.first, *params, view.last]
+                became = []
+                for t0, t1 in zip(bounds, bounds[1:]):
+                    piece = self.trim_edge(edge, t0, t1)
+                    piece.flip = edge.flip
+                    became.append(piece)
+                pieces.extend(became)
+                record.modified[edge.key()] = became
+            return SmHandle(TopoKind.COMPOUND, members=pieces), record
         arg_bodies = [
             self._tracked_copy(b, record) for a in args for b in self._bodies(a)
         ]
@@ -3002,8 +3043,34 @@ class SmlibCoreKernel(Kernel):
             return self._primitive(
                 lambda c: c.CreateLinearSweep(curves, unit, distance, 1, 1, 1)
             )
-        if shape.kind in (TopoKind.WIRE, TopoKind.EDGE):
-            wire = shape if shape.kind is TopoKind.WIRE else SmHandle(TopoKind.WIRE, members=[shape])
+        if shape.kind is TopoKind.EDGE:
+            # one edge sweeps one face; the body sweep keeps analytic surfaces
+            # but splits a curve of several spans into several faces, in
+            # which case the surface is made directly
+            as_wire = SmHandle(TopoKind.WIRE, members=[shape])
+            sheet = self._primitive(
+                lambda c: c.CreateLinearSweep(self._loop_curves(as_wire), unit, distance, 1, 0, 1)
+            )
+            faces = self._entities(sheet.entity, TopoKind.FACE)
+            if len(faces) == 1:
+                _check(faces[0].SwapUV(), "face orientation")  # OCCT: direction x tangent
+                return SmHandle(TopoKind.FACE, faces[0])
+            curve = self._as_nurbs(self._loop_curves(as_wire)[0])
+            status, surface = self.sc.SmBSplineSurface.CreateLinearSweep(
+                self.context, curve, self._vec(direction)
+            )
+            _check(status, "linear sweep")
+            face = self._face_on_surface(surface)
+            view = SmSurfaceView(self, face)
+            _, normal = view.normal(*view._mid())  # pylint: disable=protected-access
+            _, tangent = SmCurveView(self, shape).d1(0.5 * (SmCurveView(self, shape).first + SmCurveView(self, shape).last))
+            if shape.flip:
+                tangent = tuple(-c for c in tangent)
+            if _dot(normal, _cross(direction, tangent)) < 0:  # OCCT: direction x tangent
+                _check(face.entity.SwapUV(), "face orientation")
+            return face
+        if shape.kind is TopoKind.WIRE:
+            wire = shape
             curves = self._loop_curves(wire)
             sheet = self._primitive(
                 lambda c: c.CreateLinearSweep(curves, unit, distance, 1, 0, 1)
@@ -3013,8 +3080,6 @@ class SmlibCoreKernel(Kernel):
                 # the sweep's normal is tangent x direction; OCCT's sheets
                 # face the other way (direction x tangent)
                 _check(face.SwapUV(), "face orientation")
-            if shape.kind is TopoKind.EDGE and len(faces) == 1:
-                return SmHandle(TopoKind.FACE, faces[0])
             return sheet
         if shape.kind is TopoKind.VERTEX:
             start = self.vertex_point(shape)
@@ -3355,7 +3420,23 @@ class SmlibCoreKernel(Kernel):
             trsf = trsf.Multiplied(turn)
         return self._bake(profile, trsf)
 
-    sweep_multi = _unsupported("sweep_multi")
+    def sweep_multi(
+        self,
+        profiles: Sequence[SmHandle],
+        path: SmHandle,
+        *,
+        is_frenet: bool,
+        make_solid: bool,
+        binormal: Point | None = None,
+        binormal_origin: Point | None = None,
+        auxiliary_spine: SmHandle | None = None,
+    ) -> SmHandle:
+        """Several profiles along a path: skinned through the profiles where
+        they stand (the kernel's skinning with a spine keeps coplanar
+        sections flat, and the binormal and auxiliary spine are not imposed),
+        which follows the path only as far as the profiles do."""
+        del path, is_frenet, binormal, binormal_origin, auxiliary_spine
+        return self.loft(profiles, make_solid, False)
 
     def fillet(
         self, shape: SmHandle, edges: Sequence[SmHandle], radius: float
@@ -4562,21 +4643,44 @@ class SmlibCoreKernel(Kernel):
                 grown = False
                 tail = ends(chain[-1])[1]
                 head = ends(chain[0])[0]
-                for candidate in list(remaining):
+                if len(chain) > 1 and near(tail, head):
+                    break  # closed: a branch at the junction stays apart
+                # every way the chain can grow: (candidate, at the tail?, flipped?, far end)
+                options = []
+                for candidate in remaining:
                     start, end = ends(candidate)
                     if near(start, tail):
-                        chain.append(candidate)
+                        options.append((candidate, True, False, end))
                     elif near(end, tail):
-                        chain.append(candidate.with_flip(not candidate.flip))
+                        options.append((candidate, True, True, start))
                     elif near(end, head):
-                        chain.insert(0, candidate)
+                        options.append((candidate, False, False, start))
                     elif near(start, head):
-                        chain.insert(0, candidate.with_flip(not candidate.flip))
-                    else:
-                        continue
-                    remaining.remove(candidate)
-                    grown = True
+                        options.append((candidate, False, True, end))
+                if not options:
                     break
+
+                def leads_on(option: tuple[Any, ...]) -> int:
+                    """0 when the far end closes the chain, 1 when another
+                    edge continues from it, 2 for a dead end (left for last)."""
+                    candidate, at_tail, _, far = option
+                    if near(far, head if at_tail else tail):
+                        return 0
+                    for other in remaining:
+                        if other is candidate:
+                            continue
+                        if any(near(far, p) for p in ends(other)):
+                            return 1
+                    return 2
+
+                candidate, at_tail, flipped, _ = min(options, key=leads_on)
+                piece = candidate.with_flip(not candidate.flip) if flipped else candidate
+                if at_tail:
+                    chain.append(piece)
+                else:
+                    chain.insert(0, piece)
+                remaining.remove(candidate)
+                grown = True
             wires.append(SmHandle(TopoKind.WIRE, members=chain))
         return wires
 
