@@ -951,6 +951,13 @@ class KernelGeometry(ABC):
     def half_space(self, shape: Handle, point: Point) -> Handle:
         """The half-space solid bounded by a face or shell that contains ``point``."""
 
+    def same_side(self, piece: Handle, tool: Handle, point: Point, tolerance: float) -> bool:
+        """Whether ``piece`` lies on the side of the sheet ``tool`` that
+        ``point`` is on: by default, whether it shares anything of length
+        with the half-space the sheet bounds there."""
+        common, _ = self.boolean(BoolOp.COMMON, [piece], [self.half_space(tool, point)])
+        return self.length(common) >= tolerance
+
     @abstractmethod
     def ruled_surface(self, a: Handle, b: Handle) -> Handle:
         """A face ruled between two edges, or a shell between two wires."""

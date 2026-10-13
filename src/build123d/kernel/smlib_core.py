@@ -56,7 +56,9 @@ from OCP.gp import (  # placement bookkeeping only
     gp_Pnt,
     gp_Trsf,
     gp_Vec,
+    gp_XYZ,
 )
+from OCP.Standard import Standard_Failure
 from OCP.TopLoc import TopLoc_Location
 
 from build123d.kernel.base import (
@@ -74,7 +76,7 @@ from build123d.kernel.base import (
 
 SM_SUCCESS = 1000
 _TOLERANCE = 1e-6
-_MASS_ACCURACY = 1e-8  # ~1e-5 relative on spheres, well inside the test tolerances
+_MASS_ACCURACY = 1e-10  # the integrator's accuracy; the areas and volumes are compared to 7 places
 _INFINITE = 1e4  # half-size standing in for OCCT's unbounded lines and planes
 _HYPERBOLA_SPAN = 20.0  # parameter span standing in for a full hyperbola
 _HUGE = 1e300  # "best answer so far" that never prunes a solver
@@ -106,10 +108,24 @@ def _restore_locations(moved: SmHandle, original: SmHandle) -> None:
             _restore_locations(new_member, old_member)
 
 
-def _point_key(point: Sequence[float]) -> tuple[Any, ...]:
+def _point_key(point: Sequence[float], digits: int = 9) -> tuple[Any, ...]:
     """Identity of a free vertex: its position, rounded well below the kernel
     tolerance so that the ends of meeting edges agree."""
-    return ("at",) + tuple(round(c, 9) + 0.0 for c in point)
+    return ("at",) + tuple(round(c, digits) + 0.0 for c in point)
+
+
+def _perpendicular(direction: Sequence[float]) -> Point:
+    """A unit vector at right angles to ``direction``, chosen the way
+    OCCT's ``gp_Ax2`` chooses its X direction from a main direction."""
+    a, b, c = direction
+    aa, bb, cc = abs(a), abs(b), abs(c)
+    if bb <= aa and bb <= cc:
+        x = (-c, 0.0, a) if aa > cc else (c, 0.0, -a)
+    elif aa <= bb and aa <= cc:
+        x = (0.0, -c, b) if bb > cc else (0.0, c, -b)
+    else:
+        x = (-b, a, 0.0) if aa > bb else (b, -a, 0.0)
+    return _unit(x)
 
 
 def _unit(a: Sequence[float]) -> Point:
@@ -242,7 +258,12 @@ class SmCurveView(CurveView):
         self.shape = shape
         self.sc = kernel.sc
         if shape.kind is TopoKind.WIRE:
-            raise NotImplementedError("smlib: curve views of wires")
+            # one NURBS running along the wire's edges
+            self.curve = kernel._joined_curve(shape)  # pylint: disable=protected-access
+            domain = self.curve.GetNaturalInterval()
+            self.first, self.last = domain.GetMin(), domain.GetMax()
+            self.geom_type = kernel.curve_type(self.curve)
+            return
         if shape.entity is not None:
             edge = shape.entity
             self.curve = edge.GetCurve()
@@ -295,7 +316,7 @@ class SmCurveView(CurveView):
     def length(self, t0: float | None = None, t1: float | None = None) -> float:
         a = self.first if t0 is None else t0
         b = self.last if t1 is None else t1
-        status, length = self.curve.Length(self.sc.SmExtent1d(a, b), _TOLERANCE)
+        status, length = self.curve.Length(self.sc.SmExtent1d(a, b), 1e-10)
         _check(status, "curve length")
         return length
 
@@ -321,12 +342,95 @@ class SmCurveView(CurveView):
         _check(result, "point drop")
         return float(result[-2]), float(result[-1])
 
-    def positions_by_deflection(self, deflection: float) -> list[Point]:
-        count = 32
+    def samples(self, count: int) -> list[Point]:
+        """``count + 1`` points spread evenly in parameter, ends included."""
         return [
             self._point(self.first + (self.last - self.first) * i / count)
             for i in range(count + 1)
         ]
+
+    def _spans(self) -> list[float]:
+        """The parameters where the curve's spans meet, ends included."""
+        breaks = [self.first]
+        get_knots = getattr(self.curve, "GetKnotsAll", None)
+        if get_knots is not None:
+            status, knots = get_knots([])
+            if status == SM_SUCCESS:
+                for knot in knots:
+                    if self.first + 1e-9 < knot < self.last - 1e-9 and knot - breaks[-1] > 1e-9:
+                        breaks.append(float(knot))
+        breaks.append(self.last)
+        return breaks
+
+    def positions_by_deflection(self, deflection: float) -> list[Point]:
+        """Points along the curve whose chords stay within ``deflection``."""
+        if deflection <= 0:
+            raise RuntimeError("Deflection calculation failed")
+        points: list[Point] = [self._point(self.first)]
+
+        def refine(t0: float, p0: Point, t1: float, p1: Point, depth: int) -> None:
+            t_mid = 0.5 * (t0 + t1)
+            p_mid = self._point(t_mid)
+            chord = tuple(b - a for a, b in zip(p0, p1))
+            offset = tuple(b - a for a, b in zip(p0, p_mid))
+            chord_len2 = _dot(chord, chord)
+            if chord_len2 < 1e-24:
+                gap = math.sqrt(_dot(offset, offset))
+            else:
+                along = _dot(offset, chord) / chord_len2
+                foot = tuple(a + along * c for a, c in zip(p0, chord))
+                gap = math.dist(p_mid, foot)
+            if gap > deflection and depth < 16:
+                refine(t0, p0, t_mid, p_mid, depth + 1)
+                refine(t_mid, p_mid, t1, p1, depth + 1)
+            else:
+                points.append(p1)
+
+        breaks = self._spans()
+        for t0, t1 in zip(breaks, breaks[1:]):
+            p0, p1 = self._point(t0), self._point(t1)
+            if math.dist(p0, p1) > _TOLERANCE:
+                refine(t0, p0, t1, p1, 0)
+                continue
+            # a span closing on itself (a full circle in one span) would be
+            # mistaken for a chord of no length: start from its quarters
+            quarter = [t0 + (t1 - t0) * i / 4 for i in range(5)]
+            samples = [self._point(t) for t in quarter]
+            for (ta, pa), (tb, pb) in zip(
+                zip(quarter, samples), zip(quarter[1:], samples[1:])
+            ):
+                refine(ta, pa, tb, pb, 0)
+        return points
+
+    _GAUSS = (
+        (0.0, 0.5688888888888889),
+        (-0.5384693101056831, 0.47862867049936647),
+        (0.5384693101056831, 0.47862867049936647),
+        (-0.906179845938664, 0.23692688505618908),
+        (0.906179845938664, 0.23692688505618908),
+    )
+
+    def centroid(self) -> Point:
+        """The centre of mass of the curve (by arc length)."""
+        total = 0.0
+        moment = [0.0, 0.0, 0.0]
+        breaks = self._spans()
+        for t0, t1 in zip(breaks, breaks[1:]):
+            pieces = 4
+            for i in range(pieces):
+                a = t0 + (t1 - t0) * i / pieces
+                b = t0 + (t1 - t0) * (i + 1) / pieces
+                half = 0.5 * (b - a)
+                mid = 0.5 * (a + b)
+                for node, weight in self._GAUSS:
+                    point, tangent = self.d1(mid + half * node)
+                    speed = math.sqrt(_dot(tangent, tangent)) * half * weight
+                    total += speed
+                    for k in range(3):
+                        moment[k] += point[k] * speed
+        if total < 1e-300:
+            return self._point(self.first)
+        return (moment[0] / total, moment[1] / total, moment[2] / total)
 
     def _frame(self) -> tuple[Point, Point, Point, Point]:
         """Origin, x, y and z axes of an analytic curve's placement."""
@@ -487,10 +591,19 @@ class SmSurfaceView(SurfaceView):
         return params.x, params.y
 
     def plane(self) -> tuple[Point, Point, Point] | None:
-        if self.geom_type != "PLANE":
-            return None
         origin, du, dv = self.d1(*self._mid())
         _, normal = self.normal(*self._mid())
+        if self.geom_type != "PLANE":
+            # a surface of another kind that is flat all the same (a ruled
+            # or skinned patch between straight sections)
+            u0, u1, v0, v1 = self._bounds
+            scale = max(1.0, max(abs(c) for c in origin))
+            for i in range(5):
+                for j in range(5):
+                    point = self.value(u0 + (u1 - u0) * i / 4, v0 + (v1 - v0) * j / 4)
+                    gap = _dot(normal, tuple(p - o for p, o in zip(point, origin)))
+                    if abs(gap) > _TOLERANCE * scale:
+                        return None
         length = math.sqrt(sum(c * c for c in du)) or 1.0
         return origin, normal, tuple(c / length for c in du)  # type: ignore[return-value]
 
@@ -541,7 +654,7 @@ class SmlibCoreKernel(Kernel):
     """SMLib through the generated kernel-level bindings."""
 
     name = "smlib"
-    failure_types = (RuntimeError,)
+    failure_types = (RuntimeError, Standard_Failure)
 
     def __init__(self) -> None:
         self.sc = _import_core()
@@ -549,6 +662,8 @@ class SmlibCoreKernel(Kernel):
         self.context = self._probe.GetContext()
         self._meshes: dict[int, tuple[Any, float]] = {}  # brep address -> (poly brep, tolerance)
         self._bezier: set[int] = set()  # curve addresses made by make_bezier
+        self._sheets: dict[int, tuple[Any, Any]] = {}  # face address -> (face, one-face body)
+        self._boxes: dict[int, tuple[Point, Point]] = {}  # brep address -> box, during a boolean
 
     # ---- helpers --------------------------------------------------------------
 
@@ -604,18 +719,24 @@ class SmlibCoreKernel(Kernel):
     def _lumps(self, brep: Any) -> list[Any]:
         """The separate solid bodies of a brep, each copied into its own brep
         when there are several; the brep itself when there is one."""
-        solid_shells = [
-            shell
-            for shell in brep.GetShells([])
-            if shell.GetRegion() != brep.GetInfiniteRegion()
-        ]
-        if len(solid_shells) <= 1:
+        # a solid is a region that is not void (the infinite region and the
+        # cavities are); its shells are the outer one and the cavity walls
+        regions: dict[int, list[Any]] = {}
+        for shell in brep.GetShells([]):
+            region = shell.GetRegion()
+            if region.IsVoid():
+                continue
+            faces = regions.setdefault(region.address, [])
+            known = {f.address for f in faces}
+            for faceuse in shell.GetFaceuses([]):
+                face = faceuse.GetFace()
+                if face.address not in known:
+                    known.add(face.address)
+                    faces.append(face)
+        if len(regions) <= 1:
             return [brep]
         lumps = []
-        for shell in solid_shells:
-            faces = list(
-                {fu.GetFace().address: fu.GetFace() for fu in shell.GetFaceuses([])}.values()
-            )
+        for faces in regions.values():
             lump = self._new_brep()
             _check(brep.CopyFaces(faces, lump, None, 1, None), "lump copy")
             lumps.append(lump)
@@ -748,14 +869,38 @@ class SmlibCoreKernel(Kernel):
                 or a.entity.GetBrep().address != b.entity.GetBrep().address
             ):
                 return math.dist(self.vertex_point(a), self.vertex_point(b)) < _TOLERANCE
-        if a.kind is b.kind is TopoKind.EDGE and (
-            a.entity is None
-            or b.entity is None
-            or a.entity.GetBrep().address != b.entity.GetBrep().address
+        if a.kind is b.kind and a.kind in (TopoKind.EDGE, TopoKind.FACE) and (
+            (a.entity is None) != (b.entity is None)
+            or (
+                a.entity is not None
+                and b.entity is not None
+                and a.entity.GetBrep().address != b.entity.GetBrep().address
+            )
         ):
-            # likewise an edge of a wire and the edge of a face built on it
-            return self._same_curve(a, b)
+            # likewise an edge of a wire and the edge of a face built on it,
+            # or the untouched face of a body an operation rebuilt
+            if a.kind is TopoKind.EDGE:
+                return self._same_curve(a, b)
+            return self._same_face(a, b)
         return False
+
+    def _same_face(self, a: SmHandle, b: SmHandle) -> bool:
+        """Whether two faces cover the same patch of the same surface."""
+        try:
+            if abs(self.area(a) - self.area(b)) > _TOLERANCE:
+                return False
+        except RuntimeError:
+            return False
+        if math.dist(self.center_of_mass(a, TopoKind.FACE), self.center_of_mass(b, TopoKind.FACE)) > _TOLERANCE:
+            return False
+        if self.surface_type(a.entity.GetSurface()) != self.surface_type(b.entity.GetSurface()):
+            return False
+        corners_a = {_point_key(p) for p in self._corner_points(a)}
+        corners_b = {_point_key(p) for p in self._corner_points(b)}
+        return corners_a == corners_b
+
+    def _corner_points(self, shape: SmHandle) -> list[Point]:
+        return [self.vertex_point(v) for v in self.sub_shapes(shape, TopoKind.VERTEX)]
 
     def _same_curve(self, a: SmHandle, b: SmHandle) -> bool:
         """Whether two edges run over the same points (either way round)."""
@@ -779,6 +924,27 @@ class SmlibCoreKernel(Kernel):
         return a.key() == b.key() or (a.partner == b.partner and a.kind == b.kind)
 
     def hash_key(self, shape: SmHandle) -> Hashable:
+        # vertices, edges and faces are the same across bodies when they lie
+        # at the same place (see is_same), so their hashes are positional
+        if shape.kind is TopoKind.VERTEX:
+            return _point_key(self.vertex_point(shape), 5)
+        if shape.entity is None:
+            return shape.key()  # free edges stay apart, like OCCT's
+        try:
+            if shape.kind is TopoKind.EDGE:
+                view = SmCurveView(self, shape)
+                ends = frozenset(
+                    _point_key(view.value(t), 5) for t in (view.first, view.last)
+                )
+                return (TopoKind.EDGE, ends, round(view.length(), 4))
+            if shape.kind is TopoKind.FACE:
+                return (
+                    TopoKind.FACE,
+                    round(self.area(shape), 4),
+                    _point_key(self.center_of_mass(shape, TopoKind.FACE), 5),
+                )
+        except RuntimeError:
+            pass  # a face the kernel cannot measure keeps its own identity
         return shape.key()
 
     def copy_deep(self, shape: SmHandle) -> SmHandle:
@@ -1064,13 +1230,76 @@ class SmlibCoreKernel(Kernel):
         return 0.0
 
     def _face_properties(self, face: SmHandle) -> tuple[float, Point]:
+        planar = self._planar_face_properties(face)
+        if planar is not None:
+            return planar
         status, area, _, moments = face.entity.ComputePreciseProperties(
             self.sc.SM_OT_SAME, _MASS_ACCURACY, self._vec((0.0, 0.0, 0.0)), 0.0, 0.0, []
         )
-        _check(status, "face properties")
+        if status != SM_SUCCESS:
+            return self._face_properties_by_mesh(face)
         first = moments[0]
         divisor = area if area > 1e-300 else 1.0
         return area, (first.x / divisor, first.y / divisor, first.z / divisor)
+
+    def _planar_face_properties(self, face: SmHandle) -> tuple[float, Point] | None:
+        """Area and centroid of a planar face by integrating around its
+        loops (Green's theorem, Gauss quadrature on each edge): exact to
+        rounding where the kernel's integrator is not."""
+        view = SmSurfaceView(self, face)
+        plane = view.plane()
+        if plane is None:
+            return None
+        origin, normal, x_dir = plane
+        y_dir = _cross(normal, x_dir)
+        area2 = 0.0  # twice the signed area
+        mx = my = 0.0  # 6 * area * centroid
+        for wire in self.sub_shape_uses(face, TopoKind.WIRE):
+            for curve in self._loop_curves(wire):
+                domain = curve.GetNaturalInterval()
+                edge = SmCurveView(self, self._free_edge(curve, domain.GetMin(), domain.GetMax()))
+                breaks = edge._spans()  # pylint: disable=protected-access
+                for t0, t1 in zip(breaks, breaks[1:]):
+                    pieces = 4
+                    for i in range(pieces):
+                        a = t0 + (t1 - t0) * i / pieces
+                        b = t0 + (t1 - t0) * (i + 1) / pieces
+                        half, mid = 0.5 * (b - a), 0.5 * (a + b)
+                        for node, weight in edge._GAUSS:  # pylint: disable=protected-access
+                            point, tangent = edge.d1(mid + half * node)
+                            rel = tuple(p - o for p, o in zip(point, origin))
+                            x, y = _dot(rel, x_dir), _dot(rel, y_dir)
+                            dx, dy = _dot(tangent, x_dir), _dot(tangent, y_dir)
+                            w = half * weight
+                            area2 += (x * dy - y * dx) * w
+                            mx += x * (x * dy - y * dx) * w
+                            my += y * (x * dy - y * dx) * w
+        if abs(area2) < 1e-300:
+            return None
+        area = 0.5 * area2
+        cx, cy = mx / (3 * area2), my / (3 * area2)
+        centre = tuple(o + cx * xd + cy * yd for o, xd, yd in zip(origin, x_dir, y_dir))
+        return abs(area), centre  # type: ignore[return-value]
+
+    def _face_properties_by_mesh(self, face: SmHandle) -> tuple[float, Point]:
+        """Area and centroid summed over a fine triangulation, for the faces
+        whose loops the kernel's integrator does not accept."""
+        self.mesh(face, 1e-4, math.radians(5))
+        triangulation = self.face_triangulation(face)
+        if triangulation is None:
+            raise RuntimeError("SMLib face properties failed")
+        points, triangles = triangulation
+        area = 0.0
+        moment = [0.0, 0.0, 0.0]
+        for i, j, k in triangles:
+            a, b, c = points[i], points[j], points[k]
+            n = _cross(tuple(q - p for p, q in zip(a, b)), tuple(q - p for p, q in zip(a, c)))
+            piece = 0.5 * math.sqrt(_dot(n, n))
+            area += piece
+            for axis in range(3):
+                moment[axis] += piece * (a[axis] + b[axis] + c[axis]) / 3
+        divisor = area if area > 1e-300 else 1.0
+        return area, (moment[0] / divisor, moment[1] / divisor, moment[2] / divisor)
 
     def volume(self, shape: SmHandle) -> float:
         if shape.kind is TopoKind.SOLID:
@@ -1103,10 +1332,7 @@ class SmlibCoreKernel(Kernel):
             area, center = self._face_properties(shape)
             return center
         if shape.kind is TopoKind.EDGE:
-            view = SmCurveView(self, shape)
-            points = view.positions_by_deflection(0.0)
-            n = len(points)
-            return tuple(sum(p[i] for p in points) / n for i in range(3))  # type: ignore[return-value]
+            return SmCurveView(self, shape).centroid()
         # weighted average of the members' centres
         parts = []
         for member in (
@@ -1137,10 +1363,17 @@ class SmlibCoreKernel(Kernel):
             p = self.vertex_point(shape)
             boxes.append(p + p)
         elif shape.kind is TopoKind.EDGE:
-            points = SmCurveView(self, shape).positions_by_deflection(0.0)
+            view = SmCurveView(self, shape)
+            extent = self.sc.SmExtent3d()
+            _check(
+                view.curve.CalculateTightBoundingBox(
+                    self.sc.SmExtent1d(view.first, view.last), extent
+                ),
+                "bounding box",
+            )
             boxes.append(
-                tuple(min(p[i] for p in points) for i in range(3))
-                + tuple(max(p[i] for p in points) for i in range(3))
+                tuple(extent.GetMin(i) for i in range(3))
+                + tuple(extent.GetMax(i) for i in range(3))
             )
         else:
             members = (
@@ -1231,12 +1464,14 @@ class SmlibCoreKernel(Kernel):
 
     def _finish_record(self, record: _Record, result: Any) -> None:
         """Drop from the record the copies that did not survive."""
+        results = result if isinstance(result, list) else [result]
         alive = {
             e.address
+            for r in results
             for kind in (TopoKind.VERTEX, TopoKind.EDGE, TopoKind.FACE)
-            for e in self._entities(result, kind)
+            for e in self._entities(r, kind)
         }
-        alive.add(result.address)
+        alive.update(r.address for r in results)
         for key, became in list(record.modified.items()):
             survivors = [
                 h for h in became if h.entity is None or h.entity.address in alive
@@ -1284,13 +1519,11 @@ class SmlibCoreKernel(Kernel):
             and not any(self._is_one_dimensional(a) for a in args)
         ):
             return self._edges_inside(tools, args), record
+        if op is BoolOp.CUT and all(self._is_one_dimensional(a) for a in args):
+            return self._edge_pieces(args, tools, False), record
         if all(self._is_one_dimensional(s) for s in (*args, *tools)):
             if op is BoolOp.COMMON:
-                # overlaps of edges along their length are not found; the
-                # crossings come from the section
-                return SmHandle(TopoKind.COMPOUND), record
-            if op is not BoolOp.FUSE:
-                raise NotImplementedError(f"smlib: {op.value} of edges and wires")
+                return self._edge_pieces(args, tools, True), record
             # the edges are kept as they are (no splitting at crossings)
             edges: dict[Hashable, SmHandle] = {}
             for shape in (*args, *tools):
@@ -1307,15 +1540,51 @@ class SmlibCoreKernel(Kernel):
         ]
         if not arg_bodies:
             raise ValueError("a boolean needs at least one argument body")
-        result = arg_bodies[0]
-        for body in arg_bodies[1:]:
-            result = self._merge(result, body, self.sc.SM_BO_UNION)
-        for body in tool_bodies:
-            result = self._merge(result, body, ops[op])
-        self._finish_record(record, result)
+        # the merges consume their operands, so every body's box is taken
+        # before it goes in (and a merge result's as soon as it is made)
+        self._boxes = {}
+        for brep in (*arg_bodies, *tool_bodies):
+            self._box_of(brep, fresh=True)
+        results = self._fuse_bodies([], arg_bodies)
+        if op is BoolOp.FUSE:
+            results = self._fuse_bodies(results, tool_bodies)
+        else:
+            # a merge consumes both bodies: the tracked copies go in as they
+            # are the first time (so the record stays true) and as fresh
+            # copies when they are needed again
+            used: set[int] = set()
+
+            def operand(brep: Any) -> Any:
+                if brep.address in used:
+                    copy = self._copy_body(brep)[0]
+                    self._boxes[copy.address] = self._boxes[brep.address]
+                    return copy
+                used.add(brep.address)
+                return brep
+
+            if op is BoolOp.CUT:
+                for tool in tool_bodies:
+                    cut = []
+                    for body in results:
+                        if self._boxes_touch(body, tool):
+                            body = self._merge(body, operand(tool), self.sc.SM_BO_DIFFERENCE)
+                        cut.append(body)
+                    results = cut
+            else:  # COMMON: what each body shares with each tool
+                common = []
+                for body in results:
+                    for tool in tool_bodies:
+                        if self._boxes_touch(body, tool):
+                            common.append(
+                                self._merge(operand(body), operand(tool), self.sc.SM_BO_INTERSECTION)
+                            )
+                results = common
+        results = [r for r in results if self._entities(r, TopoKind.FACE)]
+        self._finish_record(record, results)
+        self._record_by_geometry(record, [*args, *tools], results)
         if all(s.kind is TopoKind.FACE for s in (*args, *tools)):
             # faces combine into faces; a sheet of one face is that face
-            faces = self._entities(result, TopoKind.FACE)
+            faces = [f for r in results for f in self._entities(r, TopoKind.FACE)]
             if len(faces) == 1:
                 return SmHandle(TopoKind.FACE, faces[0]), record
             return (
@@ -1325,7 +1594,116 @@ class SmlibCoreKernel(Kernel):
                 ),
                 record,
             )
-        return self._bodies_handle(result), record
+        handles = [self._bodies_handle(r) for r in results]
+        if len(handles) == 1:
+            return handles[0], record
+        members = [m for h in handles for m in (h.members if h.kind is TopoKind.COMPOUND else [h])]
+        return SmHandle(TopoKind.COMPOUND, members=members), record
+
+    def _record_by_geometry(
+        self, record: _Record, inputs: Sequence[SmHandle], results: Sequence[Any]
+    ) -> None:
+        """Record what each input face, edge and vertex became by geometry:
+        the merge builds its result from new entities, so a result entity
+        that lies on an input's surface, curve or point is what it became."""
+        faces = [f for r in results for f in self._entities(r, TopoKind.FACE)]
+        edges = [e for r in results for e in self._entities(r, TopoKind.EDGE)]
+        vertices = [v for r in results for v in self._entities(r, TopoKind.VERTEX)]
+        face_points = {}
+        for f in faces:
+            handle = SmHandle(TopoKind.FACE, f)
+            view = SmSurfaceView(self, handle)
+            face_points[f.address] = [self.vertex_point(v) for v in self.sub_shapes(handle, TopoKind.VERTEX)] + [view.value(*view._mid())]  # pylint: disable=protected-access
+        edge_points = {}
+        for e in edges:
+            view = SmCurveView(self, SmHandle(TopoKind.EDGE, e))
+            edge_points[e.address] = [view.value(view.first), view.value(0.5 * (view.first + view.last)), view.value(view.last)]
+        vertex_points = {v.address: self._pt(v.GetPoint()) for v in vertices}
+
+        def within(points: Sequence[Point], box: tuple[Point, Point]) -> bool:
+            low, high = box
+            return all(
+                low[i] - _TOLERANCE <= p[i] <= high[i] + _TOLERANCE for p in points for i in range(3)
+            )
+
+        def box_of(points: Sequence[Point]) -> tuple[Point, Point]:
+            return (
+                tuple(min(p[i] for p in points) for i in range(3)),  # type: ignore[return-value]
+                tuple(max(p[i] for p in points) for i in range(3)),  # type: ignore[return-value]
+            )
+
+        for shape in inputs:
+            for face in self.sub_shapes(shape, TopoKind.FACE):
+                view = SmSurfaceView(self, face)
+                corners = [self.vertex_point(v) for v in self.sub_shapes(face, TopoKind.VERTEX)]
+                samples = [view.value(*view._mid())]  # pylint: disable=protected-access
+                box = box_of(corners + samples) if corners else None
+                became = []
+                for f in faces:
+                    points = face_points[f.address]
+                    if box is not None and view.geom_type == "PLANE" and not within(points, box):
+                        continue
+                    if all(math.dist(view.value(*view.closest_uv(p)), p) <= _TOLERANCE for p in points):
+                        became.append(SmHandle(TopoKind.FACE, f))
+                self._note(record, face, became)
+            for edge in self.sub_shapes(shape, TopoKind.EDGE):
+                view = SmCurveView(self, edge)
+                became = []
+                for e in edges:
+                    if all(view.drop_point(p)[1] <= _TOLERANCE for p in edge_points[e.address]):
+                        became.append(SmHandle(TopoKind.EDGE, e))
+                self._note(record, edge, became)
+            for vertex in self.sub_shapes(shape, TopoKind.VERTEX):
+                point = self.vertex_point(vertex)
+                became = [
+                    SmHandle(TopoKind.VERTEX, v)
+                    for v in vertices
+                    if math.dist(vertex_points[v.address], point) <= _TOLERANCE
+                ]
+                self._note(record, vertex, became)
+
+    @staticmethod
+    def _note(record: _Record, sub: SmHandle, became: list[SmHandle]) -> None:
+        if became:
+            record.modified[sub.key()] = became
+            record.removed.discard(sub.key())
+        else:
+            record.modified.pop(sub.key(), None)
+            record.removed.add(sub.key())
+
+    def _box_of(self, brep: Any, fresh: bool = False) -> tuple[Point, Point]:
+        """The box of a body, cached by address during a boolean; a body
+        just made is measured afresh as its address may be a dead body's."""
+        known = None if fresh else self._boxes.get(brep.address)
+        if known is not None:
+            return known
+        extent = self.sc.SmExtent3d()
+        _check(brep.CalculateTightBoundingBox(extent), "bounding box")
+        box = (
+            tuple(extent.GetMin(i) for i in range(3)),
+            tuple(extent.GetMax(i) for i in range(3)),
+        )
+        self._boxes[brep.address] = box
+        return box  # type: ignore[return-value]
+
+    def _boxes_touch(self, a: Any, b: Any) -> bool:
+        (min_a, max_a), (min_b, max_b) = self._box_of(a), self._box_of(b)
+        return all(
+            min_a[i] <= max_b[i] + _TOLERANCE and min_b[i] <= max_a[i] + _TOLERANCE
+            for i in range(3)
+        )
+
+    def _fuse_bodies(self, results: list[Any], bodies: Sequence[Any]) -> list[Any]:
+        """Union ``bodies`` into ``results``, merging only what touches so
+        that the bodies apart stay separate breps."""
+        results = list(results)
+        for body in bodies:
+            touching = [r for r in results if self._boxes_touch(r, body)]
+            merged = body
+            for other in touching:
+                merged = self._merge(merged, other, self.sc.SM_BO_UNION)
+            results = [r for r in results if r not in touching] + [merged]
+        return results
 
     def _split(
         self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
@@ -1337,13 +1715,19 @@ class SmlibCoreKernel(Kernel):
             t.kind is TopoKind.VERTEX for t in tools
         ):
             return self._split_edges_at_points(args, tools), record
+        if all(self._is_one_dimensional(a) for a in args):
+            # edges cut where they cross the tools, every piece kept
+            inside = self._edge_pieces(args, tools, True)
+            outside = self._edge_pieces(args, tools, False)
+            return SmHandle(TopoKind.COMPOUND, members=[*inside.members, *outside.members]), record
         pieces: list[SmHandle] = [
             SmHandle(b.kind, b.entity, partner=b.partner) for a in args for b in self._bodies(a)
         ]
         for tool in tools:
             faces = self.sub_shapes(tool, TopoKind.FACE)
             if len(faces) != 1 or self.planar_surface(faces[0]) is None:
-                raise NotImplementedError("smlib: splitting by anything but one plane")
+                pieces = self._split_by_sheet(pieces, tool, record)
+                continue
             plane = self.planar_surface(faces[0])
             halves = []
             for side in (1.0, -1.0):
@@ -1364,7 +1748,7 @@ class SmlibCoreKernel(Kernel):
                         part, part_record = self.boolean(BoolOp.COMMON, [piece], [half])
                     except RuntimeError:
                         continue
-                    if self.is_null(part) or self.volume(part) <= _TOLERANCE:
+                    if self.is_null(part) or self._extent(part) <= _TOLERANCE:
                         continue
                     for key, became in part_record.modified.items():
                         record.modified.setdefault(key, []).extend(became)
@@ -1375,6 +1759,65 @@ class SmlibCoreKernel(Kernel):
         if len(pieces) == 1:
             return pieces[0], record
         return SmHandle(TopoKind.COMPOUND, members=pieces), record
+
+    def same_side(self, piece: SmHandle, tool: SmHandle, point: Point, tolerance: float) -> bool:
+        """Whether a piece's centre of mass is on the side of the sheet that
+        ``point`` is on (the sign of the normal at the nearest point)."""
+        centre = self.center_of_mass(piece, piece.kind)
+        return self._sheet_side(tool, centre) == self._sheet_side(tool, point)
+
+    def _sheet_side(self, tool: SmHandle, point: Point) -> bool:
+        best: tuple[float, bool] | None = None
+        for face in (
+            [tool] if tool.kind is TopoKind.FACE else self.sub_shapes(tool, TopoKind.FACE)
+        ):
+            view = SmSurfaceView(self, face)
+            uv = view.closest_uv(point)
+            nearest, normal = view.normal(*uv)
+            distance = math.dist(nearest, point)
+            if best is None or distance < best[0]:
+                best = (distance, _dot(normal, tuple(p - n for p, n in zip(point, nearest))) >= 0)
+        return best is not None and best[1]
+
+    def _extent(self, shape: SmHandle) -> float:
+        """Volume of a solid, area of a sheet: what tells a piece from nothing."""
+        if shape.kind is TopoKind.COMPOUND:
+            return sum(self._extent(m) for m in shape.members)
+        if shape.kind is TopoKind.SOLID:
+            return self.volume(shape)
+        return self.area(shape)
+
+    def _split_by_sheet(
+        self, pieces: Sequence[SmHandle], tool: SmHandle, record: _Record
+    ) -> list[SmHandle]:
+        """Split solids by a sheet of any shape: merged into a body without
+        joining regions, the sheet walls off the regions it closes, and each
+        solid region is copied out as a piece."""
+        tool_body = self._body(tool)
+        result: list[SmHandle] = []
+        for piece in pieces:
+            if piece.kind is not TopoKind.SOLID:
+                raise NotImplementedError("smlib: splitting a sheet by a curved sheet")
+            copy, _ = self._copy_body(piece.entity)
+            sheet, _ = self._copy_body(tool_body)
+            merge = self.sc.SmMerge(self.context, copy, sheet, 0.0, 0.0, None)
+            status, merged = merge.NonManifoldBoolean(self.sc.SM_BO_MERGE)
+            _check(status, "split")
+            if merged is None:
+                raise RuntimeError("SMLib split produced no body")
+            seen: set[tuple[Any, ...]] = set()
+            for lump in self._lumps(merged):
+                handle = SmHandle(TopoKind.SOLID, lump)
+                if not lump.IsManifoldSolid():
+                    continue
+                _, volume, centre = self._mass(lump)
+                key = (round(volume, 6),) + _point_key(centre, 6)
+                if key in seen or volume <= _TOLERANCE:
+                    continue  # the same region walled off twice
+                seen.add(key)
+                result.append(handle)
+        self._record_by_geometry(record, [tool, *pieces], [p.entity for p in result])
+        return result
 
     def _crossings(self, curve: Any, interval: Any, other: tuple[str, Any]) -> list[Point]:
         """Where a curve meets another curve, a sheet or a body."""
@@ -1426,33 +1869,74 @@ class SmlibCoreKernel(Kernel):
             members=[self.make_vertex(p) for p in points.values()],
         )
 
-    def _edges_inside(
-        self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
+    def _edge_pieces(
+        self, args: Sequence[SmHandle], tools: Sequence[SmHandle], keep_inside: bool
     ) -> SmHandle:
-        """The parts of edges that lie inside the solids: the edges are cut
-        where they cross the solids' faces and the pieces inside are kept."""
-        bodies = [b for t in tools for b in self._bodies(t)]
+        """The parts of edges inside (or outside) the tools: the edges are
+        cut where they cross the tools' faces, or where they meet the ends of
+        tool edges, and each piece is kept by where its middle lies."""
+        bodies = [b for t in tools for b in self._bodies(t)] if not all(
+            self._is_one_dimensional(t) for t in tools
+        ) else []
+        tool_views = (
+            [SmCurveView(self, e) for t in tools for e in self.sub_shapes(t, TopoKind.EDGE)]
+            if not bodies
+            else []
+        )
+
+        def inside(point: Point) -> bool:
+            if bodies:
+                return any(self.point_in_solid(b, point, _TOLERANCE) for b in bodies)
+            return any(v.drop_point(point)[1] <= _TOLERANCE for v in tool_views)
+
         pieces = []
         for arg in args:
             for edge in self.sub_shapes(arg, TopoKind.EDGE):
                 view = SmCurveView(self, edge)
                 interval = self.sc.SmExtent1d(view.first, view.last)
-                cuts = set()
+                crossings: list[Point] = []
                 for body in bodies:
-                    for point in self._crossings(view.curve, interval, ("body", body.entity)):
-                        param, distance = view.drop_point(point)
-                        if distance <= _TOLERANCE:
-                            cuts.add(round(param, 9))
+                    crossings.extend(self._crossings(view.curve, interval, ("body", body.entity)))
+                    if body.kind is TopoKind.SHELL:
+                        # an edge lying in a sheet is cut where it leaves it
+                        for rim in self._entities(body.entity, TopoKind.EDGE):
+                            rim_interval = rim.GetInterval()
+                            crossings.extend(
+                                self._crossings(
+                                    view.curve,
+                                    interval,
+                                    ("curve", (rim.GetCurve(), self.sc.SmExtent1d(rim_interval.GetMin(), rim_interval.GetMax()))),
+                                )
+                            )
+                for other in tool_views:
+                    crossings.extend(
+                        self._crossings(
+                            view.curve,
+                            interval,
+                            ("curve", (other.curve, self.sc.SmExtent1d(other.first, other.last))),
+                        )
+                    )
+                    crossings.extend(other.value(t) for t in (other.first, other.last))
+                cuts = set()
+                for point in crossings:
+                    param, distance = view.drop_point(point)
+                    if distance <= _TOLERANCE:
+                        cuts.add(round(param, 9))
                 bounds = sorted({view.first, view.last, *cuts})
                 for t0, t1 in zip(bounds, bounds[1:]):
                     if t1 - t0 <= _TOLERANCE:
                         continue
                     middle = view.value((t0 + t1) / 2)
-                    if any(self.point_in_solid(b, middle, _TOLERANCE) for b in bodies):
+                    if inside(middle) == keep_inside:
                         piece = self.trim_edge(edge, t0, t1)
                         piece.flip = edge.flip
                         pieces.append(piece)
         return SmHandle(TopoKind.COMPOUND, members=pieces)
+
+    def _edges_inside(
+        self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
+    ) -> SmHandle:
+        return self._edge_pieces(args, tools, True)
 
     def _section_edges(
         self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
@@ -1471,6 +1955,16 @@ class SmlibCoreKernel(Kernel):
                             self.sc.SM_BO_INTERSECTION, None
                         )
                         if status != SM_SUCCESS:
+                            continue
+                        if (
+                            a.kind is TopoKind.SHELL
+                            and b.kind is TopoKind.SHELL
+                            and _result is not None
+                            and self._entities(_result, TopoKind.FACE)
+                        ):
+                            # sheets overlapping in their plane share an
+                            # area, not edges (the kernel's edge list is
+                            # not valid then)
                             continue
                         for edge in merge.GetIntersectionEdges([]):
                             interval = edge.GetInterval()
@@ -1514,6 +2008,8 @@ class SmlibCoreKernel(Kernel):
         _check(status, "boolean")
         if result is None:
             raise RuntimeError("SMLib boolean produced no body")
+        if self._entities(result, TopoKind.FACE):
+            self._box_of(result, fresh=True)
         return result
 
     def record_modified(self, record: Any, shape: SmHandle) -> list[SmHandle]:
@@ -1533,7 +2029,7 @@ class SmlibCoreKernel(Kernel):
         raise ValueError("not a sewing record")
 
     def section(self, a: SmHandle, b: SmHandle) -> tuple[SmHandle, Any]:
-        raise NotImplementedError("smlib: section")
+        return self.boolean(BoolOp.SECTION, [a], [b]), _Record()
 
     def unify_same_domain(self, shape: SmHandle) -> tuple[SmHandle, Any]:
         return shape, _Record()
@@ -1546,31 +2042,86 @@ class SmlibCoreKernel(Kernel):
     def location_of(self, shape: SmHandle) -> TopLoc_Location:
         return shape.location
 
+    def _affine_parts(
+        self, matrix: Any, translation: Any
+    ) -> tuple[Any, Any, bool]:
+        """Split an affine map ``x -> M x + t`` into what SMLib's ``Transform``
+        applies: a mirror in the XY plane (first), a scaling along the world
+        axes, then a rotation and move given as a placement.
+
+        Only maps of the form ``R diag(s)`` (with ``R`` possibly improper) are
+        representable; anything else raises ``NotImplementedError``."""
+        columns = [
+            [matrix.Value(row, col) for row in (1, 2, 3)] for col in (1, 2, 3)
+        ]
+        scales = [math.sqrt(_dot(c, c)) for c in columns]
+        if min(scales) < 1e-12:
+            raise NotImplementedError("smlib: degenerate (collapsing) transform")
+        axes = [[v / scale for v in c] for c, scale in zip(columns, scales)]
+        for i in range(3):
+            for j in range(i + 1, 3):
+                if abs(_dot(axes[i], axes[j])) > 1e-9:
+                    raise NotImplementedError(
+                        "smlib: shear or scaling along rotated axes"
+                    )
+        mirror = _dot(_cross(axes[0], axes[1]), axes[2]) < 0
+        if mirror:
+            # R = R' diag(1, 1, -1): mirror the geometry in XY first, then
+            # apply the proper rotation R'
+            axes[2] = [-v for v in axes[2]]
+        origin = (translation.X(), translation.Y(), translation.Z())
+        placement = self.sc.SmAxis2Placement(
+            self._vec(origin), self._vec(axes[0]), self._vec(axes[1])
+        )
+        uniform = all(abs(scale - 1.0) < 1e-12 for scale in scales)
+        return placement, (None if uniform else self._vec(scales)), mirror
+
+    def _xy_mirror(self) -> Any:
+        return self.sc.SmAxis2Placement(
+            self._vec((0, 0, 0)), self._vec((1, 0, 0)), self._vec((0, 1, 0))
+        )
+
     def _bake(
         self,
         shape: SmHandle,
         trsf: gp_Trsf,
         copies: dict[int, tuple[Any, Any]] | None = None,
+        general: Any | None = None,
     ) -> SmHandle:
         """A moved copy of ``shape``: the geometry transformed, the placement
         remembered. ``copies`` maps a body's address to its moved copy and
-        forward map, so that the members of one container share one copy."""
-        if trsf.Form() == 0 and trsf.TranslationPart().Modulus() == 0:  # gp_Identity
-            return shape
+        forward map, so that the members of one container share one copy.
+        ``general`` is a ``gp_GTrsf`` applied instead of ``trsf`` (its
+        placement is then not remembered, as the geometry absorbs it)."""
+        if general is None:
+            if trsf.Form() == 0 and trsf.TranslationPart().Modulus() == 0:
+                return shape  # gp_Identity
+            parts = self._affine_parts(trsf.VectorialPart(), trsf.TranslationPart())
+            rigid = parts[1] is None and not parts[2]
+        else:
+            parts = self._affine_parts(general.VectorialPart(), general.TranslationPart())
+            rigid = False
         if copies is None:
             copies = {}
-        placement = self._placement_of_trsf(trsf)
-        new_location = TopLoc_Location(trsf).Multiplied(shape.location)
+        placement, scale, mirror = parts
+        new_location = (
+            TopLoc_Location(trsf).Multiplied(shape.location) if rigid else shape.location
+        )
         if shape.kind in (TopoKind.WIRE, TopoKind.COMPOUND):
             return SmHandle(
                 shape.kind,
-                members=[self._bake(m, trsf, copies) for m in shape.members],
+                members=[self._bake(m, trsf, copies, general) for m in shape.members],
                 flip=shape.flip,
                 location=new_location,
                 partner=shape.partner,
             )
         if shape.point is not None:
-            moved = gp_Pnt(*shape.point).Transformed(trsf)
+            if general is None:
+                moved = gp_Pnt(*shape.point).Transformed(trsf)
+            else:
+                xyz = gp_XYZ(*shape.point)
+                general.Transforms(xyz)
+                moved = gp_Pnt(xyz)
             return SmHandle(
                 TopoKind.VERTEX,
                 point=(moved.X(), moved.Y(), moved.Z()),
@@ -1579,7 +2130,10 @@ class SmlibCoreKernel(Kernel):
             )
         if shape.curve is not None:
             curve = self._copy_curve(shape.curve)
-            _check(curve.Transform(placement, None), "curve transform")
+            if mirror:
+                status, curve = curve.CreateMirrorCurve(self.context, self._xy_mirror())
+                _check(status, "curve mirror")
+            _check(curve.Transform(placement, scale), "curve transform")
             return SmHandle(
                 TopoKind.EDGE,
                 curve=curve,
@@ -1593,7 +2147,9 @@ class SmlibCoreKernel(Kernel):
             copy, forward = copies[brep.address]
         else:
             copy, forward = self._copy_body(brep)
-            _check(copy.Transform(placement, None, 1), "transform")
+            if mirror:
+                _check(copy.Mirror(self._xy_mirror()), "mirror")
+            _check(copy.Transform(placement, scale, 1), "transform")
             copies[brep.address] = (copy, forward)
         entity = (
             copy
@@ -1622,23 +2178,21 @@ class SmlibCoreKernel(Kernel):
         origin, normal, x_dir = plane
         return gp_Pln(gp_Ax3(gp_Pnt(*origin), gp_Dir(*normal), gp_Dir(*x_dir)))
 
+    @staticmethod
+    def _take_over(shape: SmHandle, moved: SmHandle) -> None:
+        """Make ``shape`` hold what ``moved`` holds (an in-place move)."""
+        shape.entity = moved.entity
+        shape.members = moved.members
+        shape.location = moved.location
+        shape.point = moved.point
+        shape.curve = moved.curve
+        shape.interval = moved.interval
+
     def move(self, shape: SmHandle, location: TopLoc_Location) -> None:
-        moved = self._bake(shape, location.Transformation())
-        shape.entity, shape.members, shape.location, shape.point = (
-            moved.entity,
-            moved.members,
-            moved.location,
-            moved.point,
-        )
+        self._take_over(shape, self._bake(shape, location.Transformation()))
 
     def set_location(self, shape: SmHandle, location: TopLoc_Location) -> None:
-        moved = self.located(shape, location)
-        shape.entity, shape.members, shape.location, shape.point = (
-            moved.entity,
-            moved.members,
-            moved.location,
-            moved.point,
-        )
+        self._take_over(shape, self.located(shape, location))
 
     def located(self, shape: SmHandle, location: TopLoc_Location) -> SmHandle:
         delta = location.Multiplied(shape.location.Inverted())
@@ -1702,9 +2256,33 @@ class SmlibCoreKernel(Kernel):
     ) -> SmHandle:
         placement = self._placement(frame)
         degrees = math.degrees(angle3)
-        return self._primitive(
+        sphere = self._primitive(
             lambda c: c.CreateSphere(radius, 0.0, degrees, placement)
         )
+        low, high = math.sin(angle1) * radius, math.sin(angle2) * radius
+        if low <= -radius + _TOLERANCE and high >= radius - _TOLERANCE:
+            return sphere
+        # the kernel's sphere spans the poles: the part between the two
+        # latitudes is what is inside a box of that height about the axis
+        axis = frame.Axis()
+        origin, direction = axis.Location(), axis.Direction()
+        bottom = gp_Pnt(
+            origin.X() + direction.X() * (low - _INFINITE),
+            origin.Y() + direction.Y() * (low - _INFINITE),
+            origin.Z() + direction.Z() * (low - _INFINITE),
+        )
+        slab_frame = gp_Ax2(bottom, direction, frame.XDirection())
+        slab = self.make_box(slab_frame, 2 * _INFINITE, 2 * _INFINITE, high - low + _INFINITE)
+        # the box is placed by its corner: shift it to be centred on the axis
+        shift = gp_Trsf()
+        shift.SetTranslation(
+            gp_Vec(frame.XDirection()).Multiplied(-_INFINITE).Added(
+                gp_Vec(frame.YDirection()).Multiplied(-_INFINITE)
+            )
+        )
+        slab = self._bake(slab, shift)
+        result, _ = self.boolean(BoolOp.COMMON, [sphere], [slab])
+        return result
 
     def make_torus(
         self,
@@ -1792,21 +2370,33 @@ class SmlibCoreKernel(Kernel):
         if shape.kind is TopoKind.FACE:
             wires = self.sub_shape_uses(shape, TopoKind.WIRE)
             curves = [c for w in wires for c in self._loop_curves(w)]
+            if self.planar_surface(shape) is None:
+                # a curved face sweeps into the sheet of its boundary, closed
+                # by the face itself and a copy of it moved to the far end
+                walls = self._primitive(
+                    lambda c: c.CreateLinearSweep(curves, unit, distance, 1, 0, 1)
+                )
+                far = self._bake(shape, _translation(direction))
+                faces = [*self.sub_shapes(walls, TopoKind.FACE), shape, far]
+                _, record = self.sew(faces)
+                result = record.result
+                assert result is not None
+                return self.solid_from_shell(result)
             return self._primitive(
                 lambda c: c.CreateLinearSweep(curves, unit, distance, 1, 1, 1)
             )
-        if shape.kind is TopoKind.WIRE:
-            curves = self._loop_curves(shape)
-            return self._primitive(
-                lambda c: c.CreateLinearSweep(curves, unit, distance, 1, 0, 1)
-            )
-        if shape.kind is TopoKind.EDGE:
-            curves = self._loop_curves(SmHandle(TopoKind.WIRE, members=[shape]))
+        if shape.kind in (TopoKind.WIRE, TopoKind.EDGE):
+            wire = shape if shape.kind is TopoKind.WIRE else SmHandle(TopoKind.WIRE, members=[shape])
+            curves = self._loop_curves(wire)
             sheet = self._primitive(
                 lambda c: c.CreateLinearSweep(curves, unit, distance, 1, 0, 1)
             )
             faces = self._entities(sheet.entity, TopoKind.FACE)
-            if len(faces) == 1:
+            for face in faces:
+                # the sweep's normal is tangent x direction; OCCT's sheets
+                # face the other way (direction x tangent)
+                _check(face.SwapUV(), "face orientation")
+            if shape.kind is TopoKind.EDGE and len(faces) == 1:
                 return SmHandle(TopoKind.FACE, faces[0])
             return sheet
         if shape.kind is TopoKind.VERTEX:
@@ -1819,7 +2409,9 @@ class SmlibCoreKernel(Kernel):
         origin = axis.Location()
         direction = axis.Direction()
         base = self._vec((origin.X(), origin.Y(), origin.Z()))
-        axis_dir = self._vec((direction.X(), direction.Y(), direction.Z()))
+        sign = -1.0 if angle < 0 else 1.0  # a negative angle turns the other way
+        angle = abs(angle)
+        axis_dir = self._vec((sign * direction.X(), sign * direction.Y(), sign * direction.Z()))
         if shape.kind is TopoKind.FACE:
             curves = [
                 c
@@ -1848,16 +2440,12 @@ class SmlibCoreKernel(Kernel):
     def loft(
         self, sections: Sequence[SmHandle], solid: bool, ruled: bool
     ) -> SmHandle:
+        kinds = [section.kind for section in sections]
+        if TopoKind.VERTEX in kinds:
+            return self._loft_to_points(sections, solid, ruled)
         counts, curves = [], []
         for section in sections:
-            if section.kind is TopoKind.VERTEX:
-                raise NotImplementedError("smlib: loft to a vertex")
-            wire = (
-                section
-                if section.kind is TopoKind.WIRE
-                else SmHandle(TopoKind.WIRE, members=[section])
-            )
-            loop = self._loop_curves(wire)
+            loop = self._loop_curves(self._as_wire(section))
             counts.append(len(loop))
             curves.extend(loop)
         return self._primitive(
@@ -1865,6 +2453,62 @@ class SmlibCoreKernel(Kernel):
                 counts, curves, 0.0, 1 if ruled else 3, 1 if solid else 0, [], [], []
             )
         )
+
+    @staticmethod
+    def _as_wire(section: SmHandle) -> SmHandle:
+        return (
+            section
+            if section.kind is TopoKind.WIRE
+            else SmHandle(TopoKind.WIRE, members=[section])
+        )
+
+    def _apex_faces(self, wire: SmHandle, apex: Point) -> list[SmHandle]:
+        """Faces ruled from each edge of a loop to one point."""
+        body = self._new_brep()
+        tip = self._nurbs([apex, apex], [0.0, 0.0, 1.0, 1.0], 1, None)
+        for curve in self._loop_curves(wire):
+            status, surface = self.sc.SmBSplineSurface.CreateRuledSurface(
+                self.context, self._as_nurbs(curve), tip, self.sc.SM_SP_V
+            )
+            _check(status, "ruled surface")
+            status, _ = body.CreateFaceFromSurface(surface, surface.GetNaturalUVDomain())
+            _check(status, "face from surface")
+        return [SmHandle(TopoKind.FACE, f) for f in self._entities(body, TopoKind.FACE)]
+
+    def _loft_to_points(
+        self, sections: Sequence[SmHandle], solid: bool, ruled: bool
+    ) -> SmHandle:
+        """A loft whose first and/or last section is a vertex: the loops are
+        skinned, the ends ruled to the points, and all of it sewn."""
+        if any(s.kind is TopoKind.VERTEX for s in sections[1:-1]) or all(
+            s.kind is TopoKind.VERTEX for s in sections
+        ):
+            raise NotImplementedError("smlib: loft through a vertex")
+        faces: list[SmHandle] = []
+        wires = [self._as_wire(s) for s in sections if s.kind is not TopoKind.VERTEX]
+        if len(wires) > 1:
+            counts, curves = [], []
+            for wire in wires:
+                loop = self._loop_curves(wire)
+                counts.append(len(loop))
+                curves.extend(loop)
+            skin = self._primitive(
+                lambda c: c.CreateSkinPrimitive(
+                    counts, curves, 0.0, 1 if ruled else 3, 0, [], [], []
+                )
+            )
+            faces.extend(self.sub_shapes(skin, TopoKind.FACE))
+        for end, wire in ((sections[0], wires[0]), (sections[-1], wires[-1])):
+            if end.kind is TopoKind.VERTEX:
+                faces.extend(self._apex_faces(wire, self.vertex_point(end)))
+            elif solid:
+                faces.append(self.make_planar_face(wire, []))
+        _, record = self.sew(faces)
+        result = record.result
+        assert result is not None
+        if solid and result.kind is TopoKind.SHELL:
+            return self.solid_from_shell(result)
+        return result
 
     def _as_nurbs(self, curve: Any) -> Any:
         """A plain NURBS rebuilt from a curve's control polygon and knots: the
@@ -1963,20 +2607,26 @@ class SmlibCoreKernel(Kernel):
         self, shape: SmHandle, specs: Sequence[tuple[SmHandle, SmHandle, float, float]]
     ) -> tuple[SmHandle, Any]:
         record = _Record()
+        # the kernel's chamfer is set by the distance between its two rails;
+        # OCCT's by the setback along each face, which the angle between the
+        # faces at the edge converts (measured before the copy is worked on)
+        distances = []
+        for edge, face, d1, d2 in specs:
+            angle = self._dihedral_angle(edge)
+            distances.append(math.sqrt(max(0.0, d1 * d1 + d2 * d2 - 2 * d1 * d2 * math.cos(angle))))
+        if any(d1 != d2 for _, _, d1, d2 in specs):
+            raise NotImplementedError("smlib: asymmetric chamfers")
         body = self._tracked_copy(shape, record)
         working_edges = [record.modified[e.key()][0].entity for e, _, _, _ in specs]
-        distances = {d for _, _, d1, d2 in specs for d in (d1, d2)}
-        if len(distances) != 1:
-            raise NotImplementedError("smlib: asymmetric chamfers")
         executive = self.sc.SmFilletExecutive(self.context, body)
         executive.SetDoGlobalMerge(1)
         _check(
             executive.SetFilletParameters(
                 body,
                 working_edges,
-                self.sc.SM_FSG_LINEAR,
-                self.sc.SM_FS_CONST_DIST,
-                distances.pop(),
+                [self.sc.SM_FSG_LINEAR] * len(working_edges),
+                [self.sc.SM_FS_CONST_DIST] * len(working_edges),
+                distances,
                 None,
                 0.0,
                 0.0,
@@ -1991,6 +2641,28 @@ class SmlibCoreKernel(Kernel):
         self._finish_record(record, body)
         return self._solid_handle(body), record
 
+    def _dihedral_angle(self, edge: SmHandle) -> float:
+        """The angle inside the body between the two faces along an edge,
+        measured at its middle (pi/2 for the edge of a box)."""
+        faces = [SmHandle(TopoKind.FACE, f) for f in edge.entity.GetFaces([], None)]
+        if len(faces) != 2:
+            return math.pi / 2
+        view = SmCurveView(self, edge)
+        middle, tangent = view.d1(0.5 * (view.first + view.last))
+        tangent = _unit(tangent)
+        step = max(_TOLERANCE * 100, view.length() * 1e-3)
+        inward = []
+        for face in faces:
+            surface = SmSurfaceView(self, face)
+            _, normal = surface.normal(*surface.closest_uv(middle))
+            across = _unit(_cross(normal, tangent))
+            probe = tuple(m + step * a for m, a in zip(middle, across))
+            if not self.point_on_face(face, probe, step * 0.5):
+                across = tuple(-a for a in across)  # type: ignore[assignment]
+            inward.append(across)
+        cosine = max(-1.0, min(1.0, _dot(inward[0], inward[1])))
+        return math.acos(cosine)
+
     def thick_solid(
         self,
         shape: SmHandle,
@@ -2002,6 +2674,13 @@ class SmlibCoreKernel(Kernel):
     ) -> SmHandle:
         record = _Record()
         body = self._tracked_copy(shape, record)
+        if not openings:
+            # with nothing opened the thick solid is the offset solid itself
+            status, result = self.sc.SmOffsetExecutive.OffsetBrep(
+                self.context, body, thickness, 1 if join is JoinKind.INTERSECTION else 0, 1
+            )
+            _check(status, "offset")
+            return self._solid_handle(result)
         faces = [record.modified[f.key()][0].entity for f in openings]
         status, result = self.sc.SmOffsetExecutive.ShellBrep(
             self.context, body, thickness, 1, 1, 1, faces
@@ -2086,13 +2765,11 @@ class SmlibCoreKernel(Kernel):
 
     @staticmethod
     def _arc_domain(start: float, end: float, sense: bool) -> tuple[float, float]:
-        """The degree domain of an arc given in radians, counter-clockwise
-        in the kernel; a clockwise arc is the flipped counter-clockwise one."""
-        a1, a2 = (
-            (math.degrees(start), math.degrees(end))
-            if sense
-            else (math.degrees(end), math.degrees(start))
-        )
+        """The degree domain of an arc given in radians: the counter-clockwise
+        sweep from ``start`` to ``end`` either way (OCCT's arc of the other
+        sense is this one run backwards, which the caller's flip does)."""
+        del sense
+        a1, a2 = math.degrees(start), math.degrees(end)
         while a2 <= a1:
             a2 += 360.0
         return a1, a2
@@ -2137,7 +2814,17 @@ class SmlibCoreKernel(Kernel):
         # the circle's parameter is the angle in degrees; an arc always runs
         # counter-clockwise in the kernel, so a clockwise one is flipped
         a1, a2 = self._arc_domain(start, end, sense)
-        return self._edge_on(self._circle(frame, radius, a1, a2), flip=not sense)
+        return self._arc_edge(self._circle(frame, radius, a1, a2), sense)
+
+    def _arc_edge(self, curve: Any, sense: bool) -> SmHandle:
+        """A forward edge over a whole arc; the arc of the other sense is the
+        curve itself run backwards (as OCCT's), not a reversed edge."""
+        if sense:
+            return self._edge_on(curve)
+        domain = curve.GetNaturalInterval()
+        reversed_domain = self.sc.SmExtent1d()
+        _check(curve.ReverseParameterization(domain, reversed_domain), "curve reverse")
+        return self._free_edge(curve, reversed_domain.GetMin(), reversed_domain.GetMax())
 
     def _ellipse(
         self, frame: Any, major: float, minor: float, rotation: float, a1: float, a2: float
@@ -2172,9 +2859,7 @@ class SmlibCoreKernel(Kernel):
         rotation: float = 0.0,
     ) -> SmHandle:
         a1, a2 = self._arc_domain(start, end, sense)
-        return self._edge_on(
-            self._ellipse(frame, major, minor, rotation, a1, a2), flip=not sense
-        )
+        return self._arc_edge(self._ellipse(frame, major, minor, rotation, a1, a2), sense)
 
     def make_parabola_arc(
         self, frame: Any, focal_length: float, start: float, end: float, sense: bool
@@ -2496,12 +3181,52 @@ class SmlibCoreKernel(Kernel):
         stitcher = self.sc.SmStitch(self.sc.SmStitchCallback(), _TOLERANCE, 1, 1)
         _check(stitcher.StitchIntoShell(target, 0, 1.0), "stitch")
         self._finish_record(record, target)
-        new_faces = self._entities(target, TopoKind.FACE)
-        if len(new_faces) == 1:
-            record.result = SmHandle(TopoKind.FACE, new_faces[0])
+        for edge in self._entities(target, TopoKind.EDGE):
+            if edge.GetEdgeuseCount() > 4:
+                raise ValueError("more than two faces meet on an edge")
+        pieces = self._components(target)
+        if len(pieces) == 1:
+            record.result = self._sheet_handle(target)
         else:
-            record.result = SmHandle(TopoKind.SHELL, target)
+            parts = []
+            for faces in pieces:
+                piece = self._new_brep()
+                _check(target.CopyFaces(faces, piece, None, 0, None), "sheet copy")
+                parts.append(self._sheet_handle(piece))
+            record.result = SmHandle(TopoKind.COMPOUND, members=parts)
         return record.result, record
+
+    def _sheet_handle(self, brep: Any) -> SmHandle:
+        """A face handle for a one-face sheet, else a shell handle."""
+        faces = self._entities(brep, TopoKind.FACE)
+        if len(faces) == 1:
+            return SmHandle(TopoKind.FACE, faces[0])
+        return SmHandle(TopoKind.SHELL, brep)
+
+    def _components(self, brep: Any) -> list[list[Any]]:
+        """The faces of a brep grouped by connection through its shells."""
+        faces = self._entities(brep, TopoKind.FACE)
+        index = {f.address: i for i, f in enumerate(faces)}
+        parent = list(range(len(faces)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        # the kernel's shells may hold faces that share no edge, so the
+        # grouping follows the edges themselves
+        for edge in self._entities(brep, TopoKind.EDGE):
+            members = [index[f.address] for f in edge.GetFaces([], None) if f.address in index]
+            for i in members[1:]:
+                a, b = find(members[0]), find(i)
+                if a != b:
+                    parent[b] = a
+        groups: dict[int, list[Any]] = {}
+        for i, face in enumerate(faces):
+            groups.setdefault(find(i), []).append(face)
+        return list(groups.values())
 
     def make_compound(self, shapes: Sequence[SmHandle]) -> SmHandle:
         return SmHandle(TopoKind.COMPOUND, members=list(shapes))
@@ -2522,7 +3247,10 @@ class SmlibCoreKernel(Kernel):
             _restore_locations(moved, shape)
         return moved, record
 
-    transformed_general = _unsupported("transformed_general")
+    def transformed_general(self, shape: SmHandle, transform: Any) -> SmHandle:
+        moved = self._bake(shape, gp_Trsf(), general=transform)
+        _restore_locations(moved, shape)
+        return moved
 
     # ---- distance and classification ----------------------------------------
 
@@ -2678,7 +3406,155 @@ class SmlibCoreKernel(Kernel):
         region = classification.GetObject()
         return region is not None and region != solid.entity.GetInfiniteRegion()
 
-    point_on_face = _unsupported("point_on_face")
+    def _sheet_of(self, face: SmHandle) -> Any:
+        """A body holding a copy of this one face (cached per face)."""
+        key = face.entity.address
+        sheet = self._sheets.get(key)
+        if sheet is None or sheet[0] is not face.entity:
+            body = self._new_brep()
+            _check(
+                face.entity.GetBrep().CopyFaces([face.entity], body, None, 0, None),
+                "face copy",
+            )
+            sheet = (face.entity, body)
+            self._sheets[key] = sheet
+        return sheet[1]
+
+    def point_on_face(self, face: SmHandle, point: Point, tolerance: float) -> bool:
+        zone = self.sc.SmZoneTol3d(tolerance)
+        classification = self.sc.SmPointClassification(zone, None)
+        _check(
+            self._sheet_of(face).Point3DClassify(self._vec(point), zone, 1, classification),
+            "point classification",
+        )
+        return classification.GetPointClass() != self.sc.SM_PC_REGION
+
+    def line_intersections(
+        self, shape: SmHandle, origin: Point, direction: Point, tolerance: float
+    ) -> list[tuple[SmHandle, Point]]:
+        line = self.make_infinite_line(origin, direction)
+        interval = self.sc.SmExtent1d(*line.interval)
+        found: list[tuple[SmHandle, Point]] = []
+        faces = (
+            [shape] if shape.kind is TopoKind.FACE else self.sub_shapes(shape, TopoKind.FACE)
+        )
+        for face in faces:
+            for point in self._crossings(line.curve, interval, ("body", self._sheet_of(face))):
+                found.append((face, point))
+        return found
+
+    def find_plane(self, shape: SmHandle) -> tuple[Point, Point, Point] | None:
+        """The plane all of a shape's edges lie in, if there is one."""
+        edges = (
+            [shape] if shape.kind is TopoKind.EDGE else self.sub_shapes(shape, TopoKind.EDGE)
+        )
+        points: list[Point] = []
+        x_dir: Point | None = None
+        for edge in edges:
+            view = SmCurveView(self, edge)
+            if x_dir is None:
+                x_dir = _unit(view.d1(0.5 * (view.first + view.last))[1])
+            points.extend(
+                view.value(view.first + (view.last - view.first) * i / 6) for i in range(7)
+            )
+        if not points:
+            return None
+        origin = tuple(sum(p[i] for p in points) / len(points) for i in range(3))
+        first = max(points, key=lambda p: math.dist(p, origin))
+        a = tuple(c - o for c, o in zip(first, origin))
+        if math.sqrt(_dot(a, a)) < _TOLERANCE:
+            return None
+        # the normal follows the winding of the points (Newell), the way
+        # OCCT's plane finder orients it; a chain that encloses no area is
+        # given the normal its spread defines
+        nx = ny = nz = 0.0
+        for p, q in zip(points, points[1:] + points[:1]):
+            nx += (p[1] - q[1]) * (p[2] + q[2])
+            ny += (p[2] - q[2]) * (p[0] + q[0])
+            nz += (p[0] - q[0]) * (p[1] + q[1])
+        normal: Point | None = (nx, ny, nz)
+        best = math.sqrt(_dot(normal, normal))
+        if best < _TOLERANCE * _dot(a, a):
+            normal, best = None, 0.0
+            for p in points:
+                b = tuple(c - o for c, o in zip(p, origin))
+                n = _cross(a, b)
+                size = math.sqrt(_dot(n, n))
+                if size > best:
+                    normal, best = n, size
+            if normal is None or best < _TOLERANCE * math.sqrt(_dot(a, a)):
+                return None  # all the points are in a line
+        normal = _unit(normal)
+        scale = max(1.0, max(math.dist(p, origin) for p in points))
+        for p in points:
+            if abs(_dot(tuple(c - o for c, o in zip(p, origin)), normal)) > _TOLERANCE * scale:
+                return None
+        assert x_dir is not None
+        tangent = tuple(c - _dot(x_dir, normal) * n for c, n in zip(x_dir, normal))
+        if math.sqrt(_dot(tangent, tangent)) < _TOLERANCE:
+            tangent = _unit(a)
+        return origin, normal, _unit(tangent)  # type: ignore[return-value]
+
+    def continuity_between(
+        self, edge1: SmHandle, edge2: SmHandle, u1: float, u2: float, tolerance: float
+    ) -> str:
+        a = SmCurveView(self, edge1)._derivatives(u1, 2)  # pylint: disable=protected-access
+        b = SmCurveView(self, edge2)._derivatives(u2, 2)  # pylint: disable=protected-access
+        if math.dist(a[0], b[0]) > tolerance:
+            return "C0"
+        ta, tb = a[1], b[1]
+        la, lb = math.sqrt(_dot(ta, ta)), math.sqrt(_dot(tb, tb))
+        if la < tolerance or lb < tolerance:
+            return "C0"
+        if math.dist(_unit(ta), _unit(tb)) > tolerance:
+            return "C0"
+        label = "G1"
+        if math.dist(ta, tb) <= tolerance:
+            label = "C1"
+            if math.dist(a[2], b[2]) <= tolerance:
+                return "C2"
+        # the same curvature vector makes the join G2
+        def curvature(d1: Point, d2: Point) -> Point:
+            speed2 = _dot(d1, d1)
+            along = _dot(d1, d2) / speed2
+            return tuple((c2 - along * c1) / speed2 for c1, c2 in zip(d1, d2))  # type: ignore[return-value]
+        if math.dist(curvature(ta, a[2]), curvature(tb, b[2])) <= tolerance:
+            return "G2" if label == "G1" else "C1"
+        return label
+
+    def wire_as_bspline_edge(self, wire: SmHandle, tolerance: float) -> SmHandle:
+        return self._edge_on(self._joined_curve(wire))
+
+    def planar_intersections(
+        self,
+        edge: SmHandle,
+        bounds: tuple[float, float],
+        other: SmHandle | None,
+        other_bounds: tuple[float, float] | None,
+        plane: gp_Pln,
+        tolerance: float,
+    ) -> list[tuple[float, float]]:
+        if other is None:
+            return []  # a curve crossing itself is not looked for
+        view, other_view = SmCurveView(self, edge), SmCurveView(self, other)
+        assert other_bounds is not None
+        points = self._crossings(
+            view.curve,
+            self.sc.SmExtent1d(*bounds),
+            ("curve", (other_view.curve, self.sc.SmExtent1d(*other_bounds))),
+        )
+        origin = plane.Location()
+        x_axis, y_axis = plane.XAxis().Direction(), plane.YAxis().Direction()
+        found = []
+        for p in points:
+            d = (p[0] - origin.X(), p[1] - origin.Y(), p[2] - origin.Z())
+            found.append(
+                (
+                    d[0] * x_axis.X() + d[1] * x_axis.Y() + d[2] * x_axis.Z(),
+                    d[0] * y_axis.X() + d[1] * y_axis.Y() + d[2] * y_axis.Z(),
+                )
+            )
+        return found
     uv_in_face = _unsupported("uv_in_face")
 
     # ---- the rest of the facade -----------------------------------------------
@@ -2775,15 +3651,11 @@ class SmlibCoreKernel(Kernel):
         end = view.param_at_length(length, start)
         return self.trim_edge(edge, start, end)
     approximate_edge = _unsupported("approximate_edge")
-    wire_as_bspline_edge = _unsupported("wire_as_bspline_edge")
 
     def wire_edges(self, wire: SmHandle) -> list[SmHandle]:
         return list(wire.members)
 
     build_curves_3d = _unsupported("build_curves_3d")
-    find_plane = _unsupported("find_plane")
-    continuity_between = _unsupported("continuity_between")
-    planar_intersections = _unsupported("planar_intersections")
     def nearest_edge(self, shape: SmHandle, point: Point) -> tuple[SmHandle, float] | None:
         best: tuple[float, SmHandle, float] | None = None
         for edge in self.sub_shapes(shape, TopoKind.EDGE):
@@ -2812,10 +3684,13 @@ class SmlibCoreKernel(Kernel):
         along = _dot(second, tangent)
         normal = [c - along * t for c, t in zip(second, tangent)]
         if math.sqrt(_dot(normal, normal)) < 1e-9:
-            # a straight stretch: any perpendicular will do, chosen stably
-            helper = (0.0, 0.0, 1.0) if abs(tangent[2]) < 0.9 else (1.0, 0.0, 0.0)
-            normal = list(_cross(helper, tangent))
+            # a straight stretch: the perpendicular OCCT's frame picks there
+            normal = list(_perpendicular(tangent))
         normal_unit = _unit(normal)
+        # the analytic curves evaluate with rounding noise where OCCT's are
+        # exact; trimmed off so that the frame's Euler angles come out the same
+        tangent = _unit(tuple(0.0 if abs(c) < 1e-12 else c for c in tangent))
+        normal_unit = _unit(tuple(0.0 if abs(c) < 1e-12 else c for c in normal_unit))
         return point, tangent, normal_unit, _cross(tangent, normal_unit)
 
     def make_polygon(self, points: Sequence[Point]) -> SmHandle:
@@ -2941,7 +3816,7 @@ class SmlibCoreKernel(Kernel):
         """The normal of the plane a wire lies in (Newell's method over sampled points)."""
         points: list[Point] = []
         for edge in edges:
-            points.extend(SmCurveView(self, edge).positions_by_deflection(0.0))
+            points.extend(SmCurveView(self, edge).samples(32))
         nx = ny = nz = 0.0
         for a, b in zip(points, points[1:] + points[:1]):
             nx += (a[1] - b[1]) * (a[2] + b[2])
@@ -3187,7 +4062,7 @@ class SmlibCoreKernel(Kernel):
             points = [
                 p
                 for e in edges
-                for p in SmCurveView(self, e).positions_by_deflection(0.0)[:-1]
+                for p in SmCurveView(self, e).samples(32)[:-1]
             ]
             if not edges[0].flip and len(edges) == 1:
                 pass
@@ -3362,11 +4237,19 @@ class SmlibCoreKernel(Kernel):
             raise DraftFailure("draft", None, shape)
         return result, _Record()
     split_by_edges = _unsupported("split_by_edges")
-    line_intersections = _unsupported("line_intersections")
     def solid_from_shell(self, shell: SmHandle) -> SmHandle:
         brep = self._body(shell)
         if not brep.IsManifoldSolid():
-            raise ValueError("the shell does not close a solid")
+            # a closed shell of stitched faces still bounds no region until
+            # one is split off the infinite region at one of its faces
+            brep, _ = self._copy_body(brep)
+            faces = self._entities(brep, TopoKind.FACE)
+            if faces:
+                faceuse = faces[0].GetFaceuses()[0]
+                brep.TestClosureSplitRegion(1, faceuse)
+                brep.FindAndSetInfiniteRegion(None, self.sc.SM_VS_INFINITEREGION_SWAP, None)
+            if not brep.IsManifoldSolid():
+                raise ValueError("the shell does not close a solid")
         return SmHandle(TopoKind.SOLID, brep, partner=shell.partner)
     remove_wires = _unsupported("remove_wires")
     is_seam = _unsupported("is_seam")

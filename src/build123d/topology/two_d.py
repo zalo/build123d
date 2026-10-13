@@ -2726,7 +2726,10 @@ class Shell(Mixin2D[TopoDS_Shell]):
     def volume(self) -> float:
         """volume - the volume of this Shell if manifold, otherwise zero"""
         if self.is_manifold:
-            return kernel.volume(kernel.solid_from_shell(self.wrapped))
+            try:
+                return kernel.volume(kernel.solid_from_shell(self.wrapped))
+            except ValueError:
+                return 0.0  # a manifold shell that closes no solid
         return 0.0
 
     def mass(self, mass_unit: Unit = Unit.G, length_unit: Unit = Unit.MM) -> float:

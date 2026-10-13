@@ -2157,7 +2157,6 @@ class Shape(NodeMixin, Generic[TOPODS]):
             ref_point = surface_point + normalized_surface_normal
 
             # Create a HalfSpace - Solidish object to determine top/bottom
-            tool_solid = kernel.half_space(trim_tool, tuple(ref_point))
 
         tops: list[Shape] = []
         bottoms: list[Shape] = []
@@ -2174,10 +2173,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
                     piece_center = Vector(kernel.center_of_mass(part, part_kind))
                 is_up = tool.to_local_coords(piece_center).Z >= 0
             else:
-                # Intersect self and the thickened tool
-                is_up_obj = _topods_bool_op((part,), (tool_solid,), BoolOp.COMMON)
-                # Check for valid intersections: a touching piece has length
-                is_up = kernel.length(is_up_obj) >= TOLERANCE
+                is_up = kernel.same_side(part, trim_tool, tuple(ref_point), TOLERANCE)
             (tops if is_up else bottoms).append(sub_shape)
 
         # a side with nothing on it is the empty shape of self's class
