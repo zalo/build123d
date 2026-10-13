@@ -69,6 +69,7 @@ from build123d.kernel.base import (
     JoinKind,
     Kernel,
     Point,
+    SurfaceFilling,
     SurfaceView,
     TopoKind,
     WireStatus,
@@ -692,6 +693,102 @@ class SmSurfaceView(SurfaceView):
 
     def iso_lengths(self, u_min, u_max, v_min, v_max, tolerance):  # type: ignore[override]
         raise NotImplementedError("smlib: iso-curve lengths")
+
+
+class SmSurfaceFilling(SurfaceFilling):
+    """A patch through boundary edges: a Coons patch for four of them, an
+    n-sided patch otherwise, a boundary fit when interior points are given."""
+
+    def __init__(self, kernel: SmlibCoreKernel, tolerance: float):
+        self.kernel = kernel
+        self.tolerance = tolerance
+        self.edges: list[SmHandle] = []
+        self.points: list[Point] = []
+
+    def add_edge(self, edge: SmHandle, continuity: str, face: SmHandle | None = None) -> None:
+        del continuity, face  # tangency to neighbouring faces is not imposed
+        self.edges.append(edge)
+
+    def add_point(self, point: Point) -> None:
+        self.points.append(point)
+
+    def build(self) -> SmHandle:
+        kernel, sc = self.kernel, self.kernel.sc
+        if not self.edges:
+            raise RuntimeError("a surface needs boundary edges")
+        wires = kernel.connect_edges_to_wires(self.edges, _TOLERANCE)
+        if len(wires) != 1 or not kernel.is_closed(wires[0]):
+            raise RuntimeError("the boundary edges do not close a loop")
+        curves = [kernel._as_nurbs(c) for c in kernel._loop_curves(wires[0])]  # pylint: disable=protected-access
+        if len(curves) in (1, 2):
+            # one closed curve (or two) is cut into four sides for the patch
+            pieces = []
+            for curve in curves:
+                domain = curve.GetNaturalInterval()
+                t0, t1 = domain.GetMin(), domain.GetMax()
+                parts = 4 // len(curves)
+                for i in range(parts):
+                    piece = kernel._copy_curve(curve)  # pylint: disable=protected-access
+                    _check(
+                        piece.Trim(sc.SmExtent1d(t0 + (t1 - t0) * i / parts, t0 + (t1 - t0) * (i + 1) / parts), 0, 0),
+                        "curve trim",
+                    )
+                    pieces.append(kernel._as_nurbs(piece))  # pylint: disable=protected-access
+            curves = pieces
+        if len(curves) == 4:
+            return self._four_sided(curves)
+        if len(curves) == 3:
+            # three sides: the longest is halved to make a four-sided patch
+            # (the kernel's n-sided patch cannot be read back safely)
+            lengths = [c.Length(c.GetNaturalInterval(), 1e-9)[1] for c in curves]
+            longest = lengths.index(max(lengths))
+            curve = curves[longest]
+            domain = curve.GetNaturalInterval()
+            t0, t1 = domain.GetMin(), domain.GetMax()
+            halves = []
+            for lo, hi in ((t0, 0.5 * (t0 + t1)), (0.5 * (t0 + t1), t1)):
+                piece = kernel._copy_curve(curve)  # pylint: disable=protected-access
+                _check(piece.Trim(sc.SmExtent1d(lo, hi), 0, 0), "curve trim")
+                halves.append(kernel._as_nurbs(piece))  # pylint: disable=protected-access
+            curves = curves[:longest] + halves + curves[longest + 1:]
+            return self._four_sided(curves)
+        raise RuntimeError("a patch needs one closed boundary of up to four edges")
+
+    def _four_sided(self, curves: list[Any]) -> SmHandle:
+        """The patch over four sides given in loop order: the kernel wants
+        opposite sides running the same way (u along the first and third,
+        v along the second and fourth), so the last two are turned round."""
+        kernel, sc = self.kernel, self.kernel.sc
+        bottom, right, top, left = curves
+        for curve in (top, left):
+            pass
+        turned = []
+        for curve in (top, left):
+            copy = kernel._copy_curve(curve)  # pylint: disable=protected-access
+            _check(copy.ReverseParameterization(copy.GetNaturalInterval(), sc.SmExtent1d()), "curve reverse")
+            turned.append(copy)
+        top, left = turned
+        surface = None
+        if self.points:
+            status, surface = sc.SmBSplineSurface.CreateFromBoundary(
+                kernel.context,
+                [kernel._vec(p) for p in self.points],  # pylint: disable=protected-access
+                [bottom, top],
+                [left, right],
+                self.tolerance,
+            )
+            if status != SM_SUCCESS:
+                surface = None
+        if surface is None:
+            # the sides as the kernel wants them: along u at v=0 and v=1,
+            # then along v at u=0 and u=1
+            status, surface = sc.SmBSplineSurface.CreateCoonsPatch(
+                kernel.context, self.tolerance, 1, [bottom, top, left, right], []
+            )
+            _check(status, "surface filling")
+        if surface is None:
+            raise RuntimeError("SMLib surface filling produced no surface")
+        return kernel._face_on_surface(surface)  # pylint: disable=protected-access
 
 
 def _unsupported(name: str):
@@ -3619,11 +3716,31 @@ class SmlibCoreKernel(Kernel):
         return SmHandle(TopoKind.FACE, faces[0])
 
     def add_holes(self, face: SmHandle, wires: Sequence[SmHandle]) -> SmHandle:
-        """A planar face rebuilt with extra inner loops."""
-        if self.planar_surface(face) is None:
-            raise NotImplementedError("smlib: holes in a curved face")
-        loops = self.sub_shape_uses(face, TopoKind.WIRE)
-        return self.make_planar_face(loops[0], [*loops[1:], *wires])
+        """A face with extra inner loops: a planar one is rebuilt from its
+        loops, a curved one has the patches the wires bound on its surface
+        cut away."""
+        if self.planar_surface(face) is not None:
+            loops = self.sub_shape_uses(face, TopoKind.WIRE)
+            return self.make_planar_face(loops[0], [*loops[1:], *wires])
+        result = face
+        for wire in wires:
+            if not self.is_closed(wire):
+                raise ValueError("inner wire is not closed")
+            curves = [self._copy_curve(c) for c in self._loop_curves(wire)]
+            status, surface = face.entity.GetSurface().Copy(self.context)
+            _check(status, "surface copy")
+            body = self._new_brep()
+            outcome = body.CreateFacesWithCurves(
+                None, [len(curves)], curves, [self.sc.SM_OT_SAME] * len(curves), surface, []
+            )
+            _check(outcome[0] if isinstance(outcome, tuple) else outcome, "patch on surface")
+            patches = [SmHandle(TopoKind.FACE, f) for f in self._entities(body, TopoKind.FACE)]
+            if not patches:
+                raise RuntimeError("the wire bounds nothing on the surface")
+            result, _ = self.boolean(BoolOp.CUT, [result], patches)
+            if result.kind is not TopoKind.FACE:
+                raise RuntimeError("the hole does not leave one face")
+        return result
 
     def face_of_plane(
         self, plane: Any, bounds: tuple[float, float, float, float] | None = None
@@ -4655,8 +4772,37 @@ class SmlibCoreKernel(Kernel):
         return self.make_three_point_arc(p1, midway, p0)  # type: ignore[arg-type]
     offset_face = _unsupported("offset_face")
     make_bezier_surface = _unsupported("make_bezier_surface")
-    make_spline_surface_fit = _unsupported("make_spline_surface_fit")
-    filling = _unsupported("filling")
+    def make_spline_surface_fit(
+        self,
+        points: Sequence[Sequence[Point]],
+        tolerance: float,
+        min_degree: int,
+        max_degree: int,
+        smoothing: tuple[float, float, float] | None = None,
+    ) -> SmHandle:
+        """A face on the surface fitted through a grid of points."""
+        rows, cols = len(points), len(points[0]) if points else 0
+        if rows < 2 or cols < 2:
+            raise ValueError("B-spline approximation failed")
+        flat = [self._vec(p) for row in points for p in row]
+        degree_u = max(1, min(max_degree, rows - 1))
+        degree_v = max(1, min(max_degree, cols - 1))
+        status, surface = self.sc.SmBSplineSurface.ApproximatePoints(
+            self.context, flat, rows, cols, degree_u, degree_v, float(tolerance), 0
+        )
+        if status != SM_SUCCESS or surface is None:
+            raise ValueError("B-spline approximation failed")
+        return self._face_on_surface(surface)
+
+    def _face_on_surface(self, surface: Any) -> SmHandle:
+        """A face covering a whole surface, in a body of its own."""
+        body = self._new_brep()
+        status, _ = body.CreateFaceFromSurface(surface, surface.GetNaturalUVDomain())
+        _check(status, "face from surface")
+        faces = self._entities(body, TopoKind.FACE)
+        return SmHandle(TopoKind.FACE, faces[0])
+    def filling(self, **options: Any) -> SmSurfaceFilling:
+        return SmSurfaceFilling(self, options.get("Tol3d", 1e-4))
     draft_prism = _unsupported("draft_prism")
     def extrude_generated(
         self, shape: SmHandle, direction: Point
@@ -4787,7 +4933,26 @@ class SmlibCoreKernel(Kernel):
             if not brep.IsManifoldSolid():
                 raise ValueError("the shell does not close a solid")
         return SmHandle(TopoKind.SOLID, brep, partner=shell.partner)
-    remove_wires = _unsupported("remove_wires")
+    def remove_wires(self, face: SmHandle, wires: Sequence[SmHandle]) -> SmHandle:
+        """The face without the given inner loops."""
+        loops = self.sub_shape_uses(face, TopoKind.WIRE)
+        dropped = [w.key() for w in wires]
+        kept = [w for w in loops[1:] if w.key() not in dropped]
+        if self.planar_surface(face) is not None:
+            return self.make_planar_face(loops[0], kept)
+        curves = [self._copy_curve(c) for c in self._loop_curves(loops[0])]
+        status, surface = face.entity.GetSurface().Copy(self.context)
+        _check(status, "surface copy")
+        body = self._new_brep()
+        outcome = body.CreateFacesWithCurves(
+            None, [len(curves)], curves, [self.sc.SM_OT_SAME] * len(curves), surface, []
+        )
+        _check(outcome[0] if isinstance(outcome, tuple) else outcome, "face on surface")
+        faces = self._entities(body, TopoKind.FACE)
+        if len(faces) != 1:
+            raise RuntimeError("the outer loop does not bound one face")
+        whole = SmHandle(TopoKind.FACE, faces[0])
+        return self.add_holes(whole, kept) if kept else whole
     is_seam = _unsupported("is_seam")
     to_splines = _unsupported("to_splines")
     def edge_in_plane(self, edge: SmHandle, normal: Point, tolerance: float) -> bool:
@@ -4803,4 +4968,22 @@ class SmlibCoreKernel(Kernel):
         )
     surface_axis = _unsupported("surface_axis")
     half_space = _unsupported("half_space")
-    ruled_surface = _unsupported("ruled_surface")
+    def ruled_surface(self, a: SmHandle, b: SmHandle) -> SmHandle:
+        """A face ruled between two edges, or a shell between two wires."""
+        if a.kind is TopoKind.WIRE or b.kind is TopoKind.WIRE:
+            edges_a = a.members if a.kind is TopoKind.WIRE else [a]
+            edges_b = b.members if b.kind is TopoKind.WIRE else [b]
+            if len(edges_a) != len(edges_b):
+                raise RuntimeError("the wires have different numbers of edges")
+            faces = [self.ruled_surface(x, y) for x, y in zip(edges_a, edges_b)]
+            if len(faces) == 1:
+                return faces[0]
+            _, record = self.sew(faces)
+            assert record.result is not None
+            return record.result
+        curves = [self._as_nurbs(c) for c in self._loop_curves(SmHandle(TopoKind.WIRE, members=[a, b]))]
+        status, surface = self.sc.SmBSplineSurface.CreateRuledSurface(
+            self.context, curves[0], curves[1], self.sc.SM_SP_V
+        )
+        _check(status, "ruled surface")
+        return self._face_on_surface(surface)
