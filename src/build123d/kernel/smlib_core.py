@@ -2851,7 +2851,236 @@ class SmlibCoreKernel(Kernel):
         return self.boolean(BoolOp.SECTION, [a], [b]), _Record()
 
     def unify_same_domain(self, shape: SmHandle) -> tuple[SmHandle, Any]:
-        return shape, _Record()
+        """Coplanar faces that share an edge merged into one, and edges that
+        meet at a vertex of theirs alone, on one line or circle, merged into
+        one edge: the planar part of what OCCT's UnifySameDomain does."""
+        record = _Record()
+        if shape.kind is TopoKind.COMPOUND:
+            members = []
+            for member in shape.members:
+                unified, part = self.unify_same_domain(member)
+                members.append(unified)
+                record.modified.update(part.modified)
+                record.removed |= part.removed
+            record.result = SmHandle(TopoKind.COMPOUND, members=members, partner=shape.partner)
+            return record.result, record
+        if shape.kind not in (TopoKind.FACE, TopoKind.SHELL, TopoKind.SOLID):
+            return shape, record
+        faces = self.sub_shapes(shape, TopoKind.FACE)
+        if not faces or any(f.entity is None for f in faces):
+            return shape, record
+        index = {f.entity.address: i for i, f in enumerate(faces)}
+        planes: dict[int, tuple[Point, Point]] = {}
+        for i, face in enumerate(faces):
+            plane = SmSurfaceView(self, face).plane()
+            if plane is None:
+                continue
+            origin, normal, _ = plane  # the outward normal already
+            planes[i] = (origin, normal)
+
+        # faces sharing an edge on one plane group together
+        parent = list(range(len(faces)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        interior: set[int] = set()  # edges between two faces of one group
+        brep = faces[0].entity.GetBrep()
+        for edge in self._entities(brep, TopoKind.EDGE):
+            around = list({f.address: f for f in edge.GetFaces([], None)}.values())
+            members = [index[f.address] for f in around if f.address in index]
+            if len(members) != 2 or not all(m in planes for m in members):
+                continue
+            (o1, n1), (o2, n2) = planes[members[0]], planes[members[1]]
+            if _dot(n1, n2) < 1 - 1e-9:
+                continue
+            if abs(_dot([b - a for a, b in zip(o1, o2)], n1)) > _TOLERANCE:
+                continue
+            interior.add(edge.address)
+            a, b = find(members[0]), find(members[1])
+            if a != b:
+                parent[b] = a
+        groups: dict[int, list[int]] = {}
+        for i in range(len(faces)):
+            groups.setdefault(find(i), []).append(i)
+
+        # the edges that stay, and how many meet at each vertex
+        loops = {i: self.sub_shape_uses(faces[i], TopoKind.WIRE) for i in range(len(faces))}
+        degree: dict[int, int] = {}
+        seen: set[int] = set()
+        for i in range(len(faces)):
+            for wire in loops[i]:
+                for edge in wire.members:
+                    address = edge.entity.address
+                    if address in interior or address in seen:
+                        continue
+                    seen.add(address)
+                    for vertex in self.edge_vertices_entities(edge):
+                        key = _point_key(self._pt(vertex.GetPoint()))
+                        degree[key] = degree.get(key, 0) + 1
+
+        def joint_key(before: SmHandle) -> Hashable:
+            """Where an edge ends, as a key shared with every edge ending there."""
+            vertex = self.edge_vertices_entities(before)[-1]
+            return _point_key(self._pt(vertex.GetPoint()))
+
+        def same_curve(a: SmHandle, b: SmHandle) -> bool:
+            va, vb = SmCurveView(self, a), SmCurveView(self, b)
+            if va.geom_type != vb.geom_type or va.geom_type not in ("LINE", "CIRCLE"):
+                return False
+            if va.geom_type == "LINE":
+                _, _, _, ta = self._oriented_ends(a)
+                _, _, tb, _ = self._oriented_ends(b)
+                return math.sqrt(_dot(_cross(_unit(ta), _unit(tb)), _cross(_unit(ta), _unit(tb)))) < 1e-9 and _dot(ta, tb) > 0
+            (ca, xa, ra), (cb, xb, rb) = va.circle(), vb.circle()
+            return (
+                math.dist(ca, cb) < _TOLERANCE
+                and abs(ra - rb) < _TOLERANCE
+                and abs(abs(_dot(xa, xb)) - 1) < 1e-9
+            )
+
+        def all_faces_planar(edge: SmHandle) -> bool:
+            return all(
+                index.get(f.address) in planes for f in edge.entity.GetFaces([], None)
+            )
+
+        # vertices to drop: two edges of the same line or circle meet there and nothing else
+        def chained(edges: list[SmHandle]) -> list[list[SmHandle]]:
+            """Closed loops from oriented edges whose ends meet."""
+            remaining = list(edges)
+            found = []
+            while remaining:
+                chain = [remaining.pop(0)]
+                _, tail, _, _ = self._oriented_ends(chain[-1])
+                while True:
+                    for k, candidate in enumerate(remaining):
+                        head, _, _, _ = self._oriented_ends(candidate)
+                        if math.dist(head, tail) <= _TOLERANCE:
+                            chain.append(remaining.pop(k))
+                            _, tail, _, _ = self._oriented_ends(candidate)
+                            break
+                    else:
+                        break
+                found.append(chain)
+            return found
+
+        # the loops each group keeps, the edges between its faces gone
+        chains: dict[int, list[list[SmHandle]]] = {}
+        for root, group in groups.items():
+            kept = [
+                e
+                for i in group
+                for w in loops[i]
+                for e in w.members
+                if e.entity.address not in interior
+            ]
+            chains[root] = chained(kept)
+
+        dropped: set[Hashable] = set()
+        for root in groups:
+            for edges in chains[root]:
+                if len(edges) < 2:
+                    continue
+                for before, after in zip(edges, edges[1:] + edges[:1]):
+                    joint = joint_key(before)
+                    if degree.get(joint) != 2:
+                        continue
+                    if not (all_faces_planar(before) and all_faces_planar(after)):
+                        continue
+                    if same_curve(before, after):
+                        dropped.add(joint)
+        rebuild = {
+            i
+            for group in groups.values()
+            for i in group
+            if len(group) > 1
+            or any(joint_key(e) in dropped for w in loops[i] for e in w.members)
+        }
+        if not rebuild:
+            return shape, record
+
+        def merged_loop(edges: list[SmHandle]) -> list[SmHandle]:
+            """The edges of a closed loop with the runs over dropped vertices merged."""
+            n = len(edges)
+            starts = [k for k in range(n) if joint_key(edges[k - 1]) not in dropped]
+            if not starts:  # one closed curve in pieces
+                view = SmCurveView(self, edges[0])
+                if view.geom_type == "CIRCLE":
+                    centre, axis, radius = view.circle()
+                    frame = gp_Ax2(gp_Pnt(*centre), gp_Dir(*axis))
+                    return [self.make_circle(frame, radius)]
+                return edges
+            order = edges[starts[0]:] + edges[:starts[0]]
+            runs: list[list[SmHandle]] = [[order[0]]]
+            for edge in order[1:]:
+                if joint_key(runs[-1][-1]) in dropped:
+                    runs[-1].append(edge)
+                else:
+                    runs.append([edge])
+            result = []
+            for run in runs:
+                if len(run) == 1:
+                    result.append(run[0])
+                    continue
+                start, _, _, _ = self._oriented_ends(run[0])
+                _, end, _, _ = self._oriented_ends(run[-1])
+                if SmCurveView(self, run[0]).geom_type == "LINE":
+                    result.append(self.make_line(start, end))
+                else:
+                    joint = self._pt(self.edge_vertices_entities(run[0])[-1].GetPoint())
+                    result.append(self.make_three_point_arc(start, joint, end))
+            return result
+
+        def loop_area(edges: list[SmHandle], normal: Point) -> float:
+            points = [p for e in edges for p in SmCurveView(self, e).samples(16)[:-1]]
+            twice = 0.0
+            for a, b in zip(points, points[1:] + points[:1]):
+                twice += _dot(_cross(a, b), normal)
+            return 0.5 * twice
+
+        new_faces: dict[int, SmHandle] = {}  # group root -> its new face
+        for root, group in groups.items():
+            if not any(i in rebuild for i in group):
+                continue
+            origin, normal = planes[group[0]]
+            wires = [merged_loop(loop) for loop in chains[root]]
+            wires.sort(key=lambda w: -loop_area(w, normal))
+            outer, inners = wires[0], wires[1:]
+            new = self.make_planar_face(
+                SmHandle(TopoKind.WIRE, members=outer),
+                [SmHandle(TopoKind.WIRE, members=w) for w in inners],
+            )
+            plane = SmSurfaceView(self, new).plane()
+            if plane is not None and _dot(plane[1], normal) < 0:
+                _check(new.entity.SwapUV(), "face orientation")
+            new_faces[root] = new
+            for i in group:
+                record.modified[faces[i].key()] = [new]
+        if shape.kind is TopoKind.FACE:
+            record.result = next(iter(new_faces.values()))
+            return record.result, record
+        inputs: list[SmHandle] = []
+        origin_of: dict[Hashable, list[int]] = {}
+        for root, group in groups.items():
+            handle = new_faces.get(root, faces[root] if len(group) == 1 else None)
+            if handle is None:
+                continue
+            inputs.append(handle)
+            origin_of[handle.key()] = group
+        sewn, sew_record = self.sew(inputs)
+        for handle in inputs:
+            became = sew_record.modified.get(handle.key(), [])
+            for i in origin_of[handle.key()]:
+                record.modified[faces[i].key()] = became
+        if shape.kind is TopoKind.SOLID and sewn.kind is TopoKind.SHELL:
+            sewn = self.solid_from_shell(sewn)
+        elif shape.kind is TopoKind.SHELL and sewn.kind is TopoKind.FACE:
+            sewn = SmHandle(TopoKind.SHELL, sewn.entity.GetBrep())
+        record.result = sewn
+        return sewn, record
 
     # ---- placement ----------------------------------------------------------
 
