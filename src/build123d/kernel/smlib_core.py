@@ -737,10 +737,39 @@ class SmlibCoreKernel(Kernel):
     def is_same(self, a: SmHandle, b: SmHandle) -> bool:
         if a.key() == b.key():
             return True
-        if a.kind is b.kind is TopoKind.VERTEX and (a.entity is None or b.entity is None):
-            # a free vertex is the same as any vertex at its place
-            return math.dist(self.vertex_point(a), self.vertex_point(b)) < _TOLERANCE
+        if a.kind is b.kind is TopoKind.VERTEX:
+            # a free vertex, or one of another body, is the same as any vertex
+            # at its place (OCCT shares vertices between the faces built from
+            # a wire and the wire; SMLib bodies each own theirs)
+            if (
+                a.entity is None
+                or b.entity is None
+                or a.entity.GetBrep().address != b.entity.GetBrep().address
+            ):
+                return math.dist(self.vertex_point(a), self.vertex_point(b)) < _TOLERANCE
+        if a.kind is b.kind is TopoKind.EDGE and (
+            a.entity is None
+            or b.entity is None
+            or a.entity.GetBrep().address != b.entity.GetBrep().address
+        ):
+            # likewise an edge of a wire and the edge of a face built on it
+            return self._same_curve(a, b)
         return False
+
+    def _same_curve(self, a: SmHandle, b: SmHandle) -> bool:
+        """Whether two edges run over the same points (either way round)."""
+        view_a, view_b = SmCurveView(self, a), SmCurveView(self, b)
+        if abs(view_a.length() - view_b.length()) > _TOLERANCE:
+            return False
+        ends_a = (view_a.value(view_a.first), view_a.value(view_a.last))
+        ends_b = (view_b.value(view_b.first), view_b.value(view_b.last))
+        same_way = math.dist(ends_a[0], ends_b[0]) < _TOLERANCE and math.dist(ends_a[1], ends_b[1]) < _TOLERANCE
+        other_way = math.dist(ends_a[0], ends_b[1]) < _TOLERANCE and math.dist(ends_a[1], ends_b[0]) < _TOLERANCE
+        if not (same_way or other_way):
+            return False
+        quarter_a = view_a.value(view_a.first + 0.25 * (view_a.last - view_a.first))
+        param_b, distance = view_b.drop_point(quarter_a)
+        return distance < _TOLERANCE and view_b.first - 1e-9 <= param_b <= view_b.last + 1e-9
 
     def is_equal(self, a: SmHandle, b: SmHandle) -> bool:
         return a.key() == b.key() and a.flip == b.flip
@@ -2309,6 +2338,11 @@ class SmlibCoreKernel(Kernel):
         return wire, list(wire.members)
 
     def make_planar_face(self, outer: SmHandle, inners: Sequence[SmHandle]) -> SmHandle:
+        if not self.is_closed(outer):
+            raise ValueError("outer wire is not closed")
+        for inner in inners:
+            if not self.is_closed(inner):
+                raise ValueError("inner wire is not closed")
         curves = self._loop_curves(outer)
         for inner in inners:
             curves.extend(self._loop_curves(inner))
@@ -2316,7 +2350,8 @@ class SmlibCoreKernel(Kernel):
         status, faces = brep.CreatePlanarFacesWith3DCurves(
             brep.GetInfiniteRegion(), curves, _TOLERANCE, []
         )
-        _check(status, "planar face")
+        if status != SM_SUCCESS:
+            raise ValueError(f"Cannot build face(s): SMLib planar face failed with status {status}")
         if len(faces) != 1:
             raise ValueError(f"Cannot build face(s): the wires gave {len(faces)} faces")
         return SmHandle(TopoKind.FACE, faces[0])
@@ -2742,7 +2777,68 @@ class SmlibCoreKernel(Kernel):
         return self.sub_shape_uses(face, TopoKind.WIRE)[0]
 
     fillet_2d = _unsupported("fillet_2d")
-    chamfer_2d = _unsupported("chamfer_2d")
+    def chamfer_2d(
+        self, face: SmHandle, corners: Sequence[tuple[SmHandle, SmHandle, float, float]]
+    ) -> tuple[SmHandle, Any]:
+        """The planar face with corners cut off: each loop is rebuilt from
+        free copies of its edges, shortened at the corners and bridged."""
+        loops = []
+        for loop in self.sub_shape_uses(face, TopoKind.WIRE):
+            originals = list(loop.members)
+            edges: list[SmHandle | None] = []
+            for member in originals:
+                view = SmCurveView(self, member)
+                edges.append(
+                    self._free_edge(
+                        self._copy_curve(view.curve), view.first, view.last, member.flip
+                    )
+                )
+            bridges: dict[int, SmHandle] = {}
+            count = len(originals)
+            for first, second, d1, d2 in corners:
+                indices = [
+                    k for k, member in enumerate(originals)
+                    if self.is_same(member, first) or self.is_same(member, second)
+                ]
+                if len(indices) != 2:
+                    continue
+                i, j = indices
+                if not (j == i + 1 or (i == 0 and j == count - 1 and count > 2)):
+                    continue
+                if i == 0 and j == count - 1:
+                    i, j = j, i  # the loop closes from the last edge to the first
+                along = {}
+                for k, member in ((i, originals[i]), (j, originals[j])):
+                    along[k] = d1 if self.is_same(member, first) else d2
+                if edges[i] is None or edges[j] is None:
+                    continue
+                shortened_i = self._shorten(edges[i], along[i], at_end=True)
+                shortened_j = self._shorten(edges[j], along[j], at_end=False)
+                if shortened_i is None or shortened_j is None:
+                    continue
+                edges[i], edges[j] = shortened_i, shortened_j
+                _, p1, _, _ = self._oriented_ends(shortened_i)
+                p2, _, _, _ = self._oriented_ends(shortened_j)
+                bridges[i] = self.make_line(p1, p2)
+            rebuilt: list[SmHandle] = []
+            for k, edge in enumerate(edges):
+                if edge is not None:
+                    rebuilt.append(edge)
+                if k in bridges:
+                    rebuilt.append(bridges[k])
+            loops.append(SmHandle(TopoKind.WIRE, members=rebuilt))
+        return self.make_planar_face(loops[0], loops[1:]), _Record()
+
+    def _shorten(self, edge: SmHandle, length: float, at_end: bool) -> SmHandle | None:
+        """An edge with ``length`` taken off its oriented end (or start)."""
+        view = SmCurveView(self, edge)
+        total = view.length()
+        if length <= 0 or length >= total - _TOLERANCE:
+            return None
+        # the distance from the curve's own first parameter to the cut
+        from_first = (total - length) if (at_end != edge.flip) else length
+        param = view.param_at_length(from_first, view.first)
+        return self._cut_keeping(edge, view.value(param), keep_start=at_end)
     fix_small_edges = _unsupported("fix_small_edges")
     project = _unsupported("project")
     # ---- 2D offsets -----------------------------------------------------------

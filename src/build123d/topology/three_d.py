@@ -1265,7 +1265,7 @@ class Solid(Mixin3D[TopoDS_Solid]):
         modified_target_faces = []
         for topods_face in kernel.sub_shapes(target.wrapped, TopoKind.FACE):
             target_face = tcast(TopoDS_Face, downcast(topods_face))
-            for modified in list_shapes(history.Modified(target_face)):
+            for modified in kernel.record_modified(history, target_face):
                 modified_target_faces.append(tcast(TopoDS_Face, downcast(modified)))
 
         # 3: Sew the resulting faces into shells - one for each surface the extrusion

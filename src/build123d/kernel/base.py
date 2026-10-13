@@ -180,12 +180,26 @@ class AncestorMap:
     def __len__(self) -> int:
         return len(self._keys)
 
+    def _find(self, shape: Handle) -> Hashable | None:
+        """The stored key for ``shape``: by hash key, else the key of the
+        same entity (a backend may know one vertex under two handles)."""
+        key = self._kernel.hash_key(shape)
+        if key in self._by_key:
+            return key
+        for candidate in self._keys:
+            if self._kernel.is_same(candidate, shape):
+                return self._kernel.hash_key(candidate)
+        return None
+
     def __contains__(self, shape: Handle) -> bool:
-        return self._kernel.hash_key(shape) in self._by_key
+        return self._find(shape) is not None
 
     def get(self, shape: Handle) -> list[Handle]:
         """The ancestors of ``shape``; KeyError when it is not a key."""
-        return self._by_key[self._kernel.hash_key(shape)]
+        key = self._find(shape)
+        if key is None:
+            raise KeyError(self._kernel.hash_key(shape))
+        return self._by_key[key]
 
     def items(self) -> list[tuple[Handle, list[Handle]]]:
         return [(key, self.get(key)) for key in self._keys]
