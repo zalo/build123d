@@ -1,6 +1,6 @@
 # Kernel speed comparison: OCCT vs SMLib (smcore backend)
 
-Measured with `benchmarks/bench_kernels.py` on 2026-10-13, branch `kernel-smlib`,
+Measured with `benchmarks/bench_kernels.py` on 2026-10-13 (fourth run, commit 4c5201cc), branch `kernel-smlib`,
 same machine, 7 repeats per operation, median wall time in milliseconds. Each
 operation runs through the build123d API with the kernel selected by
 `BUILD123D_KERNEL` (`occt`, or `smcore` for the SMLib backend over the
@@ -16,44 +16,43 @@ count rounded to 4 places).
 
 | Operation | OCCT ms | SMLib ms | SMLib / OCCT | Same result |
 |---|---:|---:|---:|---|
-| box | 0.09 | 0.40 | 4.34 | yes |
-| sphere | 0.07 | 1.11 | 16.16 | yes |
-| cylinder | 0.07 | 2.21 | 30.71 | yes |
-| box volume | 0.08 | 0.31 | 3.95 | yes |
-| sphere volume | 0.07 | 16.05 | 229.33 | yes |
-| sphere area | 0.07 | 16.22 | 245.73 | yes |
-| box bounding box | 0.01 | 0.02 | 1.14 | yes |
-| box faces/edges/vertices | 0.16 | 0.09 | 0.54 | yes |
-| fuse box+cylinder | 3.43 | 4.03 | 1.17 | yes |
-| cut box-cylinder | 2.65 | 6.17 | 2.32 | yes |
-| common box&sphere | 3.01 | 6.99 | 2.32 | no (1748.8199 vs 1748.82) |
-| cut box-sphere | 3.16 | 7.38 | 2.33 | no (4251.1801 vs 4251.18) |
-| fuse 8 boxes | 35.49 | 16.82 | 0.47 | yes |
-| fillet box edges | 9.98 | 14.49 | 1.45 | yes |
-| chamfer box edges | 10.83 | 10.43 | 0.96 | yes |
-| fillet cylinder edges | 2.40 | 6.05 | 2.52 | yes |
-| sketch fuse rect+circle | 1.25 | 1.22 | 0.97 | yes |
-| sketch cut rect-circle | 0.86 | 1.33 | 1.54 | yes |
-| rect fillet 2d | 8.90 | 6.92 | 0.78 | yes |
-| rect offset 2d | 1.57 | 2.50 | 1.60 | yes |
-| polygon face | 0.18 | 0.09 | 0.49 | yes |
-| extrude | 0.25 | 0.45 | 1.81 | yes |
-| revolve | 0.32 | 1.92 | 5.99 | yes |
-| loft | 2.36 | 3.54 | 1.50 | no (3961.4835 vs 3605.9308) |
-| sweep | 1.40 | 36.66 | 26.24 | no (383.1496 vs 383.1497) |
-| helix | 0.08 | 0.08 | 0.94 | yes |
-| spline | 0.03 | 0.02 | 0.73 | yes |
-| offset solid | 5.32 | 27.25 | 5.12 | yes |
-| split box | 1.35 | 5.36 | 3.97 | yes |
-| shell box | 2.79 | 4.24 | 1.52 | yes |
-| tessellate sphere | 36.58 | 96.37 | 2.63 | yes |
-| distance box-sphere | 0.47 | 0.67 | 1.42 | yes |
-| point in solid | 0.04 | 0.01 | 0.27 | yes |
-| edge positions | 0.56 | 10.44 | 18.75 | yes |
-| face normal | 0.05 | 0.02 | 0.52 | yes |
-| deepcopy | 0.06 | 0.03 | 0.53 | yes |
-| move/rotate | 0.07 | 0.10 | 1.46 | yes |
-
+| box | 0.10 | 1.42 | 14.19 | yes |
+| sphere | 0.07 | 1.14 | 15.60 | yes |
+| cylinder | 0.07 | 2.48 | 33.54 | yes |
+| box volume | 0.08 | 0.32 | 3.83 | yes |
+| sphere volume | 0.07 | 17.26 | 230.15 | yes |
+| sphere area | 0.07 | 16.53 | 236.14 | yes |
+| box bounding box | 0.01 | 0.02 | 1.07 | yes |
+| box faces/edges/vertices | 0.18 | 0.10 | 0.55 | yes |
+| fuse box+cylinder | 4.70 | 4.70 | 1.00 | yes |
+| cut box-cylinder | 3.43 | 7.30 | 2.13 | yes |
+| common box&sphere | 4.64 | 7.65 | 1.65 | no (1748.8199 vs 1748.82) |
+| cut box-sphere | 4.74 | 8.24 | 1.74 | no (4251.1801 vs 4251.18) |
+| fuse 8 boxes | 45.64 | 21.58 | 0.47 | yes |
+| fillet box edges | 10.84 | 15.25 | 1.41 | yes |
+| chamfer box edges | 11.32 | 10.27 | 0.91 | yes |
+| fillet cylinder edges | 2.53 | 5.36 | 2.12 | yes |
+| sketch fuse rect+circle | 1.37 | 2.89 | 2.11 | yes |
+| sketch cut rect-circle | 0.97 | 2.04 | 2.10 | yes |
+| rect fillet 2d | 10.40 | 10.23 | 0.98 | yes |
+| rect offset 2d | 1.76 | 3.86 | 2.19 | yes |
+| polygon face | 0.21 | 0.39 | 1.86 | yes |
+| extrude | 0.29 | 2.17 | 7.50 | yes |
+| revolve | 0.38 | 2.94 | 7.85 | yes |
+| loft | 2.73 | 26.00 | 9.53 | no (3961.4835 vs 3966.3515) |
+| sweep | 1.61 | 39.43 | 24.55 | no (383.1496 vs 383.1497) |
+| helix | 0.09 | 0.08 | 0.87 | yes |
+| spline | 0.03 | 0.06 | 1.97 | yes |
+| offset solid | 6.29 | 28.53 | 4.53 | yes |
+| split box | 2.40 | 7.70 | 3.20 | yes |
+| shell box | 4.68 | 4.47 | 0.96 | yes |
+| tessellate sphere | 41.69 | 112.03 | 2.69 | yes |
+| distance box-sphere | 0.53 | 0.74 | 1.39 | yes |
+| point in solid | 0.04 | 0.01 | 0.24 | yes |
+| edge positions | 0.61 | 11.36 | 18.56 | yes |
+| face normal | 0.05 | 0.03 | 0.52 | yes |
+| deepcopy | 0.07 | 0.03 | 0.45 | yes |
+| move/rotate | 0.07 | 0.10 | 1.36 | yes |
 
 ## Against smlibpy (another Python layer over the same SMLib kernel)
 
@@ -126,6 +125,13 @@ How to read it:
 
 ## Reading the numbers
 
+- Fourth run: primitives and extrusions got slower (box 0.4 to 1.4 ms, extrude
+  0.45 to 2.2 ms) because every planar face is now put on an explicit plane
+  with OCCT's parameterization after the kernel builds it (`ReplaceSurface`
+  per face). Sketch booleans and polygon faces doubled for the same reason:
+  faces are rebuilt with their loops' uv extents. Lofts of unlike sections
+  now split the sections alike and skin them between shared rails (26 ms).
+
 - Primitives are 4-30x slower on SMLib: every primitive is built through the
   generic `SmPrimitiveCreation` sweep machinery rather than an analytic solid.
 - Mass properties: the SMLib backend integrates them itself (planar faces by
@@ -156,3 +162,4 @@ How to read it:
 | 2026-10-13 (first run) | baseline after the transform/boolean-history work | fillet 12 box edges 3.0 s, sphere volume 148 ms, offset solid 117 ms |
 | 2026-10-13 (second run) | cheap face hashing, face-wise mass properties, inside-out check, length cache | fillet 15 ms, sphere volume 4 ms, offset 27 ms |
 | 2026-10-13 (third run) | pole-graded quadrature, uv-loop integration, cornered sweeps | sphere volume 16 ms (exact to 1e-11), chamfer on par, split 5 ms |
+| 2026-10-13 (fourth run) | OCCT-style planar frames (faces reframed on explicit planes), NURBS line segments, compatible-wire lofts, mitred sweeps, clean merging faces and edges | box 1.4 ms and extrude 2.2 ms (reframing cost), sketch booleans 2x slower, loft 26 ms through the compatible path, fuse box+cylinder on par |
