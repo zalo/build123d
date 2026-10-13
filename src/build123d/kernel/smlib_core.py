@@ -283,6 +283,35 @@ def _check(result: Any, what: str) -> Any:
     return result
 
 
+def _frame_axes(frame: Any) -> tuple[Point, Point, Point]:
+    """The X, Y and Z directions of a gp_Ax2."""
+    x, y, z = frame.XDirection(), frame.YDirection(), frame.Direction()
+    return (x.X(), x.Y(), x.Z()), (y.X(), y.Y(), y.Z()), (z.X(), z.Y(), z.Z())
+
+
+def _newell_normal(points: Sequence[Point]) -> Point:
+    """Newell's normal of a closed polygon (not normalized)."""
+    nx = ny = nz = 0.0
+    for a, b in zip(points, list(points[1:]) + list(points[:1])):
+        nx += (a[1] - b[1]) * (a[2] + b[2])
+        ny += (a[2] - b[2]) * (a[0] + b[0])
+        nz += (a[0] - b[0]) * (a[1] + b[1])
+    return (nx, ny, nz)
+
+
+def _ax3_x_direction(normal: Point) -> Point:
+    """The X direction OCCT's gp_Ax3 picks for a plane given only its normal."""
+    a, b, c = normal
+    aa, ba, ca = abs(a), abs(b), abs(c)
+    if ba <= aa and ba <= ca:
+        d = (-c, 0.0, a) if aa > ca else (c, 0.0, -a)
+    elif aa <= ba and aa <= ca:
+        d = (0.0, -c, b) if ba > ca else (0.0, c, -b)
+    else:
+        d = (-b, a, 0.0) if aa > ba else (b, -a, 0.0)
+    return _unit(d)
+
+
 def _first_last(items: list) -> list:
     """``items`` rotated so the first one comes last."""
     return items[1:] + items[:1]
@@ -1739,15 +1768,19 @@ class SmlibCoreKernel(Kernel):
 
     def _loop_wire(self, loop: Any, face: SmHandle) -> SmHandle:
         """The wire of a face loop, edges in loop order with their orientation."""
-        edges = []
-        # the loop's edge uses run counter-clockwise about the surface normal;
-        # the wire runs counter-clockwise about the face's outward normal
-        outward_flipped = self.face_outward_is_flipped(face)
-        for edgeuse in loop.GetEdgeuses([]):
-            edge = edgeuse.GetEdge()
-            reversed_use = edgeuse.GetOrientation() == self.sc.SM_OT_OPPOSITE
-            flip = reversed_use != face.flip
-            edges.append(SmHandle(TopoKind.EDGE, edge, flip=flip != outward_flipped))
+        # the loop's edge uses chain counter-clockwise about the surface
+        # normal; the wire chains counter-clockwise about the face's outward
+        # normal, so it runs the other way round when the two differ
+        edges = [
+            SmHandle(
+                TopoKind.EDGE,
+                edgeuse.GetEdge(),
+                flip=edgeuse.GetOrientation() == self.sc.SM_OT_OPPOSITE,
+            )
+            for edgeuse in loop.GetEdgeuses([])
+        ]
+        if self.face_outward_is_flipped(face):
+            edges = [e.with_flip(not e.flip) for e in reversed(edges)]
         return SmHandle(TopoKind.WIRE, members=edges)
 
     def direct_children(self, shape: SmHandle) -> list[SmHandle]:
@@ -3273,16 +3306,145 @@ class SmlibCoreKernel(Kernel):
         self, frame: Any, length: float, width: float, height: float
     ) -> SmHandle:
         placement = self._placement(frame)
-        return self._primitive(lambda c: c.CreateBox(length, width, height, placement))
+        box = self._primitive(lambda c: c.CreateBox(length, width, height, placement))
+        # OCCT's box faces lie on planes facing the frame's positive axes,
+        # parameterized by gp_Ax3's rule for each
+        axes = _frame_axes(frame)
+        for face in self._entities(box.entity, TopoKind.FACE):
+            handle = SmHandle(TopoKind.FACE, face)
+            plane = SmSurfaceView(self, handle).plane()
+            if plane is None:
+                continue
+            origin, outward, _ = plane
+            local = tuple(abs(_dot(outward, axis)) for axis in axes)
+            raw = _unit([sum(local[i] * axes[i][j] for i in range(3)) for j in range(3)])
+            x_local = _ax3_x_direction(local)
+            x_dir = _unit([sum(x_local[i] * axes[i][j] for i in range(3)) for j in range(3)])
+            self._reframe_planar_face(box.entity, face, origin, x_dir, _cross(raw, x_dir))
+        return box
 
     def make_cylinder(
         self, frame: Any, radius: float, height: float, angle: float
     ) -> SmHandle:
         placement = self._placement(frame)
         degrees = math.degrees(angle)
-        return self._primitive(
+        cylinder = self._primitive(
             lambda c: c.CreateCone(height, radius, radius, 0.0, degrees, placement)
         )
+        self._reframe_caps(cylinder, frame)
+        return cylinder
+
+    def _reframe_prism(self, prism: SmHandle, profile: SmHandle, direction: Point) -> None:
+        """The planar faces of an extruded planar face parameterized like
+        OCCT's prism: the far cap like the profile, each planar wall on a
+        plane whose X is its generating edge's curve direction and whose
+        normal is the extrusion direction crossed with it."""
+        plane = SmSurfaceView(self, profile).plane()
+        if plane is None:
+            return
+        origin, outward, x_dir = plane
+        raw = tuple(-c for c in outward) if self.face_outward_is_flipped(profile) else outward
+        y_dir = _cross(raw, x_dir)
+        offset = _dot(origin, raw)
+        # the profile's edges keep their curves' own directions; the swept
+        # body's were made to run round the loop
+        generators = []
+        for edge in self.sub_shapes(profile, TopoKind.EDGE):
+            view = SmCurveView(self, edge)
+            if view.geom_type != "LINE":
+                continue
+            middle = view.value(0.5 * (view.first + view.last))
+            generators.append((middle, _unit(view.d1(view.first)[1])))
+        for face in self._entities(prism.entity, TopoKind.FACE):
+            handle = SmHandle(TopoKind.FACE, face)
+            face_plane = SmSurfaceView(self, handle).plane()
+            if face_plane is None:
+                continue
+            face_origin, face_outward, _ = face_plane
+            if abs(_dot(face_outward, raw)) > 1 - 1e-9:
+                cap_origin = origin
+                if abs(_dot(face_origin, raw) - offset) > _TOLERANCE:  # the far cap
+                    cap_origin = tuple(o + d for o, d in zip(origin, direction))
+                self._reframe_planar_face(prism.entity, face, cap_origin, x_dir, y_dir)
+                continue
+            for edge in self.sub_shapes(handle, TopoKind.EDGE):
+                view = SmCurveView(self, edge)
+                if view.geom_type != "LINE":
+                    continue
+                start = view.value(view.first)
+                end = view.value(view.last)
+                if any(abs(_dot(p, raw) - offset) > _TOLERANCE for p in (start, end)):
+                    continue
+                middle = view.value(0.5 * (view.first + view.last))
+                along = next(
+                    (d for m, d in generators if math.dist(m, middle) <= 10 * _TOLERANCE),
+                    None,
+                )
+                if along is None:
+                    break
+                normal = _unit(_cross(direction, along))
+                self._reframe_planar_face(prism.entity, face, start, along, _cross(normal, along))
+                break
+
+    def _reframe_caps(self, body: SmHandle, frame: Any) -> None:
+        """The planar end faces of a round primitive parameterized like
+        OCCT's: on planes facing the frame's Z, with its X direction."""
+        axes = _frame_axes(frame)
+        for face in self._entities(body.entity, TopoKind.FACE):
+            handle = SmHandle(TopoKind.FACE, face)
+            plane = SmSurfaceView(self, handle).plane()
+            if plane is None:
+                continue
+            origin, outward, _ = plane
+            if abs(_dot(outward, axes[2])) < 1 - 1e-9:
+                continue
+            self._reframe_planar_face(body.entity, face, origin, axes[0], axes[1])
+
+    def _reframe_planar_face(
+        self, brep: Any, face: Any, origin: Point, x_dir: Point, y_dir: Point
+    ) -> None:
+        """Put a planar face on a plane with the given frame (what OCCT's
+        parameterization of it would be), keeping which way it faces."""
+        handle = SmHandle(TopoKind.FACE, face)
+        plane = SmSurfaceView(self, handle).plane()
+        if plane is None:
+            return
+        _, outward, _ = plane
+        flipped = self.face_outward_is_flipped(handle)
+        raw_old = tuple(-c for c in outward) if flipped else outward
+        raw_new = _unit(_cross(x_dir, y_dir))
+        # the surface must keep facing the way it did: changing that (by
+        # flipping the face or swapping u and v) leaves the kernel's merge
+        # blind to the body, so a plane facing the other way keeps OCCT's X
+        # and runs its Y the other way
+        ax, ay = x_dir, y_dir
+        if _dot(raw_new, raw_old) < 0:
+            ay = tuple(-c for c in y_dir)
+        points = [
+            p
+            for edge in self.sub_shapes(handle, TopoKind.EDGE)
+            for p in SmCurveView(self, edge).samples(16)
+        ]
+        us = [_dot([p - o for p, o in zip(pt, origin)], ax) for pt in points]
+        vs = [_dot([p - o for p, o in zip(pt, origin)], ay) for pt in points]
+        margin = 100.0 * max(max(us) - min(us), max(vs) - min(vs), 1.0)
+        domain = self.sc.SmExtent2d(
+            self.sc.SmVector2d(min(us) - margin, min(vs) - margin),
+            self.sc.SmVector2d(max(us) + margin, max(vs) + margin),
+        )
+        surface = self.sc.SmPlane(
+            self._vec(origin),
+            self._vec(ax),
+            self._vec(ay),
+            self.sc.SmVector2d(1.0, 1.0),
+            domain,
+            self.context,
+        )
+        outcome = brep.ReplaceSurface(face, surface, 1, [], 1)
+        _check(outcome[0] if isinstance(outcome, tuple) else outcome, "surface replacement")
+        extent = self.sc.SmExtent2d()
+        if face.CalculateUVDomainFromUVTrimCurves(extent, 1) == SM_SUCCESS:
+            face.SetUVDomain(extent)
 
     def make_cone(
         self,
@@ -3294,11 +3456,13 @@ class SmlibCoreKernel(Kernel):
     ) -> SmHandle:
         placement = self._placement(frame)
         degrees = math.degrees(angle)
-        return self._primitive(
+        cone = self._primitive(
             lambda c: c.CreateCone(
                 height, base_radius, top_radius, 0.0, degrees, placement
             )
         )
+        self._reframe_caps(cone, frame)
+        return cone
 
     def make_sphere(
         self, frame: Any, radius: float, angle1: float, angle2: float, angle3: float
@@ -3582,9 +3746,11 @@ class SmlibCoreKernel(Kernel):
                 result = record.result
                 assert result is not None
                 return self.solid_from_shell(result)
-            return self._primitive(
+            prism = self._primitive(
                 lambda c: c.CreateLinearSweep(curves, unit, distance, 1, 1, 1)
             )
+            self._reframe_prism(prism, shape, direction)
+            return prism
         if shape.kind is TopoKind.EDGE:
             # one edge sweeps one face; the body sweep keeps analytic surfaces
             # but splits a curve of several spans into several faces, in
@@ -4628,26 +4794,114 @@ class SmlibCoreKernel(Kernel):
         assert wire is not None
         return wire, list(wire.members)
 
-    def make_planar_face(self, outer: SmHandle, inners: Sequence[SmHandle]) -> SmHandle:
+    def make_planar_face(
+        self,
+        outer: SmHandle,
+        inners: Sequence[SmHandle],
+        frame: tuple[Point, Point, Point] | None = None,
+    ) -> SmHandle:
+        """A face on a plane parameterized as OCCT's would be: the normal is
+        the way the outer wire winds, the X direction follows gp_Ax3's rule
+        for that normal (or ``frame`` = (origin, x, y) when a plane is
+        given), the uv domain is the loops' extent, and the edges keep their
+        curves' own directions, flagged as the loop runs."""
         if not self.is_closed(outer):
             raise ValueError("outer wire is not closed")
         for inner in inners:
             if not self.is_closed(inner):
                 raise ValueError("inner wire is not closed")
-        # SMLib begins each loop at the last curve given; OCCT keeps the
-        # wire's own first edge first
-        curves = _first_last(self._loop_curves(outer))
+        samples = self._oriented_samples(outer)
+        normal = _newell_normal(samples)
+        if frame is None:
+            if _dot(normal, normal) < 1e-24:
+                raise ValueError("Cannot build face(s): the outer wire has no plane")
+            normal = _unit(normal)
+            origin = tuple(sum(p[i] for p in samples) / len(samples) for i in range(3))
+            x_dir = _ax3_x_direction(normal)
+            y_dir = _cross(normal, x_dir)
+        else:
+            origin, x_dir, y_dir = frame
+            normal = _unit(_cross(x_dir, y_dir))
+        loops = [outer]
         for inner in inners:
-            curves.extend(_first_last(self._loop_curves(inner)))
-        brep = self._new_brep()
-        status, faces = brep.CreatePlanarFacesWith3DCurves(
-            brep.GetInfiniteRegion(), curves, _TOLERANCE, []
+            # inner loops run the other way round
+            inner_normal = _newell_normal(self._oriented_samples(inner))
+            if _dot(inner_normal, normal) > 0:
+                inner = SmHandle(
+                    TopoKind.WIRE,
+                    members=[e.with_flip(not e.flip) for e in reversed(inner.members)],
+                )
+            loops.append(inner)
+        points = [p for loop in loops for p in self._oriented_samples(loop)]
+        us = [_dot([p - o for p, o in zip(pt, origin)], x_dir) for pt in points]
+        vs = [_dot([p - o for p, o in zip(pt, origin)], y_dir) for pt in points]
+        # the plane reaches well beyond the face: offsets and booleans
+        # extend faces along their surfaces
+        margin = 100.0 * max(max(us) - min(us), max(vs) - min(vs), 1.0)
+        domain = self.sc.SmExtent2d(
+            self.sc.SmVector2d(min(us) - margin, min(vs) - margin),
+            self.sc.SmVector2d(max(us) + margin, max(vs) + margin),
         )
+        plane = self.sc.SmPlane(
+            self._vec(origin),
+            self._vec(x_dir),
+            self._vec(y_dir),
+            self.sc.SmVector2d(1.0, 1.0),
+            domain,
+            self.context,
+        )
+        counts, curves, orients = [], [], []
+        for loop in loops:
+            loop_curves, loop_orients = self._loop_curves_as_they_run(loop)
+            counts.append(len(loop_curves))
+            # SMLib begins each loop at the last curve given; OCCT keeps the
+            # wire's own first edge first
+            curves.extend(_first_last(loop_curves))
+            orients.extend(_first_last(loop_orients))
+        brep = self._new_brep()
+        outcome = brep.CreateFacesWithCurves(None, counts, curves, orients, plane, [])
+        status = outcome[0] if isinstance(outcome, tuple) else outcome
         if status != SM_SUCCESS:
             raise ValueError(f"Cannot build face(s): SMLib planar face failed with status {status}")
+        faces = self._entities(brep, TopoKind.FACE)
         if len(faces) != 1:
             raise ValueError(f"Cannot build face(s): the wires gave {len(faces)} faces")
+        extent = self.sc.SmExtent2d()
+        if faces[0].CalculateUVDomainFromUVTrimCurves(extent, 1) == SM_SUCCESS:
+            faces[0].SetUVDomain(extent)
         return SmHandle(TopoKind.FACE, faces[0])
+
+    def _oriented_samples(self, wire: SmHandle) -> list[Point]:
+        """Points along a wire the way it runs."""
+        points: list[Point] = []
+        for edge in wire.members:
+            view = SmCurveView(self, edge)
+            samples = view.samples(16)[:-1]
+            if edge.flip:
+                samples = view.samples(16)[1:][::-1]
+            points.extend(samples)
+        return points
+
+    def _loop_curves_as_they_run(self, wire: SmHandle) -> tuple[list[Any], list[Any]]:
+        """Copies of a loop's curves trimmed to their edges, each with the
+        orientation the loop uses it in (the curves themselves keep their
+        direction, as OCCT's edges do)."""
+        curves, orients = [], []
+        for edge in wire.members:
+            if edge.entity is not None:
+                curve = edge.entity.GetCurve()
+                interval = edge.entity.GetInterval()
+                t0, t1 = interval.GetMin(), interval.GetMax()
+            else:
+                curve = edge.curve
+                assert edge.interval is not None
+                t0, t1 = edge.interval
+            status, copy = curve.Copy(self.context)
+            _check(status, "curve copy")
+            _check(copy.Trim(self.sc.SmExtent1d(t0, t1), 0, 0), "curve trim")
+            curves.append(copy)
+            orients.append(self.sc.SM_OT_OPPOSITE if edge.flip else self.sc.SM_OT_SAME)
+        return curves, orients
 
     def add_holes(self, face: SmHandle, wires: Sequence[SmHandle]) -> SmHandle:
         """A face with extra inner loops: a planar one is rebuilt from its
@@ -4698,14 +4952,23 @@ class SmlibCoreKernel(Kernel):
                 origin.Z() + u * x_axis.Z() + v * y_axis.Z(),
             )
 
-        corners = [
-            corner(u0, v0),
-            corner(u1, v0),
-            corner(u1, v1),
-            corner(u0, v1),
-            corner(u0, v0),
-        ]
-        return self.make_planar_face(self.make_polygon(corners), [])
+        c00, c10, c11, c01 = corner(u0, v0), corner(u1, v0), corner(u1, v1), corner(u0, v1)
+        # OCCT's edges run +u and +v, the top and left ones used reversed
+        wire = SmHandle(
+            TopoKind.WIRE,
+            members=[
+                self.make_line(c00, c10),
+                self.make_line(c10, c11),
+                self.make_line(c01, c11).with_flip(True),
+                self.make_line(c00, c01).with_flip(True),
+            ],
+        )
+        frame = (
+            (origin.X(), origin.Y(), origin.Z()),
+            (x_axis.X(), x_axis.Y(), x_axis.Z()),
+            (y_axis.X(), y_axis.Y(), y_axis.Z()),
+        )
+        return self.make_planar_face(wire, [], frame)
 
     def make_shell(self, faces: Sequence[SmHandle]) -> SmHandle:
         if len(faces) == 1:
@@ -5473,10 +5736,9 @@ class SmlibCoreKernel(Kernel):
     # ---- 2D offsets -----------------------------------------------------------
 
     def _wire_normal(self, edges: Sequence[SmHandle]) -> Point:
-        """The normal of the plane a wire lies in (Newell's method over sampled points)."""
-        points: list[Point] = []
-        for edge in edges:
-            points.extend(SmCurveView(self, edge).samples(32))
+        """The normal of the plane a wire lies in (Newell's method over
+        sampled points, taken the way the wire runs)."""
+        points = self._oriented_samples(SmHandle(TopoKind.WIRE, members=list(edges)))
         nx = ny = nz = 0.0
         for a, b in zip(points, points[1:] + points[:1]):
             nx += (a[1] - b[1]) * (a[2] + b[2])
@@ -5739,20 +6001,11 @@ class SmlibCoreKernel(Kernel):
         if self.is_closed(wire):
             # outwards for a positive distance: the right of a loop running
             # counter-clockwise about the normal, the left of one running clockwise
-            points = [
-                p
-                for e in edges
-                for p in SmCurveView(self, e).samples(32)[:-1]
-            ]
-            if not edges[0].flip and len(edges) == 1:
-                pass
+            points = self._oriented_samples(SmHandle(TopoKind.WIRE, members=edges))
             twice_area = 0.0
             for a, b in zip(points, points[1:] + points[:1]):
                 twice_area += _dot(_cross(a, b), normal)
-            # the sampled points follow each edge's own parameter direction;
-            # the first edge's flip tells which way the wire runs
-            runs_backwards = edges[0].flip
-            counter_clockwise = (twice_area > 0) != runs_backwards
+            counter_clockwise = twice_area > 0
             signed = distance if counter_clockwise else -distance
             run = self._offset_run(edges, normal, signed, join, True)
             if not run:
