@@ -1128,6 +1128,16 @@ class SmlibCoreKernel(Kernel):
             point = view.value(u, v)
             if min(math.dist(point, c) for c in corners) > _TOLERANCE * scale:
                 return False
+        # every loop edge must run along a side of the domain (a seam vertex
+        # can sit at every corner of a half cylinder cut through its seam)
+        du, dv = max(u1 - u0, 1e-12), max(v1 - v0, 1e-12)
+        for edge in self.sub_shapes(face, TopoKind.EDGE):
+            curve = SmCurveView(self, edge)
+            middle = curve.value(0.5 * (curve.first + curve.last))
+            u, v = view.closest_uv(middle)
+            on_side = min(abs(u - u0), abs(u - u1)) < 1e-6 * du or min(abs(v - v0), abs(v - v1)) < 1e-6 * dv
+            if not on_side:
+                return False
         return True
 
     def _uv_loops(self, face: Any) -> list[list[tuple[Any, bool]]]:
@@ -2465,7 +2475,7 @@ class SmlibCoreKernel(Kernel):
         a tool (edges) and the points where they cross it (vertices)."""
         overlaps = self._merge_pieces(self._edge_pieces(args, tools, True, on_surface=True).members)
         overlap_views = [SmCurveView(self, e) for e in overlaps]
-        points: dict[tuple[Any, ...], Point] = {}
+        points: dict[tuple[Any, ...], tuple[float, Point]] = {}
         for arg in args:
             for kind, data in self._atoms(arg):
                 if kind != "curve":
@@ -2476,10 +2486,14 @@ class SmlibCoreKernel(Kernel):
                         for point in self._crossings(curve, interval, other):
                             if any(v.drop_point(point)[1] <= _TOLERANCE for v in overlap_views):
                                 continue  # already within a stretch
-                            points.setdefault(_point_key(point), point)
+                            # kept in the order met along the argument's curve
+                            drop = curve.DropPoint(interval, self._vec(point), None, _TOLERANCE, None)
+                            where = float(drop[-2]) if drop[0] == SM_SUCCESS else 0.0
+                            points.setdefault(_point_key(point), (where, point))
+        ordered = [p for _, p in sorted(points.values(), key=lambda item: item[0])]
         return SmHandle(
             TopoKind.COMPOUND,
-            members=[*overlaps, *(self.make_vertex(p) for p in points.values())],
+            members=[*overlaps, *(self.make_vertex(p) for p in ordered)],
         )
 
     def _merge_pieces(self, edges: Sequence[SmHandle]) -> list[SmHandle]:
@@ -3106,14 +3120,28 @@ class SmlibCoreKernel(Kernel):
             # an open profile sweeps a sheet
             wire = shape if shape.kind is TopoKind.WIRE else SmHandle(TopoKind.WIRE, members=[shape])
             faces: list[SmHandle] = []
+            axis_point = (origin.X(), origin.Y(), origin.Z())
+            spin = (sign * direction.X(), sign * direction.Y(), sign * direction.Z())
             for curve in self._loop_curves(wire):
-                # the kernel sweeps one open curve at a time into a sheet
+                # the sweep consumes the curve: what the orientation check
+                # needs is taken first. OCCT's revolved sheet faces along
+                # (rotation x meridian)
+                domain = curve.GetNaturalInterval()
+                view = SmCurveView(self, self._free_edge(curve, domain.GetMin(), domain.GetMax()))
+                point, tangent = view.d1(0.5 * (view.first + view.last))
+                rotation = _cross(spin, tuple(p - a for p, a in zip(point, axis_point)))
+                expected = _cross(rotation, tangent)
                 sheet = self._primitive(
                     lambda c, curve=curve: c.CreateRotationalSweep(
                         [curve], base, axis_dir, math.degrees(angle), 1, 0, 1
                     )
                 )
-                faces.extend(self.sub_shapes(sheet, TopoKind.FACE))
+                for face in self.sub_shapes(sheet, TopoKind.FACE):
+                    surface = SmSurfaceView(self, face)
+                    _, normal = surface.normal(*surface.closest_uv(point))
+                    if _dot(normal, expected) < 0:
+                        _check(face.entity.SwapUV(), "face orientation")
+                    faces.append(face)
             if len(faces) == 1:
                 return faces[0]
             _, record = self.sew(faces)
@@ -4467,6 +4495,7 @@ class SmlibCoreKernel(Kernel):
             self.sc.SmExtent1d(*bounds),
             ("curve", (other_view.curve, self.sc.SmExtent1d(*other_bounds))),
         )
+        points.sort(key=lambda p: view.drop_point(p)[0])  # in the order met along the edge
         origin = plane.Location()
         x_axis, y_axis = plane.XAxis().Direction(), plane.YAxis().Direction()
         found = []
