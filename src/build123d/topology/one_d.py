@@ -490,6 +490,73 @@ def _solve_wire_fillet_corner_lines(
     )
 
 
+def _solve_wire_fillet_corner_offsets(
+    corner: _WireFilletCorner, radius: float
+) -> _WireFilletSolution | None:
+    """Fillet a corner of two edges of any kind: the arc centre is where the
+    edges' offsets by the radius cross, nearest the corner, and the arc runs
+    between the points of the edges nearest that centre."""
+    corner_point = Vector(corner.vertex)
+    candidates: list[Vector] = []
+    try:
+        offsets = [
+            [
+                edge.offset_2d(radius, side=side, closed=False)
+                for side in (Side.LEFT, Side.RIGHT)
+            ]
+            for edge in corner.connected_edges
+        ]
+    except (ValueError, RuntimeError) + kernel.failure_types:
+        return None
+    for first in offsets[0]:
+        for second in offsets[1]:
+            crossing = first.intersect(second)
+            if crossing is None:
+                continue
+            candidates.extend(Vector(v) for v in crossing.vertices())
+    if not candidates:
+        return None
+    # the nearest crossing whose arc touches both edges away from the corner
+    # (offsets also meet at their ends, right beside the corner)
+    chosen: tuple[Vector, list[Vector]] | None = None
+    for centre in sorted(candidates, key=lambda c: (c - corner_point).length):
+        touches = []
+        for edge in corner.connected_edges:
+            touch, _ = edge.closest_points(centre)
+            if (touch - corner_point).length < TOLERANCE:
+                break
+            touches.append(touch)
+        if len(touches) == 2:
+            chosen = (centre, touches)
+            break
+    if chosen is None:
+        return None
+    centre, touches = chosen
+    midway = centre + (((touches[0] + touches[1]) / 2) - centre).normalized() * radius
+    fillet_arc = Edge.make_three_point_arc(touches[0], midway, touches[1])
+    trimmed_topods_edges = []
+    for edge, touch in zip(corner.connected_edges, touches):
+        other_vertex = [v for v in edge.vertices() if not v.is_same(corner.vertex)][0]
+        split_vertex = Vertex(kernel.make_vertex(tuple(touch)))
+        split_edges = _split_edge_at_vertex(copy.deepcopy(edge), split_vertex)
+        edge_result = next(
+            (
+                e
+                for e in split_edges
+                if _topods_edge_contains_vertex(e, other_vertex.wrapped)
+                and not _topods_edge_contains_vertex(e, corner.vertex.wrapped)
+            ),
+            None,
+        )
+        if edge_result is None:
+            return None
+        trimmed_topods_edges.append(edge_result)
+    return _WireFilletSolution(
+        trimmed_topods_edges=trimmed_topods_edges,
+        fillet_topods_edge=fillet_arc.wrapped,  # pylint: disable=no-member
+    )
+
+
 def _fillet_wire_corner(wire: Wire, vertex: Vertex, radius: float) -> Wire:
     """Fillet a single planar wire corner with the available 2D fillet solvers."""
 
@@ -501,6 +568,8 @@ def _fillet_wire_corner(wire: Wire, vertex: Vertex, radius: float) -> Wire:
     solution = None
     if kernel.name != "occt":  # the constrained 2D solver below is OCCT's
         solution = _solve_wire_fillet_corner_lines(corner, radius)
+        if solution is None:
+            solution = _solve_wire_fillet_corner_offsets(corner, radius)
     if solution is None:
         solution = _solve_wire_fillet_corner_geom2dgcc_circ2d2tanrad(corner, radius)
 

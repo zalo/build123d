@@ -1231,6 +1231,8 @@ class SmlibCoreKernel(Kernel):
             return self._section_points(args, tools), _Record()
         if op is BoolOp.SECTION and all(self._is_one_dimensional(t) for t in tools):
             return self._section_points(tools, args), _Record()
+        if op is BoolOp.SECTION:
+            return self._section_edges(args, tools), _Record()
         if op not in ops:
             raise NotImplementedError(f"smlib: boolean {op.value}")
         record = _Record()
@@ -1415,6 +1417,35 @@ class SmlibCoreKernel(Kernel):
                         piece.flip = edge.flip
                         pieces.append(piece)
         return SmHandle(TopoKind.COMPOUND, members=pieces)
+
+    def _section_edges(
+        self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
+    ) -> SmHandle:
+        """The edges where faces, shells and solids cross each other: the
+        intersection edges the kernel's merge computes, copied out as free edges."""
+        edges: list[SmHandle] = []
+        for arg in args:
+            for tool in tools:
+                for a in self._bodies(arg):
+                    for b in self._bodies(tool):
+                        copy_a, _ = self._copy_body(a.entity)
+                        copy_b, _ = self._copy_body(b.entity)
+                        merge = self.sc.SmMerge(self.context, copy_a, copy_b, 0.0, 0.0, None)
+                        status, _result = merge.ManifoldBoolean(
+                            self.sc.SM_BO_INTERSECTION, None
+                        )
+                        if status != SM_SUCCESS:
+                            continue
+                        for edge in merge.GetIntersectionEdges([]):
+                            interval = edge.GetInterval()
+                            edges.append(
+                                self._free_edge(
+                                    self._copy_curve(edge.GetCurve()),
+                                    interval.GetMin(),
+                                    interval.GetMax(),
+                                )
+                            )
+        return SmHandle(TopoKind.COMPOUND, members=edges)
 
     def _split_edges_at_points(
         self, edges: Sequence[SmHandle], vertices: Sequence[SmHandle]
@@ -2638,8 +2669,15 @@ class SmlibCoreKernel(Kernel):
         if best is None:
             return None
         return best[1], best[2]
-    edge_uv_on_face = _unsupported("edge_uv_on_face")
-    vertex_uv_on_face = _unsupported("vertex_uv_on_face")
+    def edge_uv_on_face(
+        self, edge: SmHandle, face: SmHandle, params: Sequence[float]
+    ) -> list[tuple[float, float]]:
+        curve = SmCurveView(self, edge)
+        surface = SmSurfaceView(self, face)
+        return [surface.closest_uv(curve.value(t)) for t in params]
+
+    def vertex_uv_on_face(self, vertex: SmHandle, face: SmHandle) -> tuple[float, float]:
+        return SmSurfaceView(self, face).closest_uv(self.vertex_point(vertex))
     edge_uv_ends_on_face = _unsupported("edge_uv_ends_on_face")
     def frame_at(
         self, shape: SmHandle, param: float, corrected: bool
