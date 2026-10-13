@@ -16,43 +16,43 @@ count rounded to 4 places).
 
 | Operation | OCCT ms | SMLib ms | SMLib / OCCT | Same result |
 |---|---:|---:|---:|---|
-| box | 0.09 | 0.41 | 4.35 | yes |
-| sphere | 0.07 | 1.11 | 15.93 | yes |
-| cylinder | 0.07 | 2.19 | 32.28 | yes |
-| box volume | 0.08 | 1.29 | 16.93 | yes |
-| sphere volume | 0.07 | 4.31 | 61.56 | yes |
-| sphere area | 0.07 | 4.31 | 64.31 | yes |
-| box bounding box | 0.01 | 0.01 | 1.07 | yes |
-| box faces/edges/vertices | 0.17 | 0.09 | 0.56 | yes |
-| fuse box+cylinder | 3.30 | 4.24 | 1.28 | yes |
-| cut box-cylinder | 2.59 | 6.30 | 2.43 | yes |
-| common box&sphere | 3.07 | 7.03 | 2.29 | no (1748.8199 vs 1748.82) |
-| cut box-sphere | 3.10 | 7.45 | 2.41 | no (4251.1801 vs 4251.18) |
-| fuse 8 boxes | 33.38 | 16.36 | 0.49 | yes |
-| fillet box edges | 10.10 | 14.52 | 1.44 | yes |
-| chamfer box edges | 11.43 | 9.49 | 0.83 | yes |
-| fillet cylinder edges | 2.49 | 5.19 | 2.09 | yes |
-| sketch fuse rect+circle | 1.14 | 1.19 | 1.04 | yes |
-| sketch cut rect-circle | 0.73 | 1.32 | 1.80 | yes |
-| rect fillet 2d | 8.97 | 6.93 | 0.77 | yes |
-| rect offset 2d | 1.56 | 2.51 | 1.61 | yes |
-| polygon face | 0.18 | 0.09 | 0.51 | yes |
-| extrude | 0.25 | 0.62 | 2.48 | yes |
-| revolve | 0.32 | 1.92 | 6.04 | yes |
-| loft | 2.36 | 3.53 | 1.49 | no (3961.4835 vs 3605.9308) |
-| sweep | 1.40 | 39.01 | 27.78 | no (383.1496 vs 383.1497) |
-| helix | 0.08 | 0.07 | 0.93 | yes |
-| spline | 0.03 | 0.02 | 0.76 | yes |
-| offset solid | 5.33 | 27.28 | 5.12 | yes |
-| split box | 1.37 | 9.90 | 7.24 | yes |
-| shell box | 2.81 | 5.66 | 2.01 | yes |
-| tessellate sphere | 37.44 | 96.53 | 2.58 | yes |
-| distance box-sphere | 0.54 | 0.67 | 1.24 | yes |
-| point in solid | 0.04 | 0.01 | 0.23 | yes |
-| edge positions | 0.54 | 10.41 | 19.13 | yes |
-| face normal | 0.04 | 0.03 | 0.59 | yes |
-| deepcopy | 0.06 | 0.03 | 0.50 | yes |
-| move/rotate | 0.07 | 0.10 | 1.39 | yes |
+| box | 0.09 | 0.40 | 4.34 | yes |
+| sphere | 0.07 | 1.11 | 16.16 | yes |
+| cylinder | 0.07 | 2.21 | 30.71 | yes |
+| box volume | 0.08 | 0.31 | 3.95 | yes |
+| sphere volume | 0.07 | 16.05 | 229.33 | yes |
+| sphere area | 0.07 | 16.22 | 245.73 | yes |
+| box bounding box | 0.01 | 0.02 | 1.14 | yes |
+| box faces/edges/vertices | 0.16 | 0.09 | 0.54 | yes |
+| fuse box+cylinder | 3.43 | 4.03 | 1.17 | yes |
+| cut box-cylinder | 2.65 | 6.17 | 2.32 | yes |
+| common box&sphere | 3.01 | 6.99 | 2.32 | no (1748.8199 vs 1748.82) |
+| cut box-sphere | 3.16 | 7.38 | 2.33 | no (4251.1801 vs 4251.18) |
+| fuse 8 boxes | 35.49 | 16.82 | 0.47 | yes |
+| fillet box edges | 9.98 | 14.49 | 1.45 | yes |
+| chamfer box edges | 10.83 | 10.43 | 0.96 | yes |
+| fillet cylinder edges | 2.40 | 6.05 | 2.52 | yes |
+| sketch fuse rect+circle | 1.25 | 1.22 | 0.97 | yes |
+| sketch cut rect-circle | 0.86 | 1.33 | 1.54 | yes |
+| rect fillet 2d | 8.90 | 6.92 | 0.78 | yes |
+| rect offset 2d | 1.57 | 2.50 | 1.60 | yes |
+| polygon face | 0.18 | 0.09 | 0.49 | yes |
+| extrude | 0.25 | 0.45 | 1.81 | yes |
+| revolve | 0.32 | 1.92 | 5.99 | yes |
+| loft | 2.36 | 3.54 | 1.50 | no (3961.4835 vs 3605.9308) |
+| sweep | 1.40 | 36.66 | 26.24 | no (383.1496 vs 383.1497) |
+| helix | 0.08 | 0.08 | 0.94 | yes |
+| spline | 0.03 | 0.02 | 0.73 | yes |
+| offset solid | 5.32 | 27.25 | 5.12 | yes |
+| split box | 1.35 | 5.36 | 3.97 | yes |
+| shell box | 2.79 | 4.24 | 1.52 | yes |
+| tessellate sphere | 36.58 | 96.37 | 2.63 | yes |
+| distance box-sphere | 0.47 | 0.67 | 1.42 | yes |
+| point in solid | 0.04 | 0.01 | 0.27 | yes |
+| edge positions | 0.56 | 10.44 | 18.75 | yes |
+| face normal | 0.05 | 0.02 | 0.52 | yes |
+| deepcopy | 0.06 | 0.03 | 0.53 | yes |
+| move/rotate | 0.07 | 0.10 | 1.46 | yes |
 
 ## Reading the numbers
 
@@ -60,10 +60,12 @@ count rounded to 4 places).
   generic `SmPrimitiveCreation` sweep machinery rather than an analytic solid.
 - Mass properties: the SMLib backend integrates them itself (planar faces by
   Green's theorem around the loops, faces covering a whole rectangle of their
-  parameter space by Gauss quadrature on the knot spans) because the kernel's
-  own integrator costs 150 ms on a sphere at the accuracy the tests need; a
-  body with trimmed curved faces still falls back to that integrator
-  (~300 ms for a box with all edges filleted).
+  parameter space by Gauss quadrature on the knot spans, graded toward poles,
+  other trimmed faces by Green's theorem in parameter space through their uv
+  trim curves) because the kernel's own integrator costs 150 ms on a sphere
+  at the accuracy the tests need; a body with trimmed pole-bearing patches
+  still falls back to that integrator (~300 ms for a box with all edges
+  filleted).
 - Booleans are 1.3-2.5x slower one at a time but fusing many disjoint bodies
   is 2x faster (bodies that do not touch are kept apart and merged only with
   what they overlap).
@@ -83,3 +85,4 @@ count rounded to 4 places).
 |---|---|---|
 | 2026-10-13 (first run) | baseline after the transform/boolean-history work | fillet 12 box edges 3.0 s, sphere volume 148 ms, offset solid 117 ms |
 | 2026-10-13 (second run) | cheap face hashing, face-wise mass properties, inside-out check, length cache | fillet 15 ms, sphere volume 4 ms, offset 27 ms |
+| 2026-10-13 (third run) | pole-graded quadrature, uv-loop integration, cornered sweeps | sphere volume 16 ms (exact to 1e-11), chamfer on par, split 5 ms |

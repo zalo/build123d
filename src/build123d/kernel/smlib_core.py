@@ -3161,7 +3161,46 @@ class SmlibCoreKernel(Kernel):
             # a swept sheet faces the other way than OCCT's
             for face in self._entities(swept.entity, TopoKind.FACE):
                 _check(face.SwapUV(), "face orientation")
+        if not options.bMoveProfileCenterToPath:
+            # the kernel shifts a profile placed off the path before sweeping;
+            # OCCT keeps its offset across the path (and, like the kernel,
+            # brings it onto the plane the path starts in): the result is
+            # moved back by the across-path part of the shift the first
+            # profile copy shows
+            shift = self._profile_shift(swept, curves, path_start)
+            if shift is not None:
+                start_view = SmCurveView(self, path_wire.members[0])
+                tangent = _unit(start_view.d1(start_view.first)[1])
+                along = _dot(shift, tangent)
+                across = tuple(c - along * t for c, t in zip(shift, tangent))
+                if math.sqrt(_dot(across, across)) > _TOLERANCE:
+                    swept = self._bake(swept, _translation(tuple(-c for c in across)))
         return swept
+
+    def _profile_shift(
+        self, swept: SmHandle, curves: Sequence[Any], path_start: Point
+    ) -> Point | None:
+        """How far the kernel moved the profile: the difference between the
+        middle of the profile's first curve and that of the matching edge of
+        the result nearest the path's start."""
+        curve = curves[0]
+        domain = curve.GetNaturalInterval()
+        view = SmCurveView(self, self._free_edge(curve, domain.GetMin(), domain.GetMax()))
+        length = view.length()
+        middle = view.value(0.5 * (view.first + view.last))
+        best: tuple[float, Point] | None = None
+        for edge in self.sub_shapes(swept, TopoKind.EDGE):
+            other = SmCurveView(self, edge)
+            if abs(other.length() - length) > 1e-6 * max(1.0, length):
+                continue
+            other_middle = other.value(0.5 * (other.first + other.last))
+            # the copy at the start of the path is the one nearest to it
+            score = math.dist(other_middle, path_start)
+            if best is None or score < best[0]:
+                best = (score, other_middle)
+        if best is None:
+            return None
+        return tuple(o - m for o, m in zip(best[1], middle))  # type: ignore[return-value]
 
     def _smooth_wire(self, wire: SmHandle) -> bool:
         """Whether the tangent carries on from each edge to the next."""
@@ -3900,6 +3939,12 @@ class SmlibCoreKernel(Kernel):
     def sew(self, faces: Sequence[SmHandle]) -> tuple[SmHandle, Any]:
         record = _Record()
         target = self._new_brep()
+        # shells and compounds sew by their faces (OCCT's sewing takes any shape)
+        faces = [
+            f
+            for shape in faces
+            for f in ([shape] if shape.kind is TopoKind.FACE else self.sub_shapes(shape, TopoKind.FACE))
+        ]
         for face in faces:
             before = {f.address for f in self._entities(target, TopoKind.FACE)}
             _check(
