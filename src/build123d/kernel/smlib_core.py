@@ -317,6 +317,7 @@ def _first_last(items: list) -> list:
     return items[1:] + items[:1]
 
 
+_PLANE_MARGIN = 1.0  # a plane's domain reaches this many face extents beyond it
 _partner_ids = itertools.count(1)
 _DROPPED = object()  # marks an offset edge used up at a corner
 
@@ -2550,6 +2551,7 @@ class SmlibCoreKernel(Kernel):
                 self._copy_face_into(SmHandle(TopoKind.FACE, face), target)
         stitcher = self.sc.SmStitch(self.sc.SmStitchCallback(), _TOLERANCE, 1, 1)
         _check(stitcher.StitchIntoShell(target, 0, 1.0), "stitch")
+        self._orient_sheet(target)
         self._box_of(target, fresh=True)
         return target
 
@@ -3194,9 +3196,16 @@ class SmlibCoreKernel(Kernel):
                 _, end, _, _ = self._oriented_ends(run[-1])
                 if SmCurveView(self, run[0]).geom_type == "LINE":
                     result.append(self.make_line(start, end))
+                elif math.dist(start, end) <= 10 * _TOLERANCE:
+                    # the run closes its circle
+                    centre, axis, radius = SmCurveView(self, run[0]).circle()
+                    result.append(self.make_circle(gp_Ax2(gp_Pnt(*centre), gp_Dir(*axis)), radius))
                 else:
                     joint = self._pt(self.edge_vertices_entities(run[0])[-1].GetPoint())
-                    result.append(self.make_three_point_arc(start, joint, end))
+                    try:
+                        result.append(self.make_three_point_arc(start, joint, end))
+                    except ValueError:
+                        result.extend(run)  # left as they were
             return result
 
         def loop_area(edges: list[SmHandle], normal: Point) -> float:
@@ -3522,6 +3531,56 @@ class SmlibCoreKernel(Kernel):
                 self._reframe_planar_face(prism.entity, face, start, along, _cross(normal, along))
                 break
 
+    def _nurbs_edged_sheet(self, brep: Any) -> Any:
+        """The sheet with every analytic edge curve replaced by its NURBS
+        form (faces rebuilt on their surfaces), or the sheet itself when
+        none of its edges needs it."""
+        needs = [
+            face
+            for face in self._entities(brep, TopoKind.FACE)
+            if any(
+                self.curve_type(e.GetCurve()) != "BSPLINE"
+                for e in self._entities(self._sheet_of(SmHandle(TopoKind.FACE, face)), TopoKind.EDGE)
+            )
+        ]
+        if not needs:
+            return brep
+        rebuilt_addresses = {f.address for f in needs}
+        target = self._new_brep()
+        for face in self._entities(brep, TopoKind.FACE):
+            handle = SmHandle(TopoKind.FACE, face)
+            if face.address not in rebuilt_addresses:
+                self._copy_face_into(handle, target)
+                continue
+            # the loops run counter-clockwise about the outward normal; the
+            # builder wants them so about the surface normal, and the face
+            # is turned over afterwards when the two differ
+            turned = self.face_outward_is_flipped(handle)
+            counts, curves, orients = [], [], []
+            for loop in self.sub_shape_uses(handle, TopoKind.WIRE):
+                if turned:
+                    loop = SmHandle(
+                        TopoKind.WIRE,
+                        members=[e.with_flip(not e.flip) for e in reversed(loop.members)],
+                    )
+                loop_curves, loop_orients = self._loop_curves_as_they_run(loop)
+                counts.append(len(loop_curves))
+                curves.extend(self._as_nurbs(c) for c in loop_curves)
+                orients.extend(loop_orients)
+            status, surface = face.GetSurface().Copy(self.context)
+            _check(status, "surface copy")
+            body = self._new_brep()
+            outcome = body.CreateFacesWithCurves(None, counts, curves, orients, surface, [])
+            _check(outcome[0] if isinstance(outcome, tuple) else outcome, "face rebuild")
+            for made in self._entities(body, TopoKind.FACE):
+                if turned:
+                    _check(made.SwapUV(), "face orientation")
+                self._copy_face_into(SmHandle(TopoKind.FACE, made), target)
+        stitcher = self.sc.SmStitch(self.sc.SmStitchCallback(), _TOLERANCE, 1, 1)
+        _check(stitcher.StitchIntoShell(target, 0, 1.0), "stitch")
+        self._orient_sheet(target)
+        return target
+
     def _reframe_caps(self, body: SmHandle, frame: Any) -> None:
         """The planar end faces of a round primitive parameterized like
         OCCT's: on planes facing the frame's Z, with its X direction."""
@@ -3563,7 +3622,7 @@ class SmlibCoreKernel(Kernel):
         ]
         us = [_dot([p - o for p, o in zip(pt, origin)], ax) for pt in points]
         vs = [_dot([p - o for p, o in zip(pt, origin)], ay) for pt in points]
-        margin = 100.0 * max(max(us) - min(us), max(vs) - min(vs), 1.0)
+        margin = _PLANE_MARGIN * max(max(us) - min(us), max(vs) - min(vs), 1.0)
         domain = self.sc.SmExtent2d(
             self.sc.SmVector2d(min(us) - margin, min(vs) - margin),
             self.sc.SmVector2d(max(us) + margin, max(vs) + margin),
@@ -4136,6 +4195,22 @@ class SmlibCoreKernel(Kernel):
             return self.solid_from_shell(result)
         return result
 
+    def _analytic_lines(self, curves: Sequence[Any]) -> list[Any]:
+        """Line segments as analytic SmLines: the taper primitive refuses
+        degree-one NURBS, which is what make_line makes (the shelling, in
+        turn, refuses analytic lines in faces built by hand)."""
+        out = []
+        for curve in curves:
+            if self.curve_type(curve) == "LINE" and not isinstance(curve, self.sc.SmLine):
+                domain = curve.GetNaturalInterval()
+                start, end = self.sc.SmVector3d(), self.sc.SmVector3d()
+                _check(curve.EvaluatePoint(domain.GetMin(), start), "curve evaluation")
+                _check(curve.EvaluatePoint(domain.GetMax(), end), "curve evaluation")
+                out.append(self.sc.SmLine(start, end, 3, self.context))
+            else:
+                out.append(curve)
+        return out
+
     def _as_nurbs(self, curve: Any) -> Any:
         """A plain NURBS rebuilt from a curve's control polygon and knots: the
         sweeps walk the NURBS data directly, which the analytic curves and
@@ -4611,8 +4686,19 @@ class SmlibCoreKernel(Kernel):
                 sheet, _ = self._copy_body(self._sheet_of(shape))
             else:
                 sheet, _ = self._copy_body(self._body(shape))
+            # the shelling's side walls take every edge curve for a NURBS
+            # (an analytic line or circle crashes it): faces with such
+            # edges are rebuilt on their own surface with NURBS copies
+            if amount < 0:
+                # the kernel's shelling crashes on a negative amount: the
+                # sheet is turned over and thickened the other way instead
+                for face in self._entities(sheet, TopoKind.FACE):
+                    _check(face.SwapUV(), "face orientation")
+                amount = -amount
+            # extended offset, no self-intersection pass (that rounds the
+            # rims; OCCT's thicken walls them up flat), an offset solid
             status, result = self.sc.SmOffsetExecutive.ShellBrep(
-                self.context, sheet, amount, 1, 1, 1, []
+                self.context, sheet, amount, 1, 0, 1, []
             )
             _check(status, "thicken")
             return self._solid_handle(result)
@@ -4653,8 +4739,16 @@ class SmlibCoreKernel(Kernel):
         return self._free_edge(curve, domain.GetMin(), domain.GetMax(), flip)
 
     def make_line(self, start: Point, end: Point) -> SmHandle:
-        line = self.sc.SmLine(self._vec(start), self._vec(end), 3, self.context)
-        return self._free_edge(line, 0.0, 1.0)
+        # a NURBS segment rather than an analytic SmLine: the kernel's
+        # shelling reads a NURBS off every edge curve and crashes on the
+        # analytic one (its own lines carry that data); the segment still
+        # reads as a LINE
+        status, line = self.sc.SmBSplineCurve.CreateLineSegment(
+            self.context, 3, self._vec(start), self._vec(end)
+        )
+        _check(status, "line")
+        domain = line.GetNaturalInterval()
+        return self._free_edge(line, domain.GetMin(), domain.GetMax())
 
     def make_infinite_line(self, origin: Point, direction: Point) -> SmHandle:
         length = math.sqrt(sum(c * c for c in direction))
@@ -4841,6 +4935,14 @@ class SmlibCoreKernel(Kernel):
         return self._edge_on(circle)
 
     def make_three_point_arc(self, p1: Point, p2: Point, p3: Point) -> SmHandle:
+        # the kernel's constructor never returns for coincident ends or
+        # points in a line: refused here instead
+        scale = max(1.0, max(abs(c) for p in (p1, p2, p3) for c in p))
+        if min(math.dist(p1, p2), math.dist(p2, p3), math.dist(p1, p3)) <= _TOLERANCE * scale:
+            raise ValueError("three-point arc: two of the points coincide")
+        chord = _cross([b - a for a, b in zip(p1, p2)], [c - a for a, c in zip(p1, p3)])
+        if math.sqrt(_dot(chord, chord)) <= 1e-12 * scale * scale:
+            raise ValueError("three-point arc: the points are in a line")
         arc = self.sc.SmCircle(
             self._vec(p1), self._vec(p2), self._vec(p3), 3, 0, self.context
         )
@@ -5079,9 +5181,10 @@ class SmlibCoreKernel(Kernel):
         points = [p for loop in loops for p in self._oriented_samples(loop)]
         us = [_dot([p - o for p, o in zip(pt, origin)], x_dir) for pt in points]
         vs = [_dot([p - o for p, o in zip(pt, origin)], y_dir) for pt in points]
-        # the plane reaches well beyond the face: offsets and booleans
-        # extend faces along their surfaces
-        margin = 100.0 * max(max(us) - min(us), max(vs) - min(vs), 1.0)
+        # the plane reaches somewhat beyond the face (offsets and booleans
+        # extend faces along their surfaces) but not far: the kernel's
+        # shelling crashes on planes with a huge domain
+        margin = _PLANE_MARGIN * max(max(us) - min(us), max(vs) - min(vs), 1.0)
         domain = self.sc.SmExtent2d(
             self.sc.SmVector2d(min(us) - margin, min(vs) - margin),
             self.sc.SmVector2d(max(us) + margin, max(vs) + margin),
@@ -5216,8 +5319,27 @@ class SmlibCoreKernel(Kernel):
 
     def make_shell(self, faces: Sequence[SmHandle]) -> SmHandle:
         if len(faces) == 1:
-            return SmHandle(TopoKind.SHELL, faces[0].entity.GetBrep())
-        raise NotImplementedError("smlib: shells of several faces")
+            brep = faces[0].entity.GetBrep()
+            if len(self._entities(brep, TopoKind.FACE)) == 1 and not brep.IsManifoldSolid():
+                return SmHandle(TopoKind.SHELL, brep)
+            # one face of a body: a sheet of its own
+            return SmHandle(TopoKind.SHELL, self._sheet_of(faces[0]))
+        # several faces, connected or not (OCCT's shell builder takes any)
+        target = self._new_brep()
+        for face in faces:
+            self._copy_face_into(face, target)
+        stitcher = self.sc.SmStitch(self.sc.SmStitchCallback(), _TOLERANCE, 1, 1)
+        _check(stitcher.StitchIntoShell(target, 0, 1.0), "stitch")
+        self._orient_sheet(target)
+        return SmHandle(TopoKind.SHELL, target)
+
+    def _orient_sheet(self, brep: Any) -> None:
+        """Turn the surfaces of a stitched sheet to face the way its first
+        face does (OCCT's sewing orients from the first face given); the
+        stitcher itself leaves each surface as it came."""
+        faces = self._entities(brep, TopoKind.FACE)
+        if len(faces) > 1 and not brep.IsManifoldSolid():
+            brep.OrientSheetSurfaces(faces[0], 1)
 
     def sew(self, faces: Sequence[SmHandle]) -> tuple[SmHandle, Any]:
         record = _Record()
@@ -5238,6 +5360,7 @@ class SmlibCoreKernel(Kernel):
             ]
         stitcher = self.sc.SmStitch(self.sc.SmStitchCallback(), _TOLERANCE, 1, 1)
         _check(stitcher.StitchIntoShell(target, 0, 1.0), "stitch")
+        self._orient_sheet(target)
         self._finish_record(record, target)
         for edge in self._entities(target, TopoKind.EDGE):
             if edge.GetEdgeuseCount() > 4:
@@ -6563,11 +6686,15 @@ class SmlibCoreKernel(Kernel):
 
         loops = self.sub_shape_uses(base, TopoKind.WIRE)
         outer_angle = angle_of(loops[0])
-        outer = self._primitive(
-            lambda c: c.CreateTaperExtrude(
-                self._loop_curves(loops[0]), height, degrees(outer_angle), 3, self._vec(up)
+        try:
+            outer = self._primitive(
+                lambda c: c.CreateTaperExtrude(
+                    self._analytic_lines(self._loop_curves(loops[0])), height, degrees(outer_angle), 3, self._vec(up)
+                )
             )
-        )
+        except RuntimeError as failure:
+            # a taper the primitive refuses is for the facade to loft instead
+            raise DraftFailure("draft", None, shape) from failure
         if outer.kind is not TopoKind.SOLID:
             raise DraftFailure("draft", None, shape)
         # sides that run into each other (thin arms widening) come back as a
@@ -6582,7 +6709,7 @@ class SmlibCoreKernel(Kernel):
             # out is tapered the other way
             angle = -degrees(angle_of(hole))
             # the hole's own taper runs a little past both caps so the cut is clean
-            curves = self._loop_curves(hole)
+            curves = self._analytic_lines(self._loop_curves(hole))
             back = self._placement_of_trsf(
                 _translation(tuple(-_TOLERANCE * 10 * c for c in up))
             )
