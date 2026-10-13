@@ -879,8 +879,13 @@ class SmlibCoreKernel(Kernel):
                 a, v, m = self._flux_quadrature(view)
             else:
                 # the kernel's per-face flux is not reliable (zero on some
-                # trimmed walls): the body-wide integrator takes this body
-                raise RuntimeError("trimmed curved face")
+                # trimmed walls): integrated over the trimmed region through
+                # its uv loops, unless the surface collapses to a point on a
+                # side (a sphere's pole), where that integral stays inexact
+                # and the body-wide integrator takes the whole body
+                if any(self._degenerate_ends(view, True)) or any(self._degenerate_ends(view, False)):
+                    raise RuntimeError("trimmed face with a pole")
+                a, v, m = self._trimmed_flux(view)
             area += a
             volume += v
             for i in range(3):
@@ -907,6 +912,171 @@ class SmlibCoreKernel(Kernel):
                 return False
         return True
 
+    def _uv_loops(self, face: Any) -> list[list[tuple[Any, bool]]]:
+        """The loops of a face as lists of (uv trim curve, reversed) in loop
+        order, taken from the face use that carries the uv curves. The uv
+        curves must follow the edges exactly (a circle on a sphere gets an
+        approximation, which would taint an integral): checked by sampling."""
+        surface = face.GetSurface()
+        point, uv_point = self.sc.SmVector3d(), self.sc.SmVector3d()
+        for faceuse in face.GetFaceuses():
+            loops = []
+            for loopuse in faceuse.GetLoopuses([], 0, None):
+                loop = []
+                for edgeuse in loopuse.GetEdgeuses([]):
+                    curve = edgeuse.GetUVTrimCurvePointer()
+                    if curve is None:
+                        break
+                    edge = edgeuse.GetEdge()
+                    edge_curve, interval = edge.GetCurve(), edge.GetInterval()
+                    domain = curve.GetNaturalInterval()
+                    t0, t1 = domain.GetMin(), domain.GetMax()
+                    for fraction in (0.21, 0.5, 0.79):
+                        _check(curve.EvaluatePoint(t0 + (t1 - t0) * fraction, uv_point), "uv curve evaluation")
+                        _check(surface.EvaluatePoint(self.sc.SmVector2d(uv_point.x, uv_point.y), point), "surface evaluation")
+                        drop = edge_curve.DropPoint(interval, point, None, _TOLERANCE, None)
+                        scale = max(1.0, abs(point.x), abs(point.y), abs(point.z))
+                        if drop[0] != SM_SUCCESS or drop[-1] > 1e-9 * scale:
+                            raise RuntimeError("inexact uv trim curve")
+                    loop.append((curve, edgeuse.GetOrientation() != self.sc.SM_OT_SAME))
+                else:
+                    loops.append(loop)
+                    continue
+                break
+            else:
+                if loops:
+                    return loops
+        raise RuntimeError("no uv trim curves")
+
+    def _trimmed_flux(self, view: SmSurfaceView) -> tuple[float, float, Point]:
+        """Area, flux volume and first moments of a trimmed face: Green's
+        theorem in parameter space turns the integral over the region into
+        one around its uv loops of an inner integral along v, both by Gauss
+        quadrature. The loops are closed with straight uv segments where an
+        edge use carries no curve (a pole)."""
+        sc = self.sc
+        u0, u1, v0, v1 = view._bounds  # pylint: disable=protected-access
+        status, knots = view.surface.GetKnots(sc.SM_SP_V, [])
+        v_breaks = sorted({k for k in knots if v0 + 1e-9 < k < v1 - 1e-9}) if status == SM_SUCCESS else []
+        parts = 3 if len(v_breaks) <= 3 else 1
+        pole_start, pole_end = self._degenerate_ends(view, True)
+        point, du, dv = sc.SmVector3d(), sc.SmVector3d(), sc.SmVector3d()
+        evaluate = view.surface.Evaluate1stDerivatives
+        gauss = self._GAUSS
+
+        def inner(u: float, v: float) -> tuple[float, float, float, float, float]:
+            """Integrals from v0 to v of the five integrands at this u."""
+            bounds = self._graded(
+                [v0, *(k for k in v_breaks if k < v), v],
+                parts,
+                pole_start,
+                pole_end and v >= v1 - 1e-9,
+            )
+            area = flux = mx = my = mz = 0.0
+            for lo, hi in zip(bounds, bounds[1:]):
+                if True:
+                    half, mid = 0.5 * (hi - lo), 0.5 * (lo + hi)
+                    for node, weight in gauss:
+                        _check(evaluate(sc.SmVector2d(u, mid + half * node), 0, 0, point, du, dv), "surface derivatives")
+                        nx = du.y * dv.z - du.z * dv.y
+                        ny = du.z * dv.x - du.x * dv.z
+                        nz = du.x * dv.y - du.y * dv.x
+                        w = half * weight
+                        area += math.sqrt(nx * nx + ny * ny + nz * nz) * w
+                        flux += (point.x * nx + point.y * ny + point.z * nz) * w / 3.0
+                        mx += point.x * point.x * nx * w / 2.0
+                        my += point.y * point.y * ny * w / 2.0
+                        mz += point.z * point.z * nz * w / 2.0
+            return area, flux, mx, my, mz
+
+        totals = [0.0] * 5
+        uv_point = sc.SmVector3d()
+
+        def along(u: float, v: float, du_dt: float, w: float) -> None:
+            if abs(du_dt) < 1e-15:
+                return
+            values = inner(u, v)
+            for i in range(5):
+                totals[i] -= values[i] * du_dt * w
+
+        def segment(a: tuple[float, float], b: tuple[float, float]) -> None:
+            if abs(b[0] - a[0]) < 1e-12:
+                return  # a vertical uv segment contributes nothing to a du integral
+            panels = 8
+            for i in range(panels):
+                lo, hi = i / panels, (i + 1) / panels
+                half, mid = 0.5 * (hi - lo), 0.5 * (lo + hi)
+                for node, weight in gauss:
+                    t = mid + half * node
+                    along(a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, b[0] - a[0], half * weight)
+
+        for loop in self._uv_loops(view.face.entity):
+            ends = []
+            for curve, reversed_ in loop:
+                domain = curve.GetNaturalInterval()
+                t0, t1 = domain.GetMin(), domain.GetMax()
+                status, flat = curve.GetKnotsAll([])
+                breaks = [t0, *sorted({k for k in flat if t0 + 1e-9 < k < t1 - 1e-9})] if status == SM_SUCCESS else [t0]
+                breaks.append(t1)
+                direction = -1.0 if reversed_ else 1.0
+                for a, b in zip(breaks, breaks[1:]):
+                    for i in range(3):
+                        lo, hi = a + (b - a) * i / 3, a + (b - a) * (i + 1) / 3
+                        half, mid = 0.5 * (hi - lo), 0.5 * (lo + hi)
+                        for node, weight in gauss:
+                            status, vectors = curve.EvaluateDerivatives(mid + half * node, 1, False, False)
+                            _check(status, "uv curve evaluation")
+                            along(vectors[0].x, vectors[0].y, direction * vectors[1].x, half * weight)
+                _check(curve.EvaluatePoint(t1 if reversed_ else t0, uv_point), "uv curve evaluation")
+                start = (uv_point.x, uv_point.y)
+                _check(curve.EvaluatePoint(t0 if reversed_ else t1, uv_point), "uv curve evaluation")
+                ends.append((start, (uv_point.x, uv_point.y)))
+            for (_, tail), (head, _) in zip(ends, ends[1:] + ends[:1]):
+                if math.dist(tail, head) > 1e-9:
+                    segment(tail, head)  # a gap in the uv loop: a pole or seam
+        area, flux, mx, my, mz = totals
+        if area < 0:  # the loops ran clockwise in uv
+            area, flux, mx, my, mz = -area, -flux, -mx, -my, -mz
+        # the outward normal may run against du x dv: settle the sign once
+        um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+        _, du_m, dv_m = view.d1(um, vm)
+        _, outward = view.normal(um, vm)
+        if _dot(_cross(du_m, dv_m), outward) < 0:
+            flux, mx, my, mz = -flux, -mx, -my, -mz
+        return area, flux, (mx, my, mz)
+
+    def _degenerate_ends(self, view: SmSurfaceView, along_v: bool) -> tuple[bool, bool]:
+        """Whether the surface collapses to a point at the start / end of the
+        v (or u) range: there the area element has a square-root behaviour."""
+        u0, u1, v0, v1 = view._bounds  # pylint: disable=protected-access
+        um, vm = 0.5 * (u0 + u1), 0.5 * (v0 + v1)
+        scale = max(1.0, max(abs(c) for c in view.value(um, vm)))
+        flags = []
+        for end in ((v0, v1) if along_v else (u0, u1)):
+            _, du, dv = view.d1(um, end) if along_v else view.d1(end, vm)
+            other = du if along_v else dv  # the derivative across the end
+            flags.append(math.sqrt(_dot(other, other)) < 1e-7 * scale)
+        return flags[0], flags[1]
+
+    @staticmethod
+    def _graded(bounds: list[float], parts: int, at_start: bool, at_end: bool) -> list[float]:
+        """Panel bounds: each span split in ``parts``, the first and last
+        further halved geometrically toward a degenerate end."""
+        fine = []
+        for a, b in zip(bounds, bounds[1:]):
+            fine.extend(a + (b - a) * i / parts for i in range(parts))
+        fine.append(bounds[-1])
+        levels = 8
+        if at_start:
+            a, b = fine[0], fine[1]
+            inserts = [a + (b - a) * 2.0 ** -k for k in range(levels, 0, -1)]
+            fine = [a, *inserts, *fine[1:]] if len(fine) > 2 else [a, *inserts, b]
+        if at_end:
+            a, b = fine[-2], fine[-1]
+            inserts = [b - (b - a) * 2.0 ** -k for k in range(1, levels + 1)]
+            fine = [*fine[:-1], *inserts, b]
+        return fine
+
     def _flux_quadrature(self, view: SmSurfaceView) -> tuple[float, float, Point]:
         """Area, flux volume (1/3 of the integral of x.n) and the volume's
         first moments (1/2 of the integral of x_i^2 n_i) over a whole face."""
@@ -926,15 +1096,11 @@ class SmlibCoreKernel(Kernel):
         # (a swept or approximated surface) is fine as it is, with fewer nodes
         panels = []
         rules = []
-        for lo_hi in breaks:
+        for lo_hi, along_v in ((breaks[0], False), (breaks[1], True)):
             spans = len(lo_hi) - 1
             parts = 3 if spans <= 4 else 1
             rules.append(self._GAUSS if spans <= 16 else self._GAUSS3 if spans <= 64 else self._GAUSS2)
-            fine = []
-            for a, b in zip(lo_hi, lo_hi[1:]):
-                fine.extend(a + (b - a) * i / parts for i in range(parts))
-            fine.append(lo_hi[-1])
-            panels.append(fine)
+            panels.append(self._graded(lo_hi, parts, *self._degenerate_ends(view, along_v)))
         point, du, dv = sc.SmVector3d(), sc.SmVector3d(), sc.SmVector3d()
         evaluate = view.surface.Evaluate1stDerivatives
         area = volume = 0.0
