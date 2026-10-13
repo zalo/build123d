@@ -63,6 +63,7 @@ from build123d.kernel.base import (
     AncestorMap,
     BoolOp,
     CurveView,
+    DraftFailure,
     JoinKind,
     Kernel,
     Point,
@@ -89,6 +90,12 @@ def _cross(a: Sequence[float], b: Sequence[float]) -> Point:
         a[2] * b[0] - a[0] * b[2],
         a[0] * b[1] - a[1] * b[0],
     )
+
+
+def _translation(vector: Sequence[float]) -> gp_Trsf:
+    trsf = gp_Trsf()
+    trsf.SetTranslation(gp_Vec(*vector))
+    return trsf
 
 
 def _point_key(point: Sequence[float]) -> tuple[Any, ...]:
@@ -1258,6 +1265,18 @@ class SmlibCoreKernel(Kernel):
         for body in tool_bodies:
             result = self._merge(result, body, ops[op])
         self._finish_record(record, result)
+        if all(s.kind is TopoKind.FACE for s in (*args, *tools)):
+            # faces combine into faces; a sheet of one face is that face
+            faces = self._entities(result, TopoKind.FACE)
+            if len(faces) == 1:
+                return SmHandle(TopoKind.FACE, faces[0]), record
+            return (
+                SmHandle(
+                    TopoKind.COMPOUND,
+                    members=[SmHandle(TopoKind.FACE, f) for f in faces],
+                ),
+                record,
+            )
         return self._bodies_handle(result), record
 
     def _split(
@@ -2680,8 +2699,113 @@ class SmlibCoreKernel(Kernel):
     make_spline_surface_fit = _unsupported("make_spline_surface_fit")
     filling = _unsupported("filling")
     draft_prism = _unsupported("draft_prism")
-    extrude_generated = _unsupported("extrude_generated")
-    draft = _unsupported("draft")
+    def extrude_generated(
+        self, shape: SmHandle, direction: Point
+    ) -> tuple[SmHandle, AncestorMap, Any]:
+        prism = self.extrude(shape, direction)
+        pull = _unit(direction)
+        sides = []
+        for face in self.sub_shapes(prism, TopoKind.FACE):
+            plane = self.planar_surface(face)
+            if plane is not None:
+                normal = plane.Axis().Direction()
+                if abs(_dot((normal.X(), normal.Y(), normal.Z()), pull)) > 1 - 1e-9:
+                    continue  # a cap
+            sides.append(face)
+        entries = []
+        for edge in self.sub_shapes(shape, TopoKind.EDGE):
+            view = SmCurveView(self, edge)
+            middle = view.value((view.first + view.last) / 2)
+            generated = [
+                face
+                for face in sides
+                if self._solve_pair(("point", middle), ("face", face.entity))[0] <= _TOLERANCE
+            ]
+            entries.append((edge, generated))
+        return prism, AncestorMap(self, entries), _Record()
+
+    def draft(
+        self,
+        shape: SmHandle,
+        specs: Sequence[tuple[SmHandle, float]],
+        pull: Point,
+        neutral_plane: Any,
+    ) -> tuple[SmHandle, Any]:
+        """A draft of a prism: the prism is rebuilt as a tapered extrusion of
+        its cap in the neutral plane, which SMLib offers directly, one loop at
+        a time (holes are tapered on their own and cut out)."""
+        if shape.kind is not TopoKind.SOLID:
+            raise DraftFailure("draft", None, shape)
+        direction = _unit(pull)
+        origin = neutral_plane.Location()
+        base = None
+        height = 0.0
+        for face in self.sub_shapes(shape, TopoKind.FACE):
+            plane = self.planar_surface(face)
+            if plane is None:
+                continue
+            normal = plane.Axis().Direction()
+            if abs(_dot((normal.X(), normal.Y(), normal.Z()), direction)) < 1 - 1e-9:
+                continue
+            centre = self.center_of_mass(face, TopoKind.FACE)
+            offset = _dot(
+                [c - o for c, o in zip(centre, (origin.X(), origin.Y(), origin.Z()))],
+                direction,
+            )
+            if abs(offset) <= _TOLERANCE:
+                base = face
+            else:
+                height = offset
+        if base is None or height == 0.0:
+            raise DraftFailure("draft", None, shape)
+        up = direction if height > 0 else tuple(-c for c in direction)
+        height = abs(height)
+
+        def angle_of(wire: SmHandle) -> float:
+            """The draft angle asked of the side faces grown from a loop."""
+            for edge in wire.members:
+                view = SmCurveView(self, edge)
+                middle = view.value((view.first + view.last) / 2)
+                for side, angle in specs:
+                    if self._solve_pair(("point", middle), ("face", side.entity))[0] <= _TOLERANCE:
+                        return angle
+            raise DraftFailure("draft", None, shape)
+
+        def degrees(angle: float) -> float:
+            """SMLib's taper angle in degrees: positive narrows, negative widens."""
+            return math.degrees(angle)
+
+        loops = self.sub_shape_uses(base, TopoKind.WIRE)
+        outer = self._primitive(
+            lambda c: c.CreateTaperExtrude(
+                self._loop_curves(loops[0]), height, degrees(angle_of(loops[0])), 3, self._vec(up)
+            )
+        )
+        if outer.kind is not TopoKind.SOLID:
+            raise DraftFailure("draft", None, shape)
+        result = outer
+        for hole in loops[1:]:
+            # a draft narrows the material, so it widens a hole: the plug cut
+            # out is tapered the other way
+            angle = -degrees(angle_of(hole))
+            # the hole's own taper runs a little past both caps so the cut is clean
+            curves = self._loop_curves(hole)
+            back = self._placement_of_trsf(
+                _translation(tuple(-_TOLERANCE * 10 * c for c in up))
+            )
+            for curve in curves:
+                _check(curve.Transform(back, None), "curve transform")
+            plug = self._primitive(
+                lambda c, curves=curves, angle=angle: c.CreateTaperExtrude(
+                    curves, height + _TOLERANCE * 20, angle, 3, self._vec(up)
+                )
+            )
+            if plug.kind is not TopoKind.SOLID:
+                raise DraftFailure("draft", None, shape)
+            result, _ = self.boolean(BoolOp.CUT, [result], [plug])
+        if result.kind is not TopoKind.SOLID:
+            raise DraftFailure("draft", None, shape)
+        return result, _Record()
     split_by_edges = _unsupported("split_by_edges")
     line_intersections = _unsupported("line_intersections")
     solid_from_shell = _unsupported("solid_from_shell")
