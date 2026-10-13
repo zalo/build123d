@@ -762,7 +762,9 @@ class SmlibCoreKernel(Kernel):
         """A solid, or a compound of solids when a brep holds several bodies."""
         lumps = self._lumps(brep)
         if len(lumps) == 1:
-            return self._solid_handle(brep)
+            if brep.IsManifoldSolid():
+                return self._solid_handle(brep)
+            return self._sheet_handle(brep)  # a sheet: one face, or a shell
         return SmHandle(
             TopoKind.COMPOUND, members=[self._solid_handle(l) for l in lumps]
         )
@@ -1785,6 +1787,14 @@ class SmlibCoreKernel(Kernel):
             inner = self._tracked_copy(sheet, record)
             record.modified[shape.key()] = record.modified.get(shape.key(), record.modified[sheet.key()])
             return inner
+        if shape.kind is TopoKind.SHELL and shape.entity.IsManifoldSolid():
+            # the shell of a solid, asked for as a surface: a sheet copy of
+            # its faces, which bounds no region
+            sheet = self._new_brep()
+            faces = self._entities(shape.entity, TopoKind.FACE)
+            _check(shape.entity.CopyFaces(faces, sheet, None, 0, None), "sheet copy")
+            record.modified[shape.key()] = [SmHandle(TopoKind.SHELL, sheet, partner=shape.partner)]
+            return sheet
         copy, forward = self._copy_body(shape.entity)
         for kind in (TopoKind.VERTEX, TopoKind.EDGE, TopoKind.FACE):
             for sub in self.sub_shapes(shape, kind):
@@ -3478,6 +3488,10 @@ class SmlibCoreKernel(Kernel):
             # SMLib has no unbounded faces; a very large one stands in
             bounds = (-_INFINITE, _INFINITE, -_INFINITE, _INFINITE)
         u0, u1, v0, v1 = bounds
+        if u1 - u0 < _TOLERANCE:  # a face of no extent (OCCT allows one) gets some
+            u0, u1 = u0 - 0.5, u1 + 0.5
+        if v1 - v0 < _TOLERANCE:
+            v0, v1 = v0 - 0.5, v1 + 0.5
         origin = plane.Location()
         x_axis = plane.XAxis().Direction()
         y_axis = plane.YAxis().Direction()
@@ -4150,7 +4164,39 @@ class SmlibCoreKernel(Kernel):
         param = view.param_at_length(from_first, view.first)
         return self._cut_keeping(edge, view.value(param), keep_start=at_end)
     fix_small_edges = _unsupported("fix_small_edges")
-    project = _unsupported("project")
+    def project(
+        self,
+        shape: SmHandle,
+        target: SmHandle,
+        *,
+        direction: Point | None = None,
+        center: Point | None = None,
+    ) -> list[SmHandle]:
+        """Wires where the edges of ``shape``, swept along ``direction`` both
+        ways, cut the target's faces (the projection onto those faces)."""
+        if direction is None:
+            raise NotImplementedError("smlib: projection from a point")
+        unit = _unit(direction)
+        boxes = [b for b in (self.bounding_box(shape, False), self.bounding_box(target, False)) if b is not None]
+        reach = max(
+            math.dist(b[:3], b[3:]) for b in boxes
+        ) + max(math.dist(a[:3], b[3:]) for a in boxes for b in boxes)
+        edges = (
+            [shape] if shape.kind is TopoKind.EDGE else self.sub_shapes(shape, TopoKind.EDGE)
+        )
+        back = _translation(tuple(-reach * c for c in unit))
+        found: list[SmHandle] = []
+        faces = (
+            [target] if target.kind is TopoKind.FACE else self.sub_shapes(target, TopoKind.FACE)
+        )
+        for edge in edges:
+            moved = self._bake(edge, back)
+            sheet = self.extrude(moved, tuple(2 * reach * c for c in unit))  # type: ignore[arg-type]
+            sheet_body = SmHandle(TopoKind.SHELL, self._body(sheet))
+            for face in faces:
+                one_face = SmHandle(TopoKind.SHELL, self._sheet_of(face))
+                found.extend(self._section_edges([sheet_body], [one_face]).members)
+        return self.connect_edges_to_wires(found, _TOLERANCE)
     # ---- 2D offsets -----------------------------------------------------------
 
     def _wire_normal(self, edges: Sequence[SmHandle]) -> Point:
