@@ -33,7 +33,7 @@ from random import uniform
 from unittest.mock import PropertyMock, patch
 
 import numpy as np
-from build123d.kernel import BoolOp
+from build123d.kernel import BoolOp, kernel
 from anytree import PreOrderIter
 from build123d.build_enums import CenterOf, GeomType, Keep, Transition
 from build123d.geometry import (
@@ -763,12 +763,12 @@ class TestShape(unittest.TestCase):
         root_2o2 = math.sqrt(2) / 2
         self.assertAlmostEqual(rotated_line @ 0, (1 - root_2o2, -root_2o2))
         self.assertAlmostEqual(rotated_line @ 1, (1, 0))
-        self.assertTrue(line.wrapped.IsPartner(rotated_line.wrapped))
+        self.assertTrue(kernel.is_partner(line.wrapped, rotated_line.wrapped))
 
         rotated_line = line.rotate(Axis((1, 0, 0), (0, 0, 1)), 45, transform=True)
         self.assertAlmostEqual(rotated_line @ 0, (1 - root_2o2, -root_2o2))
         self.assertAlmostEqual(rotated_line @ 1, (1, 0))
-        self.assertFalse(line.wrapped.IsPartner(rotated_line.wrapped))
+        self.assertFalse(kernel.is_partner(line.wrapped, rotated_line.wrapped))
 
         rotated_empty = Edge().rotate(Axis((1, 0, 0), (0, 0, 1)), 45)
         self.assertTrue(rotated_empty.is_empty)
@@ -778,12 +778,12 @@ class TestShape(unittest.TestCase):
         translated_line = line.translate((0, 1, 0))
         self.assertAlmostEqual(translated_line @ 0, (0, 1, 0))
         self.assertAlmostEqual(translated_line @ 1, (1, 1, 0))
-        self.assertTrue(line.wrapped.IsPartner(translated_line.wrapped))
+        self.assertTrue(kernel.is_partner(line.wrapped, translated_line.wrapped))
 
         translated_line = line.translate((0, 1, 0), transform=True)
         self.assertAlmostEqual(translated_line @ 0, (0, 1, 0))
         self.assertAlmostEqual(translated_line @ 1, (1, 1, 0))
-        self.assertFalse(line.wrapped.IsPartner(translated_line.wrapped))
+        self.assertFalse(kernel.is_partner(line.wrapped, translated_line.wrapped))
 
         translated_empty = Edge().translate((0, 1, 0))
         self.assertTrue(translated_empty.is_empty)

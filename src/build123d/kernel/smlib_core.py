@@ -109,6 +109,13 @@ def _restore_locations(moved: SmHandle, original: SmHandle) -> None:
             _restore_locations(new_member, old_member)
 
 
+def _fresh_partners(shape: SmHandle) -> None:
+    """Make ``shape`` and its members partners of nothing made before."""
+    shape.partner = next(_partner_ids)
+    for member in shape.members:
+        _fresh_partners(member)
+
+
 def _point_key(point: Sequence[float], digits: int = 9) -> tuple[Any, ...]:
     """Identity of a free vertex: its position, rounded well below the kernel
     tolerance so that the ends of meeting edges agree."""
@@ -159,6 +166,11 @@ def _check(result: Any, what: str) -> Any:
     if status != SM_SUCCESS:
         raise RuntimeError(f"SMLib {what} failed with status {status}")
     return result
+
+
+def _first_last(items: list) -> list:
+    """``items`` rotated so the first one comes last."""
+    return items[1:] + items[:1]
 
 
 _partner_ids = itertools.count(1)
@@ -4018,9 +4030,11 @@ class SmlibCoreKernel(Kernel):
         for inner in inners:
             if not self.is_closed(inner):
                 raise ValueError("inner wire is not closed")
-        curves = self._loop_curves(outer)
+        # SMLib begins each loop at the last curve given; OCCT keeps the
+        # wire's own first edge first
+        curves = _first_last(self._loop_curves(outer))
         for inner in inners:
-            curves.extend(self._loop_curves(inner))
+            curves.extend(_first_last(self._loop_curves(inner)))
         brep = self._new_brep()
         status, faces = brep.CreatePlanarFacesWith3DCurves(
             brep.GetInfiniteRegion(), curves, _TOLERANCE, []
@@ -4178,9 +4192,11 @@ class SmlibCoreKernel(Kernel):
         record = _Record()
         moved = self._bake(shape, transform)
         if copy:
-            # like OCCT's copying transform, the geometry moves and the
-            # placement the shape remembers is left as it was
+            # like OCCT's copying transform, the geometry moves, the
+            # placement the shape remembers is left as it was, and the result
+            # is no partner of the original
             _restore_locations(moved, shape)
+            _fresh_partners(moved)
         return moved, record
 
     def transformed_general(self, shape: SmHandle, transform: Any) -> SmHandle:
@@ -5062,6 +5078,13 @@ class SmlibCoreKernel(Kernel):
             normal: Point = (direction.X(), direction.Y(), direction.Z())
         else:
             normal = self._wire_normal(edges)
+            if not self.is_closed(wire):
+                # an open wire's offset is a loop counter-clockwise about the
+                # plane's normal, which OCCT's plane finder points so that its
+                # largest component is positive, whichever way the wire runs
+                largest = max(range(3), key=lambda i: abs(normal[i]))
+                if normal[largest] < 0:
+                    normal = (-normal[0], -normal[1], -normal[2])
         if self.is_closed(wire):
             # outwards for a positive distance: the right of a loop running
             # counter-clockwise about the normal, the left of one running clockwise
@@ -5089,10 +5112,11 @@ class SmlibCoreKernel(Kernel):
         start, _, _, _ = self._oriented_ends(edges[0])
         _, end, _, _ = self._oriented_ends(edges[-1])
         if right and left:
-            loop.extend(right)
-            loop.append(self._end_cap(right[-1], left[0], end, abs(distance)))
-            loop.extend(left)
-            loop.append(self._end_cap(left[-1], right[0], start, abs(distance)))
+            # counter-clockwise about the normal, beginning (as OCCT's does)
+            # with the cap round the wire's end
+            end_cap = self._end_cap(right[-1], left[0], end, abs(distance))
+            start_cap = self._end_cap(left[-1], right[0], start, abs(distance))
+            loop.extend([end_cap, *left, start_cap, *right])
         elif right or left:
             # one side collapsed entirely (an inside offset beyond the bends):
             # half circles round each end meet, or are joined, on that side
