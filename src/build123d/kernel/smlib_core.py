@@ -1678,15 +1678,14 @@ class SmlibCoreKernel(Kernel):
         if shape.kind is TopoKind.WIRE:
             if not shape.members:
                 return False
-            first = self.vertex_point(
-                self.edge_vertices(shape.members[0])[1 if shape.members[0].flip else 0]
-            )
-            last = self.vertex_point(
-                self.edge_vertices(shape.members[-1])[
-                    0 if shape.members[-1].flip else 1
-                ]
-            )
-            return all(abs(a - b) < _TOLERANCE for a, b in zip(first, last))
+            # closed when every end of an edge meets the end of another,
+            # whatever order the edges are held in
+            counts: dict[tuple[Any, ...], int] = {}
+            for edge in shape.members:
+                for vertex in self.edge_vertices(edge):
+                    key = _point_key(self.vertex_point(vertex), 6)
+                    counts[key] = counts.get(key, 0) + 1
+            return bool(counts) and all(n % 2 == 0 for n in counts.values())
         if shape.kind is TopoKind.SOLID:
             return True
         if shape.kind is TopoKind.SHELL:
