@@ -30,6 +30,7 @@ from __future__ import annotations
 
 from typing import cast
 
+from build123d.kernel import kernel
 from build123d.build_common import BaseObject, Builder
 from build123d.build_enums import GeomType, Mode, Select, SheetSurface
 from build123d.geometry import Location, Plane
@@ -352,7 +353,7 @@ class BuildSheet(Builder[Shell]):
             brought = [
                 f.wrapped
                 for f in incoming_faces
-                if not any(f.wrapped.IsSame(c) for c in carried)
+                if not any(kernel.is_same(f.wrapped, c) for c in carried)
             ]
         else:
             brought = [f.wrapped for f in incoming_faces]
