@@ -908,8 +908,33 @@ class SmlibCoreKernel(Kernel):
                     surface.GetBotRadius() - surface.GetTopRadius()
                 ) <= _TOLERANCE * max(1.0, abs(surface.GetBotRadius())):
                     return "CYLINDER"  # SMLib makes cylinders as cones of equal radii
+                if label == "BSPLINE" and self._flat_surface(surface):
+                    return "PLANE"  # a tapered extrusion's side, flat in all but name
                 return label
         return "OTHER"
+
+    def _flat_surface(self, surface: Any) -> bool:
+        """Whether a surface is a plane over its whole domain (sampled)."""
+        domain = surface.GetNaturalUVDomain()
+        lo, hi = domain.GetMin(), domain.GetMax()
+        point, normal = self.sc.SmVector3d(), self.sc.SmVector3d()
+        um, vm = 0.5 * (lo.x + hi.x), 0.5 * (lo.y + hi.y)
+        if surface.EvaluateNormal(self.sc.SmVector2d(um, vm), 0, 0, normal) != SM_SUCCESS:
+            return False
+        if surface.EvaluatePoint(self.sc.SmVector2d(um, vm), point) != SM_SUCCESS:
+            return False
+        origin = (point.x, point.y, point.z)
+        axis = (normal.x, normal.y, normal.z)
+        scale = max(1.0, max(abs(c) for c in origin))
+        for i in range(5):
+            for j in range(5):
+                uv = self.sc.SmVector2d(lo.x + (hi.x - lo.x) * i / 4, lo.y + (hi.y - lo.y) * j / 4)
+                if surface.EvaluatePoint(uv, point) != SM_SUCCESS:
+                    return False
+                gap = _dot(axis, (point.x - origin[0], point.y - origin[1], point.z - origin[2]))
+                if abs(gap) > _TOLERANCE * scale:
+                    return False
+        return True
 
     def _copy_curve(self, curve: Any) -> Any:
         """A copy of a curve in the kernel context, keeping the bezier tag."""
@@ -3155,13 +3180,22 @@ class SmlibCoreKernel(Kernel):
     ) -> SmHandle:
         if thicken:
             # a planar face is thickened by extruding it along its normal;
-            # other surfaces would need offset faces with side walls
+            # other sheets by the kernel's shelling with nothing opened,
+            # which offsets the faces and walls up their rims
             if shape.kind is TopoKind.FACE and self.planar_surface(shape) is not None:
                 _, normal = SmSurfaceView(self, shape).normal(
                     *SmSurfaceView(self, shape)._mid()  # pylint: disable=protected-access
                 )
                 return self.extrude(shape, tuple(amount * c for c in normal))  # type: ignore[arg-type]
-            raise NotImplementedError("smlib: thickening of curved faces")
+            if shape.kind is TopoKind.FACE:
+                sheet, _ = self._copy_body(self._sheet_of(shape))
+            else:
+                sheet, _ = self._copy_body(self._body(shape))
+            status, result = self.sc.SmOffsetExecutive.ShellBrep(
+                self.context, sheet, amount, 1, 1, 1, []
+            )
+            _check(status, "thicken")
+            return self._solid_handle(result)
         record = _Record()
         body = self._tracked_copy(shape, record)
         status, result = self.sc.SmOffsetExecutive.OffsetBrep(
@@ -4701,12 +4735,19 @@ class SmlibCoreKernel(Kernel):
             return math.degrees(angle)
 
         loops = self.sub_shape_uses(base, TopoKind.WIRE)
+        outer_angle = angle_of(loops[0])
         outer = self._primitive(
             lambda c: c.CreateTaperExtrude(
-                self._loop_curves(loops[0]), height, degrees(angle_of(loops[0])), 3, self._vec(up)
+                self._loop_curves(loops[0]), height, degrees(outer_angle), 3, self._vec(up)
             )
         )
         if outer.kind is not TopoKind.SOLID:
+            raise DraftFailure("draft", None, shape)
+        # sides that run into each other (thin arms widening) come back as a
+        # solid that lost material: a widening taper must gain volume and a
+        # narrowing one lose it, or the draft is no good
+        before, after = self.volume(shape), self.volume(outer)
+        if outer_angle != 0 and (after - before) * outer_angle > 0:
             raise DraftFailure("draft", None, shape)
         result = outer
         for hole in loops[1:]:
