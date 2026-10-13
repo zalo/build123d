@@ -2421,7 +2421,10 @@ class SmlibCoreKernel(Kernel):
     def _section_points(
         self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
     ) -> SmHandle:
-        """The vertices where edges and wires cross the tools."""
+        """Where edges and wires meet the tools: the stretches that run along
+        a tool (edges) and the points where they cross it (vertices)."""
+        overlaps = self._merge_pieces(self._edge_pieces(args, tools, True, on_surface=True).members)
+        overlap_views = [SmCurveView(self, e) for e in overlaps]
         points: dict[tuple[Any, ...], Point] = {}
         for arg in args:
             for kind, data in self._atoms(arg):
@@ -2431,14 +2434,50 @@ class SmlibCoreKernel(Kernel):
                 for tool in tools:
                     for other in self._atoms(tool):
                         for point in self._crossings(curve, interval, other):
+                            if any(v.drop_point(point)[1] <= _TOLERANCE for v in overlap_views):
+                                continue  # already within a stretch
                             points.setdefault(_point_key(point), point)
         return SmHandle(
             TopoKind.COMPOUND,
-            members=[self.make_vertex(p) for p in points.values()],
+            members=[*overlaps, *(self.make_vertex(p) for p in points.values())],
         )
 
+    def _merge_pieces(self, edges: Sequence[SmHandle]) -> list[SmHandle]:
+        """Edges that follow each other on one line or circle joined into
+        one edge (OCCT reports such a section as a single edge)."""
+        merged: list[SmHandle] = []
+        for wire in self.connect_edges_to_wires(edges, _TOLERANCE):
+            members = list(wire.members)
+            if len(members) == 1:
+                merged.append(members[0])
+                continue
+            views = [SmCurveView(self, e) for e in members]
+            kinds = {v.geom_type for v in views}
+            start = views[0].value(views[0].last if members[0].flip else views[0].first)
+            end = views[-1].value(views[-1].first if members[-1].flip else views[-1].last)
+            directions = [_unit(v.d1(0.5 * (v.first + v.last))[1]) for v in views]
+            collinear = all(abs(abs(_dot(directions[0], d)) - 1) < 1e-9 for d in directions)
+            if kinds == {"LINE"} and collinear:
+                merged.append(self.make_line(start, end))
+                continue
+            if kinds == {"CIRCLE"} and len({_point_key(v.circle()[0], 6) for v in views}) == 1:
+                middle = views[len(views) // 2]
+                via = middle.value(0.5 * (middle.first + middle.last)) if len(views) % 2 else middle.value(middle.last if members[len(views) // 2].flip else middle.first)
+                merged.append(self.make_three_point_arc(start, via, end))
+                continue
+            if self._smooth_wire(wire):
+                # pieces of one smooth curve: joined into one NURBS edge
+                merged.append(self._edge_on(self._joined_curve(wire)))
+                continue
+            merged.extend(members)
+        return merged
+
     def _edge_pieces(
-        self, args: Sequence[SmHandle], tools: Sequence[SmHandle], keep_inside: bool
+        self,
+        args: Sequence[SmHandle],
+        tools: Sequence[SmHandle],
+        keep_inside: bool,
+        on_surface: bool = False,
     ) -> SmHandle:
         """The parts of edges inside (or outside) the tools: the edges are
         cut where they cross the tools' faces, or where they meet the ends of
@@ -2452,8 +2491,12 @@ class SmlibCoreKernel(Kernel):
             else []
         )
 
+        tool_faces = [f for t in tools for f in ([t] if t.kind is TopoKind.FACE else self.sub_shapes(t, TopoKind.FACE))]
+
         def inside(point: Point) -> bool:
             if bodies:
+                if on_surface:  # on a face of the tool, not in its volume
+                    return any(self.point_on_face(f, point, _TOLERANCE) for f in tool_faces)
                 return any(self.point_in_solid(b, point, _TOLERANCE) for b in bodies)
             return any(v.drop_point(point)[1] <= _TOLERANCE for v in tool_views)
 
@@ -2509,32 +2552,39 @@ class SmlibCoreKernel(Kernel):
     def _section_edges(
         self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
     ) -> SmHandle:
-        """The edges where faces, shells and solids cross each other: the
-        intersection edges the kernel's merge computes, copied out as free edges."""
+        """The edges where faces, shells and solids cross or touch each other:
+        the tool is imprinted into a copy of the argument and the edges that
+        appear on the tool are copied out as free edges (the kernel's own
+        intersection edge list is not safe to read after a merge)."""
         edges: list[SmHandle] = []
         for arg in args:
             for tool in tools:
+                tool_faces = [tool] if tool.kind is TopoKind.FACE else self.sub_shapes(tool, TopoKind.FACE)
                 for a in self._bodies(arg):
                     for b in self._bodies(tool):
                         copy_a, _ = self._copy_body(a.entity)
                         copy_b, _ = self._copy_body(b.entity)
+                        before = {e.address for e in self._entities(copy_a, TopoKind.EDGE)}
                         merge = self.sc.SmMerge(self.context, copy_a, copy_b, 0.0, 0.0, None)
-                        status, _result = merge.ManifoldBoolean(
-                            self.sc.SM_BO_INTERSECTION, None
-                        )
-                        if status != SM_SUCCESS:
+                        status, result = merge.NonManifoldBoolean(self.sc.SM_BO_IMPRINT)
+                        if status != SM_SUCCESS or result is None:
                             continue
-                        if (
-                            a.kind is TopoKind.SHELL
-                            and b.kind is TopoKind.SHELL
-                            and _result is not None
-                            and self._entities(_result, TopoKind.FACE)
-                        ):
-                            # sheets overlapping in their plane share an
-                            # area, not edges (the kernel's edge list is
-                            # not valid then)
-                            continue
-                        for edge in merge.GetIntersectionEdges([]):
+                        for edge in self._entities(result, TopoKind.EDGE):
+                            view = SmCurveView(self, SmHandle(TopoKind.EDGE, edge))
+                            samples = [
+                                view.value(view.first + (view.last - view.first) * f)
+                                for f in (0.0, 0.37, 0.5, 0.71, 1.0)
+                            ]
+                            if edge.address in before and not all(
+                                any(self.point_on_face(f, p, _TOLERANCE) for f in tool_faces)
+                                for p in samples
+                            ):
+                                continue
+                            if not all(
+                                any(self.point_on_face(f, p, _TOLERANCE) for f in tool_faces)
+                                for p in samples
+                            ):
+                                continue
                             interval = edge.GetInterval()
                             edges.append(
                                 self._free_edge(
@@ -2543,7 +2593,7 @@ class SmlibCoreKernel(Kernel):
                                     interval.GetMax(),
                                 )
                             )
-        return SmHandle(TopoKind.COMPOUND, members=edges)
+        return SmHandle(TopoKind.COMPOUND, members=self._merge_pieces(edges))
 
     def _split_edges_at_points(
         self, edges: Sequence[SmHandle], vertices: Sequence[SmHandle]
@@ -4043,7 +4093,7 @@ class SmlibCoreKernel(Kernel):
             brep = shape.entity.GetBrep()
             if len(self._entities(brep, TopoKind.FACE)) == 1:
                 return [("body", brep)]
-            return [("face", shape.entity)]
+            return [("body", self._sheet_of(shape))]  # the face as a sheet of its own
         if shape.kind is TopoKind.EDGE:
             view = SmCurveView(self, shape)
             return [("curve", (view.curve, self.sc.SmExtent1d(view.first, view.last)))]
@@ -4114,16 +4164,30 @@ class SmlibCoreKernel(Kernel):
             return distance, a[1], on_b
         if kinds == ("curve", "curve"):
             (c1, i1), (c2, i2) = a[1], b[1]
-            _check(
-                c1.GlobalCurveSolve(
-                    i1, c2, i2, sc.SM_SO_MINIMIZE, _TOLERANCE, None, None,
-                    sc.SM_SR_SINGLE, solutions,
-                ),
-                "curve to curve",
+            status = c1.GlobalCurveSolve(
+                i1, c2, i2, sc.SM_SO_MINIMIZE, _TOLERANCE, None, None,
+                sc.SM_SR_SINGLE, solutions,
             )
-            found = self._solutions(solutions)
+            found = self._solutions(solutions) if status == SM_SUCCESS else []
             if not found:
-                raise RuntimeError("SMLib found no nearest points")
+                # curves lying on each other defeat the solver: sampled instead
+                best: tuple[float, Point, Point] | None = None
+                point = sc.SmVector3d()
+                for i in range(33):
+                    t = i1.GetMin() + (i1.GetMax() - i1.GetMin()) * i / 32
+                    _check(c1.EvaluatePoint(t, point), "curve evaluation")
+                    p1 = (point.x, point.y, point.z)
+                    drop = c2.DropPoint(i2, self._vec(p1), None, _TOLERANCE, None)
+                    if drop[0] != SM_SUCCESS:
+                        continue
+                    _check(c2.EvaluatePoint(drop[-2], point), "curve evaluation")
+                    p2 = (point.x, point.y, point.z)
+                    candidate = (math.dist(p1, p2), p1, p2)
+                    if best is None or candidate[0] < best[0]:
+                        best = candidate
+                if best is None:
+                    raise RuntimeError("SMLib found no nearest points")
+                return best
             return min(found)
         if kinds == ("curve", "body"):
             curve, interval = a[1]
