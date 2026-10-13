@@ -3496,8 +3496,9 @@ class ShapeList(list[T]):
         elif not group_by:
             raise ValueError("Cannot group by an empty object")
 
-        elif hasattr(group_by, "wrapped") and isinstance(
-            group_by.wrapped, (TopoDS_Edge, TopoDS_Wire)
+        elif hasattr(group_by, "wrapped") and (
+            kernel.is_kind(group_by.wrapped, TopoKind.EDGE)
+            or kernel.is_kind(group_by.wrapped, TopoKind.WIRE)
         ):
 
             def key_f(obj):
@@ -3623,8 +3624,9 @@ class ShapeList(list[T]):
             )
         elif not sort_by:
             raise ValueError("Cannot sort by an empty object")
-        elif hasattr(sort_by, "wrapped") and isinstance(
-            sort_by.wrapped, (TopoDS_Edge, TopoDS_Wire)
+        elif hasattr(sort_by, "wrapped") and (
+            kernel.is_kind(sort_by.wrapped, TopoKind.EDGE)
+            or kernel.is_kind(sort_by.wrapped, TopoKind.WIRE)
         ):
 
             def u_of_closest_center(obj) -> float:
@@ -3979,8 +3981,9 @@ def unwrap_topods_compound(
     Returns:
         TopoDS_Compound | TopoDS_Shape: base shape
     """
-    if compound.NbChildren() == 1:
-        single_element = downcast(kernel.direct_children(compound)[0])
+    children = kernel.direct_children(compound)
+    if len(children) == 1:
+        single_element = downcast(children[0])
 
         # If the single element is another TopoDS_Compound, unwrap it recursively
         if kernel.is_kind(single_element, TopoKind.COMPOUND):

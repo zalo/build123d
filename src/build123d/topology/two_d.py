@@ -262,7 +262,7 @@ class Mixin2D(ABC, Shape[TOPODS]):
         if self.is_empty:
             raise ValueError("Invalid Shape")
         new_surface = copy.deepcopy(self)
-        new_surface.wrapped = tcast(TOPODS, downcast(self.wrapped.Complemented()))
+        new_surface.wrapped = tcast(TOPODS, kernel.reversed(self.wrapped))
 
         # As the surface has been modified, the parent is no longer valid
         new_surface.topo_parent = None
