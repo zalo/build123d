@@ -1313,6 +1313,12 @@ class SmlibCoreKernel(Kernel):
         if shape.kind in (TopoKind.SOLID, TopoKind.SHELL):
             if kind is TopoKind.SHELL and shape.kind is TopoKind.SOLID:
                 return [SmHandle(TopoKind.SHELL, shape.entity, partner=shape.partner)]
+            if kind is TopoKind.WIRE:  # the loops of every face
+                return [
+                    w
+                    for f in self._entities(shape.entity, TopoKind.FACE)
+                    for w in self.sub_shape_uses(SmHandle(TopoKind.FACE, f), TopoKind.WIRE)
+                ]
             return [SmHandle(kind, e) for e in self._entities(shape.entity, kind)]
         if shape.kind is TopoKind.FACE:
             if kind is TopoKind.WIRE:
@@ -1361,10 +1367,14 @@ class SmlibCoreKernel(Kernel):
     def _loop_wire(self, loop: Any, face: SmHandle) -> SmHandle:
         """The wire of a face loop, edges in loop order with their orientation."""
         edges = []
+        # the loop's edge uses run counter-clockwise about the surface normal;
+        # the wire runs counter-clockwise about the face's outward normal
+        outward_flipped = self.face_outward_is_flipped(face)
         for edgeuse in loop.GetEdgeuses([]):
             edge = edgeuse.GetEdge()
             reversed_use = edgeuse.GetOrientation() == self.sc.SM_OT_OPPOSITE
-            edges.append(SmHandle(TopoKind.EDGE, edge, flip=reversed_use != face.flip))
+            flip = reversed_use != face.flip
+            edges.append(SmHandle(TopoKind.EDGE, edge, flip=flip != outward_flipped))
         return SmHandle(TopoKind.WIRE, members=edges)
 
     def direct_children(self, shape: SmHandle) -> list[SmHandle]:
@@ -2767,17 +2777,25 @@ class SmlibCoreKernel(Kernel):
                 for w in self.sub_shape_uses(shape, TopoKind.WIRE)
                 for c in self._loop_curves(w)
             ]
-        elif shape.kind is TopoKind.WIRE:
+        elif shape.kind is TopoKind.WIRE and self.is_closed(shape):
             curves = self._loop_curves(shape)
-        elif shape.kind is TopoKind.EDGE:
-            curves = self._loop_curves(SmHandle(TopoKind.WIRE, members=[shape]))
-            sheet = self._primitive(
-                lambda c: c.CreateRotationalSweep(
-                    curves, base, axis_dir, math.degrees(angle), 1, 0, 1
+        elif shape.kind in (TopoKind.EDGE, TopoKind.WIRE):
+            # an open profile sweeps a sheet
+            wire = shape if shape.kind is TopoKind.WIRE else SmHandle(TopoKind.WIRE, members=[shape])
+            faces: list[SmHandle] = []
+            for curve in self._loop_curves(wire):
+                # the kernel sweeps one open curve at a time into a sheet
+                sheet = self._primitive(
+                    lambda c, curve=curve: c.CreateRotationalSweep(
+                        [curve], base, axis_dir, math.degrees(angle), 1, 0, 1
+                    )
                 )
-            )
-            faces = self._entities(sheet.entity, TopoKind.FACE)
-            return SmHandle(TopoKind.FACE, faces[0]) if len(faces) == 1 else sheet
+                faces.extend(self.sub_shapes(sheet, TopoKind.FACE))
+            if len(faces) == 1:
+                return faces[0]
+            _, record = self.sew(faces)
+            assert record.result is not None
+            return record.result
         else:
             raise NotImplementedError(f"smlib: revolve of a {shape.kind.name}")
         return self._primitive(
@@ -3479,7 +3497,12 @@ class SmlibCoreKernel(Kernel):
             raise ValueError(f"Cannot build face(s): the wires gave {len(faces)} faces")
         return SmHandle(TopoKind.FACE, faces[0])
 
-    add_holes = _unsupported("add_holes")
+    def add_holes(self, face: SmHandle, wires: Sequence[SmHandle]) -> SmHandle:
+        """A planar face rebuilt with extra inner loops."""
+        if self.planar_surface(face) is None:
+            raise NotImplementedError("smlib: holes in a curved face")
+        loops = self.sub_shape_uses(face, TopoKind.WIRE)
+        return self.make_planar_face(loops[0], [*loops[1:], *wires])
 
     def face_of_plane(
         self, plane: Any, bounds: tuple[float, float, float, float] | None = None
