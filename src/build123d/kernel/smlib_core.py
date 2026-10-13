@@ -98,6 +98,14 @@ def _translation(vector: Sequence[float]) -> gp_Trsf:
     return trsf
 
 
+def _restore_locations(moved: SmHandle, original: SmHandle) -> None:
+    """Give a moved copy (and its members, one to one) the placements of the original."""
+    moved.location = original.location
+    if len(moved.members) == len(original.members):
+        for new_member, old_member in zip(moved.members, original.members):
+            _restore_locations(new_member, old_member)
+
+
 def _point_key(point: Sequence[float]) -> tuple[Any, ...]:
     """Identity of a free vertex: its position, rounded well below the kernel
     tolerance so that the ends of meeting edges agree."""
@@ -555,6 +563,8 @@ class SmlibCoreKernel(Kernel):
     @staticmethod
     def _pt(vector: Any) -> Point:
         return (vector.x, vector.y, vector.z)
+
+    kernel_pt = _pt
 
     def _placement(self, frame: Any) -> Any:
         """An ``SmAxis2Placement`` for a ``gp_Ax2`` frame."""
@@ -2351,6 +2361,10 @@ class SmlibCoreKernel(Kernel):
     ) -> tuple[SmHandle, Any]:
         record = _Record()
         moved = self._bake(shape, transform)
+        if copy:
+            # like OCCT's copying transform, the geometry moves and the
+            # placement the shape remembers is left as it was
+            _restore_locations(moved, shape)
         return moved, record
 
     transformed_general = _unsupported("transformed_general")
@@ -2693,7 +2707,277 @@ class SmlibCoreKernel(Kernel):
     chamfer_2d = _unsupported("chamfer_2d")
     fix_small_edges = _unsupported("fix_small_edges")
     project = _unsupported("project")
-    offset_2d = _unsupported("offset_2d")
+    # ---- 2D offsets -----------------------------------------------------------
+
+    def _wire_normal(self, edges: Sequence[SmHandle]) -> Point:
+        """The normal of the plane a wire lies in (Newell's method over sampled points)."""
+        points: list[Point] = []
+        for edge in edges:
+            points.extend(SmCurveView(self, edge).positions_by_deflection(0.0))
+        nx = ny = nz = 0.0
+        for a, b in zip(points, points[1:] + points[:1]):
+            nx += (a[1] - b[1]) * (a[2] + b[2])
+            ny += (a[2] - b[2]) * (a[0] + b[0])
+            nz += (a[0] - b[0]) * (a[1] + b[1])
+        length = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if length < 1e-12:
+            raise ValueError("the wire has no plane to be offset in")
+        return (nx / length, ny / length, nz / length)
+
+    def _oriented_ends(self, edge: SmHandle) -> tuple[Point, Point, Point, Point]:
+        """Start, end, start tangent and end tangent of an edge the way it runs."""
+        view = SmCurveView(self, edge)
+        p0, t0 = view.d1(view.first)
+        p1, t1 = view.d1(view.last)
+        if edge.flip:
+            return p1, p0, tuple(-c for c in t1), tuple(-c for c in t0)  # type: ignore[return-value]
+        return p0, p1, t0, t1
+
+    def _offset_edge(self, edge: SmHandle, normal: Point, distance: float) -> SmHandle | None:
+        """The edge offset by ``distance`` to its right (looking along it with
+        ``normal`` up); None when the offset collapses it. Lines stay lines and
+        circles stay circles."""
+        view = SmCurveView(self, edge)
+        # the offset side is to the right of the way the edge runs
+        side = -distance if edge.flip else distance
+        if view.geom_type == "LINE":
+            p0, p1 = view.value(view.first), view.value(view.last)
+            tangent = _unit([b - a for a, b in zip(p0, p1)])
+            right = _cross(tangent, normal)
+            shift = tuple(side * c for c in right)
+            moved = self.make_line(
+                tuple(a + b for a, b in zip(p0, shift)),  # type: ignore[arg-type]
+                tuple(a + b for a, b in zip(p1, shift)),  # type: ignore[arg-type]
+            )
+            return moved.with_flip(edge.flip)
+        if view.geom_type == "CIRCLE":
+            centre, _, radius = view.circle()
+            # the right of a circle running counter-clockwise about the normal
+            # is its outside; the way it runs comes from its own parameter
+            # direction, not from its frame
+            start, tangent = view.d1(view.first)
+            radial = [p - c for p, c in zip(start, centre)]
+            counter_clockwise = _dot(_cross(radial, tangent), normal) > 0
+            outward = side if counter_clockwise else -side
+            new_radius = radius + outward
+            if new_radius <= _TOLERANCE:
+                return None
+            position = view.curve.GetPosition()
+            x_axis = self.kernel_pt(position.GetXAxis())
+            y_axis = self.kernel_pt(position.GetYAxis())
+
+            def angle_at(t: float) -> float:
+                """The angle on the circle of the point at parameter ``t``."""
+                relative = [p - c for p, c in zip(view.value(t), centre)]
+                return math.degrees(math.atan2(_dot(relative, y_axis), _dot(relative, x_axis)))
+
+            a1, a2 = angle_at(view.first), angle_at(view.last)
+            if view.is_closed():
+                a2 = a1 + 360.0
+            while a2 <= a1 + 1e-9:
+                a2 += 360.0
+            circle = self.sc.SmCircle(
+                position.GetOrigin(),
+                position.GetXAxis(),
+                position.GetYAxis(),
+                self.sc.SmExtent1d(a1, a2),
+                new_radius,
+                3,
+                self.context,
+                None,
+                0,
+            )
+            return self._edge_on(circle, flip=edge.flip)
+        offset = self.sc.SmOffsetCurve(
+            3,
+            self._copy_curve(view.curve),
+            self.sc.SmExtent1d(view.first, view.last),
+            self._vec(normal),
+            side,
+            1,
+        )
+        status, nurbs = offset.CreateNonRationalNurb(self.context, _TOLERANCE / 10)
+        _check(status, "offset curve")
+        return self._edge_on(nurbs, flip=edge.flip)
+
+    def _line_crossing(self, a: SmHandle, b: SmHandle, normal: Point) -> Point | None:
+        """Where the lines of two straight edges cross in their plane."""
+        p, _, u, _ = self._oriented_ends(a)
+        q, _, v, _ = self._oriented_ends(b)
+        u, v = _unit(u), _unit(v)
+        denominator = _dot(_cross(u, v), normal)
+        if abs(denominator) < 1e-12:
+            return None
+        w = [b_ - a_ for a_, b_ in zip(p, q)]
+        along = _dot(_cross(w, v), normal) / denominator
+        return tuple(a_ + along * b_ for a_, b_ in zip(p, u))  # type: ignore[return-value]
+
+    def _cut_keeping(self, edge: SmHandle, point: Point, keep_start: bool) -> SmHandle | None:
+        """The part of an edge on the start side (or the end side) of ``point``."""
+        view = SmCurveView(self, edge)
+        param, _ = view.drop_point(point)
+        if not (view.first < param < view.last):
+            return None
+        from_start = keep_start != edge.flip  # keep the curve's own first part
+        t0, t1 = (view.first, param) if from_start else (param, view.last)
+        if t1 - t0 <= _TOLERANCE:
+            return None
+        piece = self.trim_edge(edge, t0, t1)
+        piece.flip = edge.flip
+        return piece
+
+    def _join_offsets(
+        self,
+        first: SmHandle,
+        second: SmHandle,
+        corner: Point,
+        turn_opens: bool,
+        join: JoinKind,
+        normal: Point,
+        distance: float,
+    ) -> tuple[SmHandle | None, SmHandle | None, SmHandle | None]:
+        """Trim or connect two consecutive offset edges at a corner; returns
+        the adjusted first and second edges and an edge to put between them."""
+        _, p1, _, _ = self._oriented_ends(first)
+        p0, _, _, _ = self._oriented_ends(second)
+        if math.dist(p1, p0) <= _TOLERANCE:
+            return first, second, None
+        straight = (
+            SmCurveView(self, first).geom_type == "LINE"
+            and SmCurveView(self, second).geom_type == "LINE"
+        )
+        if turn_opens and join is JoinKind.ARC:
+            towards = _unit([(a + b) / 2 - c for a, b, c in zip(p1, p0, corner)])
+            midway = tuple(c + abs(distance) * t for c, t in zip(corner, towards))
+            return first, second, self.make_three_point_arc(p1, midway, p0)  # type: ignore[arg-type]
+        if straight:
+            crossing = self._line_crossing(first, second, normal)
+            if crossing is None:
+                return first, second, self.make_line(p1, p0)
+            a0, _, _, _ = self._oriented_ends(first)
+            _, b1, _, _ = self._oriented_ends(second)
+            first_cut = self.make_line(a0, crossing).with_flip(False)
+            second_cut = self.make_line(crossing, b1).with_flip(False)
+            if math.dist(a0, crossing) <= _TOLERANCE or math.dist(crossing, b1) <= _TOLERANCE:
+                return first, second, self.make_line(p1, p0)
+            return first_cut, second_cut, None
+        if not turn_opens:
+            view_first = SmCurveView(self, first)
+            crossings = self._crossings(
+                view_first.curve,
+                self.sc.SmExtent1d(view_first.first, view_first.last),
+                self._atoms(second)[0],
+            )
+            if crossings:
+                crossing = min(crossings, key=lambda c: math.dist(c, corner))
+                cut_first = self._cut_keeping(first, crossing, True)
+                cut_second = self._cut_keeping(second, crossing, False)
+                if cut_first is not None and cut_second is not None:
+                    return cut_first, cut_second, None
+        # whatever could not be joined better is bridged
+        return first, second, self.make_line(p1, p0)
+
+    def _offset_run(
+        self,
+        edges: Sequence[SmHandle],
+        normal: Point,
+        distance: float,
+        join: JoinKind,
+        closed: bool,
+    ) -> list[SmHandle]:
+        """The edges offset to their right and joined at the corners."""
+        offsets = []
+        for edge in edges:
+            moved = self._offset_edge(edge, normal, distance)
+            if moved is not None:
+                offsets.append((edge, moved))
+        if not offsets:
+            return []
+        result: list[SmHandle] = [moved for _, moved in offsets]
+        pairs = list(range(len(offsets) - 1))
+        if closed and len(offsets) > 1:
+            pairs.append(len(offsets) - 1)
+        inserted: dict[int, SmHandle] = {}
+        for i in pairs:
+            j = (i + 1) % len(offsets)
+            base_first, base_second = offsets[i][0], offsets[j][0]
+            _, corner, _, t_end = self._oriented_ends(base_first)
+            _, _, t_start, _ = self._oriented_ends(base_second)
+            turn = _dot(_cross(t_end, t_start), normal)
+            # a left turn opens a gap on the right side, the offset side
+            turn_opens = turn > 0 if distance > 0 else turn < 0
+            first, second, between = self._join_offsets(
+                result[i], result[j], corner, turn_opens, join, normal, distance
+            )
+            if first is not None:
+                result[i] = first
+            if second is not None:
+                result[j] = second
+            if between is not None:
+                inserted[i] = between
+        ordered: list[SmHandle] = []
+        for i, edge in enumerate(result):
+            ordered.append(edge)
+            if i in inserted:
+                ordered.append(inserted[i])
+        return ordered
+
+    def offset_2d(
+        self,
+        wire: SmHandle,
+        distance: float,
+        join: JoinKind,
+        plane: Any = None,
+    ) -> SmHandle | None:
+        edges = list(wire.members) if wire.kind is TopoKind.WIRE else [wire]
+        if plane is not None:
+            direction = plane.Axis().Direction()
+            normal: Point = (direction.X(), direction.Y(), direction.Z())
+        else:
+            normal = self._wire_normal(edges)
+        if self.is_closed(wire):
+            # outwards for a positive distance: the right of a loop running
+            # counter-clockwise about the normal, the left of one running clockwise
+            points = [
+                p
+                for e in edges
+                for p in SmCurveView(self, e).positions_by_deflection(0.0)[:-1]
+            ]
+            if not edges[0].flip and len(edges) == 1:
+                pass
+            twice_area = 0.0
+            for a, b in zip(points, points[1:] + points[:1]):
+                twice_area += _dot(_cross(a, b), normal)
+            # the sampled points follow each edge's own parameter direction;
+            # the first edge's flip tells which way the wire runs
+            runs_backwards = edges[0].flip
+            counter_clockwise = (twice_area > 0) != runs_backwards
+            signed = distance if counter_clockwise else -distance
+            run = self._offset_run(edges, normal, signed, join, True)
+            return SmHandle(TopoKind.WIRE, members=run) if run else None
+        right = self._offset_run(edges, normal, abs(distance), join, False)
+        backwards = [e.with_flip(not e.flip) for e in reversed(edges)]
+        left = self._offset_run(backwards, normal, abs(distance), join, False)
+        loop: list[SmHandle] = []
+        start, _, _, _ = self._oriented_ends(edges[0])
+        _, end, _, _ = self._oriented_ends(edges[-1])
+        if right and left:
+            loop.extend(right)
+            loop.append(self._end_cap(right[-1], left[0], end, abs(distance)))
+            loop.extend(left)
+            loop.append(self._end_cap(left[-1], right[0], start, abs(distance)))
+        else:
+            loop.extend(right or left)
+        return SmHandle(TopoKind.WIRE, members=loop) if loop else None
+
+    def _end_cap(self, before: SmHandle, after: SmHandle, centre: Point, radius: float) -> SmHandle:
+        """The half circle about an end of an open wire from one side's offset to the other's."""
+        _, p1, _, _ = self._oriented_ends(before)
+        p0, _, _, _ = self._oriented_ends(after)
+        _, _, _, tangent = self._oriented_ends(before)
+        ahead = _unit(tangent)
+        midway = tuple(c + radius * t for c, t in zip(centre, ahead))
+        return self.make_three_point_arc(p1, midway, p0)  # type: ignore[arg-type]
     offset_face = _unsupported("offset_face")
     make_bezier_surface = _unsupported("make_bezier_surface")
     make_spline_surface_fit = _unsupported("make_spline_surface_fit")
