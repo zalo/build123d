@@ -3128,6 +3128,9 @@ class SmlibCoreKernel(Kernel):
         if auxiliary_spine is not None or binormal is not None:
             raise NotImplementedError("smlib: sweeps with an auxiliary spine or binormal")
         path_wire = path if path.kind is TopoKind.WIRE else SmHandle(TopoKind.WIRE, members=[path])
+        if len(path_wire.members) > 1:
+            # one piece per path edge, as OCCT's pipes are built
+            return self._sweep_segments(profile, path_wire, make_solid=make_solid)
         if profile.kind is TopoKind.FACE:
             wires = self.sub_shape_uses(profile, TopoKind.WIRE)
             curves = [self._as_nurbs(c) for w in wires for c in self._loop_curves(w)]
@@ -3142,11 +3145,127 @@ class SmlibCoreKernel(Kernel):
         options = self.sc.SmSweepOptions()
         options.bCapEndsArg = 1 if (make_solid and closed) else 0
         options.bTranslationalSweep = 0
-        return self._primitive(
+        # a profile centred on the path is carried along it (the way OCCT
+        # keeps it perpendicular); one placed off the path keeps its offset
+        box = self.bounding_box(profile, False)
+        path_start = SmCurveView(self, path_wire.members[0]).value(SmCurveView(self, path_wire.members[0]).first)
+        if box is not None:
+            centre = tuple(0.5 * (box[i] + box[i + 3]) for i in range(3))
+            options.bMoveProfileCenterToPath = 1 if math.dist(centre, path_start) <= _TOLERANCE * 100 else 0
+        swept = self._primitive(
             lambda c: c.CreateCurveSweep(
                 curves, spine, None, None, _TOLERANCE, options, [], [], [], 1
             )
         )
+        if swept.kind is not TopoKind.SOLID:
+            # a swept sheet faces the other way than OCCT's
+            for face in self._entities(swept.entity, TopoKind.FACE):
+                _check(face.SwapUV(), "face orientation")
+        return swept
+
+    def _smooth_wire(self, wire: SmHandle) -> bool:
+        """Whether the tangent carries on from each edge to the next."""
+        curves = self._loop_curves(wire)
+        views = [
+            SmCurveView(self, self._free_edge(c, c.GetNaturalInterval().GetMin(), c.GetNaturalInterval().GetMax()))
+            for c in curves
+        ]
+        for before, after in zip(views, views[1:]):
+            t_end = _unit(before.d1(before.last)[1])
+            t_start = _unit(after.d1(after.first)[1])
+            if _dot(t_end, t_start) < 1 - 1e-6:
+                return False
+        return True
+
+    def _sweep_segments(
+        self, profile: SmHandle, path_wire: SmHandle, *, make_solid: bool
+    ) -> SmHandle:
+        """A sweep along a path with corners: each edge is swept on its own,
+        the profile carried to the next edge by the turn the path makes
+        there, and the pieces sewn (sheets) or fused (solids)."""
+        curves = self._loop_curves(path_wire)
+        pieces: list[SmHandle] = []
+        placed = profile
+        for index, curve in enumerate(curves):
+            domain = curve.GetNaturalInterval()
+            segment = self._free_edge(curve, domain.GetMin(), domain.GetMax())
+            view = SmCurveView(self, segment)
+            if index > 0:
+                previous = SmCurveView(
+                    self,
+                    self._free_edge(
+                        curves[index - 1],
+                        curves[index - 1].GetNaturalInterval().GetMin(),
+                        curves[index - 1].GetNaturalInterval().GetMax(),
+                    ),
+                )
+                # carry the profile along the previous edge's own frame to
+                # its end, then turn it from that tangent to this one
+                moved = self._carry_along(placed, previous)
+                corner, t_new = view.d1(view.first)
+                t_old = _unit(previous.d1(previous.last)[1])
+                t_new = _unit(t_new)
+                axis = _cross(t_old, t_new)
+                size = math.sqrt(_dot(axis, axis))
+                if size > 1e-12:
+                    angle = math.atan2(size, _dot(t_old, t_new))
+                    turn = gp_Trsf()
+                    turn.SetRotation(gp_Ax1(gp_Pnt(*corner), gp_Dir(*axis)), angle)
+                    turned = self._bake(moved, turn)
+                    # the wedge the turn opens between the two profiles
+                    wedge = self._corner_wedge(moved, turned, make_solid)
+                    if wedge is not None:
+                        pieces.append(wedge)
+                    moved = turned
+                placed = moved
+            piece = self.sweep(
+                placed,
+                segment,
+                is_frenet=False,
+                transition=None,
+                make_solid=make_solid,
+            )
+            pieces.append(piece)
+        if all(p.kind is TopoKind.SOLID for p in pieces):
+            result = pieces[0]
+            for piece in pieces[1:]:
+                result, _ = self.boolean(BoolOp.FUSE, [result], [piece])
+            return result
+        faces = [f for p in pieces for f in self.sub_shapes(p, TopoKind.FACE)]
+        if len(faces) == 1:
+            return faces[0]
+        _, record = self.sew(faces)
+        assert record.result is not None
+        return record.result
+
+    def _corner_wedge(
+        self, before: SmHandle, after: SmHandle, make_solid: bool
+    ) -> SmHandle | None:
+        """What fills the gap between a profile and its turned copy at a
+        path corner: ruled between the two for sheets, lofted for solids."""
+        if before.kind is not TopoKind.FACE:
+            return None  # open profiles leave the corner open (a ruled fill folds)
+        try:
+            return self.loft([before, after], make_solid, True)
+        except (RuntimeError, ValueError):
+            return None
+
+    def _carry_along(self, profile: SmHandle, view: SmCurveView) -> SmHandle:
+        """The profile as the sweep leaves it at the end of an edge: moved
+        along and turned with the edge's tangent (the kernel sweeps keeping
+        the profile's angle to the tangent)."""
+        start, t0 = view.d1(view.first)
+        end, t1 = view.d1(view.last)
+        t0, t1 = _unit(t0), _unit(t1)
+        trsf = gp_Trsf()
+        trsf.SetTranslation(gp_Vec(*(e - s for s, e in zip(start, end))))
+        axis = _cross(t0, t1)
+        size = math.sqrt(_dot(axis, axis))
+        if size > 1e-12:
+            turn = gp_Trsf()
+            turn.SetRotation(gp_Ax1(gp_Pnt(*start), gp_Dir(*axis)), math.atan2(size, _dot(t0, t1)))
+            trsf = trsf.Multiplied(turn)
+        return self._bake(profile, trsf)
 
     sweep_multi = _unsupported("sweep_multi")
 
