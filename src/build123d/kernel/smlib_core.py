@@ -1780,7 +1780,10 @@ class SmlibCoreKernel(Kernel):
             for edgeuse in loop.GetEdgeuses([])
         ]
         if self.face_outward_is_flipped(face):
+            # a reversed wire, as OCCT marks it: its edges listed the other
+            # way round (position_at then walks them backwards)
             edges = [e.with_flip(not e.flip) for e in reversed(edges)]
+            return SmHandle(TopoKind.WIRE, members=edges, flip=True)
         return SmHandle(TopoKind.WIRE, members=edges)
 
     def direct_children(self, shape: SmHandle) -> list[SmHandle]:
@@ -1803,15 +1806,24 @@ class SmlibCoreKernel(Kernel):
         subs = self.sub_shapes(shape, sub_kind)
         if sub_kind is TopoKind.EDGE and ancestor_kind is TopoKind.FACE:
             for sub in subs:
-                entries.append(
-                    (
-                        sub,
-                        [
-                            SmHandle(TopoKind.FACE, f)
-                            for f in sub.entity.GetFaces([], None)
-                        ],
-                    )
-                )
+                # a face is listed once per use of the edge (twice for a
+                # seam), as OCCT's ancestor map lists it
+                uses: dict[int, tuple[Any, int]] = {}
+                edgeuses = sub.entity.GetEdgeuses([])
+                if isinstance(edgeuses, tuple):
+                    edgeuses = edgeuses[-1]
+                for edgeuse in edgeuses:
+                    face = edgeuse.GetFace()
+                    if face is None:
+                        continue
+                    seen = uses.get(face.address)
+                    uses[face.address] = (face, (seen[1] if seen else 0) + 1)
+                faces = [
+                    SmHandle(TopoKind.FACE, face)
+                    for face, count in uses.values()
+                    for _ in range(max(1, count // 2))
+                ]
+                entries.append((sub, faces))
         elif sub_kind is TopoKind.VERTEX and ancestor_kind is TopoKind.EDGE:
             edges = self.sub_shapes(shape, TopoKind.EDGE)
             for sub in subs:
@@ -1901,9 +1913,22 @@ class SmlibCoreKernel(Kernel):
         return shape.flip
 
     def reverse(self, shape: SmHandle) -> None:
-        shape.flip = not shape.flip
+        turned = self.reversed(shape)
+        shape.flip = turned.flip
+        shape.members = turned.members
 
     def reversed(self, shape: SmHandle) -> SmHandle:
+        if shape.kind is TopoKind.WIRE:
+            # a reversed wire lists its edges the other way round, each
+            # turned, as OCCT's explorer does; positions along it are then
+            # taken from the far end (the facade turns them round again)
+            return SmHandle(
+                TopoKind.WIRE,
+                members=[e.with_flip(not e.flip) for e in reversed(shape.members)],
+                flip=not shape.flip,
+                location=shape.location,
+                partner=shape.partner,
+            )
         return shape.with_flip(not shape.flip)
 
     def same_orientation(self, a: SmHandle, b: SmHandle) -> bool:
@@ -2182,7 +2207,11 @@ class SmlibCoreKernel(Kernel):
         if shape.kind is TopoKind.COMPOUND:
             return [b for m in shape.members for b in self._bodies(m)]
         if shape.kind is TopoKind.FACE:
-            return [SmHandle(TopoKind.SHELL, shape.entity.GetBrep())]
+            brep = shape.entity.GetBrep()
+            if len(self._entities(brep, TopoKind.FACE)) > 1:
+                # one face of a body works as a sheet of its own
+                return [SmHandle(TopoKind.SHELL, self._sheet_of(shape))]
+            return [SmHandle(TopoKind.SHELL, brep)]
         raise ValueError(f"booleans need solids, got a {shape.kind.name}")
 
     def _tracked_copy(self, shape: SmHandle, record: _Record) -> Any:
@@ -2497,9 +2526,28 @@ class SmlibCoreKernel(Kernel):
             touching = [r for r in results if self._boxes_touch(r, body)]
             merged = body
             for other in touching:
-                merged = self._merge(merged, other, self.sc.SM_BO_UNION)
+                try:
+                    merged = self._merge(merged, other, self.sc.SM_BO_UNION)
+                except RuntimeError:
+                    # sheets meeting along an edge the merge refuses are
+                    # stitched together instead (the merge consumed nothing
+                    # on failure, so both are still whole)
+                    if merged.IsManifoldSolid() or other.IsManifoldSolid():
+                        raise
+                    merged = self._stitched(merged, other)
             results = [r for r in results if r not in touching] + [merged]
         return results
+
+    def _stitched(self, a: Any, b: Any) -> Any:
+        """The faces of two sheet bodies stitched into one."""
+        target = self._new_brep()
+        for brep in (a, b):
+            for face in self._entities(brep, TopoKind.FACE):
+                self._copy_face_into(SmHandle(TopoKind.FACE, face), target)
+        stitcher = self.sc.SmStitch(self.sc.SmStitchCallback(), _TOLERANCE, 1, 1)
+        _check(stitcher.StitchIntoShell(target, 0, 1.0), "stitch")
+        self._box_of(target, fresh=True)
+        return target
 
     def _split(
         self, args: Sequence[SmHandle], tools: Sequence[SmHandle]
@@ -2677,6 +2725,57 @@ class SmlibCoreKernel(Kernel):
             members=[*overlaps, *(self.make_vertex(p) for p in ordered)],
         )
 
+    def _merge_same_domain_edges(self, edges: Sequence[SmHandle]) -> list[SmHandle]:
+        """Edges joined pairwise where two of them, on one line or one
+        circle, meet at a vertex no other edge reaches."""
+        remaining = list(edges)
+        changed = True
+        while changed:
+            changed = False
+            ends = [self._oriented_ends(e)[:2] for e in remaining]
+            degree: dict[Hashable, list[int]] = {}
+            for i, (a, b) in enumerate(ends):
+                degree.setdefault(_point_key(a, 6), []).append(i)
+                degree.setdefault(_point_key(b, 6), []).append(i)
+            for key, users in degree.items():
+                if len(users) != 2 or users[0] == users[1]:
+                    continue
+                i, j = users
+                a, b = remaining[i], remaining[j]
+                va, vb = SmCurveView(self, a), SmCurveView(self, b)
+                if va.geom_type != vb.geom_type or va.geom_type not in ("LINE", "CIRCLE"):
+                    continue
+                # the two edges as a chain through the shared vertex
+                sa, ea = ends[i]
+                sb, eb = ends[j]
+                if _point_key(ea, 6) == key:
+                    first = a
+                    second = b if _point_key(sb, 6) == key else b.with_flip(not b.flip)
+                else:
+                    first = b if _point_key(eb, 6) == key else b.with_flip(not b.flip)
+                    second = a if _point_key(sa, 6) == key else a.with_flip(not a.flip)
+                start = self._oriented_ends(first)[0]
+                end = self._oriented_ends(second)[1]
+                if va.geom_type == "LINE":
+                    ta = _unit(self._oriented_ends(first)[3])
+                    tb = _unit(self._oriented_ends(second)[2])
+                    if _dot(ta, tb) < 1 - 1e-9:
+                        continue
+                    joined = self.make_line(start, end)
+                else:
+                    (ca, xa, ra), (cb, xb, rb) = va.circle(), vb.circle()
+                    if math.dist(ca, cb) > _TOLERANCE or abs(ra - rb) > _TOLERANCE or abs(abs(_dot(xa, xb)) - 1) > 1e-9:
+                        continue
+                    if math.dist(start, end) <= 10 * _TOLERANCE:
+                        joined = self.make_circle(gp_Ax2(gp_Pnt(*ca), gp_Dir(*xa)), ra)
+                    else:
+                        via = self.vertex_point(self.edge_vertices(first)[-1]) if first.entity is not None else self._oriented_ends(first)[1]
+                        joined = self.make_three_point_arc(start, via, end)
+                remaining = [e for k, e in enumerate(remaining) if k not in (i, j)] + [joined]
+                changed = True
+                break
+        return remaining
+
     def _merge_pieces(self, edges: Sequence[SmHandle]) -> list[SmHandle]:
         """Edges that follow each other on one line or circle joined into
         one edge (OCCT reports such a section as a single edge)."""
@@ -2698,6 +2797,13 @@ class SmlibCoreKernel(Kernel):
             if kinds == {"CIRCLE"} and len({_point_key(v.circle()[0], 6) for v in views}) == 1:
                 middle = views[len(views) // 2]
                 via = middle.value(0.5 * (middle.first + middle.last)) if len(views) % 2 else middle.value(middle.last if members[len(views) // 2].flip else middle.first)
+                if math.dist(start, end) <= 10 * _TOLERANCE:
+                    # the pieces close the circle: one whole circle (the
+                    # three-point arc builder never returns for that)
+                    centre, axis, radius = views[0].circle()
+                    frame = gp_Ax2(gp_Pnt(*centre), gp_Dir(*axis))
+                    merged.append(self.make_circle(frame, radius))
+                    continue
                 merged.append(self.make_three_point_arc(start, via, end))
                 continue
             if self._smooth_wire(wire):
@@ -2889,6 +2995,27 @@ class SmlibCoreKernel(Kernel):
         meet at a vertex of theirs alone, on one line or circle, merged into
         one edge: the planar part of what OCCT's UnifySameDomain does."""
         record = _Record()
+        if shape.kind is TopoKind.WIRE or (
+            shape.kind is TopoKind.COMPOUND
+            and shape.members
+            and all(self._is_one_dimensional(m) for m in shape.members)
+        ):
+            # two edges on one line or one circle meeting at a vertex of
+            # theirs alone become one (what OCCT's UnifySameDomain does)
+            edges = self.sub_shapes(shape, TopoKind.EDGE)
+            merged = self._merge_same_domain_edges(edges)
+            if len(merged) == len(edges):
+                return shape, record
+            for edge in edges:
+                record.removed.add(edge.key())
+            if len(merged) == 1:
+                record.result = merged[0]
+            else:
+                wires = self.connect_edges_to_wires(merged, _TOLERANCE)
+                record.result = (
+                    wires[0] if len(wires) == 1 else SmHandle(TopoKind.COMPOUND, members=wires)
+                )
+            return record.result, record
         if shape.kind is TopoKind.COMPOUND:
             members = []
             for member in shape.members:
@@ -3238,10 +3365,15 @@ class SmlibCoreKernel(Kernel):
             if shape.kind in (TopoKind.SOLID, TopoKind.SHELL)
             else self._mapped(forward, shape.entity)
         )
+        flip = shape.flip
+        if mirror and shape.kind is TopoKind.FACE and not copy.IsManifoldSolid():
+            # a mirrored sheet face faces the mirrored way, as OCCT's does
+            # (the kernel keeps a sheet's face use as it was)
+            flip = not flip
         return SmHandle(
             shape.kind,
             entity,
-            flip=shape.flip,
+            flip=flip,
             location=new_location,
             partner=shape.partner,
         )
@@ -4053,6 +4185,10 @@ class SmlibCoreKernel(Kernel):
         path_wire = path if path.kind is TopoKind.WIRE else SmHandle(TopoKind.WIRE, members=[path])
         if len(path_wire.members) > 1:
             # one piece per path edge, as OCCT's pipes are built
+            if getattr(transition, "name", None) == "RIGHT" and all(
+                SmCurveView(self, e).geom_type == "LINE" for e in path_wire.members
+            ):
+                return self._sweep_mitred(profile, path_wire, make_solid=make_solid)
             return self._sweep_segments(profile, path_wire, make_solid=make_solid)
         if profile.kind is TopoKind.FACE:
             wires = self.sub_shape_uses(profile, TopoKind.WIRE)
@@ -4189,6 +4325,84 @@ class SmlibCoreKernel(Kernel):
             )
             pieces.append(piece)
         if all(p.kind is TopoKind.SOLID for p in pieces):
+            result = pieces[0]
+            for piece in pieces[1:]:
+                result, _ = self.boolean(BoolOp.FUSE, [result], [piece])
+            return result
+        faces = [f for p in pieces for f in self.sub_shapes(p, TopoKind.FACE)]
+        if len(faces) == 1:
+            return faces[0]
+        _, record = self.sew(faces)
+        assert record.result is not None
+        return record.result
+
+    def _sweep_mitred(
+        self, profile: SmHandle, path_wire: SmHandle, *, make_solid: bool
+    ) -> SmHandle:
+        """A sweep along a polyline with right (mitred) corners, as OCCT's
+        pipes with Transition.RIGHT: each segment's sweep is run past the
+        corners and cut back at the plane bisecting each corner, and the
+        pieces are sewn (sheets) or fused (solids)."""
+        segments = [self._oriented_ends(e)[:2] for e in path_wire.members]
+        directions = [_unit([b - a for a, b in zip(start, end)]) for start, end in segments]
+        closed = math.dist(segments[-1][1], segments[0][0]) <= 10 * _TOLERANCE
+        box = self.bounding_box(profile) or (0.0, 0.0, 0.0, 1.0, 1.0, 1.0)
+        reach = 2.0 * math.dist(box[:3], box[3:]) + 1.0
+        pieces: list[SmHandle] = []
+        placed = profile
+        count = len(segments)
+        for index, ((start, end), along) in enumerate(zip(segments, directions)):
+            if index > 0:
+                # carry the profile to this corner and turn it onto this segment
+                previous_start, previous_end = segments[index - 1]
+                carried = self._bake(
+                    placed, _translation(tuple(b - a for a, b in zip(previous_start, previous_end)))
+                )
+                before = directions[index - 1]
+                axis = _cross(before, along)
+                size = math.sqrt(_dot(axis, axis))
+                if size > 1e-12:
+                    turn = gp_Trsf()
+                    turn.SetRotation(
+                        gp_Ax1(gp_Pnt(*start), gp_Dir(*axis)), math.atan2(size, _dot(before, along))
+                    )
+                    carried = self._bake(carried, turn)
+                placed = carried
+            cut_start = index > 0 or closed
+            cut_end = index < count - 1 or closed
+            far_start = tuple(c - reach * d for c, d in zip(start, along)) if cut_start else start
+            far_end = tuple(c + reach * d for c, d in zip(end, along)) if cut_end else end
+            swept_profile = placed
+            if cut_start:
+                swept_profile = self._bake(placed, _translation(tuple(a - b for a, b in zip(far_start, start))))
+            piece = self.sweep(
+                swept_profile,
+                self.make_line(far_start, far_end),
+                is_frenet=False,
+                transition=None,
+                make_solid=make_solid,
+            )
+            middle = tuple(0.5 * (a + b) for a, b in zip(start, end))
+            for corner, neighbour in (
+                (start, directions[index - 1] if cut_start else None),
+                (end, directions[(index + 1) % count] if cut_end else None),
+            ):
+                if neighbour is None:
+                    continue
+                normal = _unit([a + b for a, b in zip(along, neighbour)])
+                tool = self.face_of_plane(gp_Pln(gp_Pnt(*corner), gp_Dir(*normal)))
+                parts, _ = self._split([piece], [tool])
+                candidates = parts.members if parts.kind is TopoKind.COMPOUND else [parts]
+                kept = [
+                    part
+                    for part in candidates
+                    if self.same_side(part, tool, middle, _TOLERANCE)
+                ]
+                if not kept:
+                    raise RuntimeError("the mitre cut left nothing of a sweep piece")
+                piece = kept[0] if len(kept) == 1 else SmHandle(TopoKind.COMPOUND, members=kept)
+            pieces.append(piece)
+        if make_solid and all(p.kind is TopoKind.SOLID for p in pieces):
             result = pieces[0]
             for piece in pieces[1:]:
                 result, _ = self.boolean(BoolOp.FUSE, [result], [piece])
@@ -4783,9 +4997,27 @@ class SmlibCoreKernel(Kernel):
         # like OCCT's wire builder, the edges are chained end to end whatever
         # order and way round they were given in
         chained = self.connect_edges_to_wires(edges, _TOLERANCE)
-        if len(chained) != 1:
+        if len(chained) == 1:
+            return chained[0], WireStatus.OK
+        # OCCT's wire builder also takes edges that branch at a vertex: one
+        # wire as long as every edge is reached through shared ends
+        members = [e for wire in chained for e in wire.members]
+        parent = list(range(len(members)))
+
+        def find(i: int) -> int:
+            while parent[i] != i:
+                parent[i] = parent[parent[i]]
+                i = parent[i]
+            return i
+
+        ends = [self._oriented_ends(e)[:2] for e in members]
+        for i in range(len(members)):
+            for j in range(i + 1, len(members)):
+                if any(math.dist(a, b) <= _TOLERANCE for a in ends[i] for b in ends[j]):
+                    parent[find(j)] = find(i)
+        if len({find(i) for i in range(len(members))}) != 1:
             return None, WireStatus.DISCONNECTED
-        return chained[0], WireStatus.OK
+        return SmHandle(TopoKind.WIRE, members=members), WireStatus.OK
 
     def make_wire_placed(
         self, edges: Sequence[SmHandle]
@@ -4986,10 +5218,7 @@ class SmlibCoreKernel(Kernel):
         ]
         for face in faces:
             before = {f.address for f in self._entities(target, TopoKind.FACE)}
-            _check(
-                face.entity.GetBrep().CopyFaces([face.entity], target, None, 0, None),
-                "face copy",
-            )
+            self._copy_face_into(face, target)
             record.modified[face.key()] = [
                 SmHandle(TopoKind.FACE, f)
                 for f in self._entities(target, TopoKind.FACE)
@@ -5012,6 +5241,22 @@ class SmlibCoreKernel(Kernel):
                 parts.append(self._sheet_handle(piece))
             record.result = SmHandle(TopoKind.COMPOUND, members=parts)
         return record.result, record
+
+    def _copy_face_into(self, face: SmHandle, target: Any) -> None:
+        """Copy a face into a body; a planar face the kernel refuses to copy
+        (some of a sewn or swept sheet's) is rebuilt from its loops first."""
+        outcome = face.entity.GetBrep().CopyFaces([face.entity], target, None, 0, None)
+        status = outcome[0] if isinstance(outcome, tuple) else outcome
+        if status == SM_SUCCESS:
+            return
+        if self.planar_surface(face) is None:
+            raise RuntimeError(f"SMLib face copy failed with status {status}")
+        loops = self.sub_shape_uses(face, TopoKind.WIRE)
+        rebuilt = self.make_planar_face(loops[0], loops[1:])
+        _check(
+            rebuilt.entity.GetBrep().CopyFaces([rebuilt.entity], target, None, 0, None),
+            "face copy",
+        )
 
     def _sheet_handle(self, brep: Any) -> SmHandle:
         """A face handle for a one-face sheet, else a shell handle."""
@@ -5098,16 +5343,23 @@ class SmlibCoreKernel(Kernel):
         """(distance, point on the first object, point on the second) per
         solution; a point solve has one object only and repeats its point."""
         found = []
+        unreadable = 0
         for i in range(solutions.GetSize()):
             solution = solutions.GetAt(i)
             points = []
             for j in range(count):
                 located, params = self.sc.SmVector3d(), self.sc.SmVector3d()
-                _check(solution.GetPoint(j, located, params, 0), "solution point")
+                if solution.GetPoint(j, located, params, 0) != SM_SUCCESS:
+                    break  # a solution the kernel cannot place: left out
                 points.append(self._pt(located))
+            if len(points) < count:
+                unreadable += 1
+                continue
             found.append(
                 (float(solution.m_vStart.m_dSolutionValue), points[0], points[-1])
             )
+        if unreadable and not found:
+            raise RuntimeError("SMLib solution point failed with status 1001")
         return found
 
     def _solve_pair(self, a: tuple[str, Any], b: tuple[str, Any]) -> tuple[float, Point, Point]:
@@ -5148,7 +5400,19 @@ class SmlibCoreKernel(Kernel):
                     ),
                     "point to body",
                 )
-            found = self._solutions(solutions, 1)
+            try:
+                found = self._solutions(solutions, 1)
+            except RuntimeError:
+                found = []
+            if not found and kinds[1] == "curve":
+                # the solver placed nothing: the dropped point will do
+                curve, interval = b[1]
+                drop = curve.DropPoint(interval, point, None, _TOLERANCE, None)
+                if drop[0] == SM_SUCCESS:
+                    nearest = sc.SmVector3d()
+                    _check(curve.EvaluatePoint(float(drop[-2]), nearest), "curve evaluation")
+                    on_curve = self._pt(nearest)
+                    return math.dist(a[1], on_curve), a[1], on_curve
             if not found:
                 raise RuntimeError("SMLib found no nearest point")
             distance, on_b, _ = min(found)
@@ -5247,10 +5511,16 @@ class SmlibCoreKernel(Kernel):
         sheet = self._sheets.get(key)
         if sheet is None or sheet[0] is not face.entity:
             body = self._new_brep()
-            _check(
-                face.entity.GetBrep().CopyFaces([face.entity], body, None, 0, None),
-                "face copy",
-            )
+            outcome = face.entity.GetBrep().CopyFaces([face.entity], body, None, 0, None)
+            status = outcome[0] if isinstance(outcome, tuple) else outcome
+            if status != SM_SUCCESS:
+                # some faces of fused sheets refuse to be copied out: a
+                # planar one is rebuilt from its loops instead
+                if self.planar_surface(face) is None:
+                    raise RuntimeError(f"SMLib face copy failed with status {status}")
+                loops = self.sub_shape_uses(face, TopoKind.WIRE)
+                rebuilt = self.make_planar_face(loops[0], loops[1:])
+                body = rebuilt.entity.GetBrep()
             sheet = (face.entity, body)
             self._sheets[key] = sheet
         return sheet[1]
@@ -5502,10 +5772,14 @@ class SmlibCoreKernel(Kernel):
     def reversed_geometry(self, edge: SmHandle) -> SmHandle:
         view = SmCurveView(self, edge)
         curve = self._copy_curve(view.curve)
+        natural = curve.GetNaturalInterval()
+        low, high = natural.GetMin(), natural.GetMax()
         old = self.sc.SmExtent1d(view.first, view.last)
         new = self.sc.SmExtent1d()
         _check(curve.ReverseParameterization(old, new), "curve reverse")
-        return self._free_edge(curve, new.GetMin(), new.GetMax())
+        # the kernel turns the curve round over its whole domain (and hands
+        # back the old interval): the edge's part of it moves accordingly
+        return self._free_edge(curve, low + high - view.last, low + high - view.first)
 
     def trim_edge(self, edge: SmHandle, start: float, end: float) -> SmHandle:
         view = SmCurveView(self, edge)

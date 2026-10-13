@@ -31,6 +31,8 @@ import os
 import random
 import tempfile
 import unittest
+
+from build123d.kernel import kernel
 from unittest.mock import patch, MagicMock
 
 import numpy as np
@@ -328,7 +330,7 @@ class TestWire(unittest.TestCase):
         """Wires the kernel marks as reversed, as those of a mirrored sketch are"""
 
         def flipped(wire: Wire) -> Wire:
-            return Wire(TopoDS.Wire(wire.wrapped.Reversed()))
+            return Wire(kernel.reversed(wire.wrapped))
 
         mixed = Wire(
             [
