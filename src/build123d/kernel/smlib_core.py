@@ -92,8 +92,9 @@ def _cross(a: Sequence[float], b: Sequence[float]) -> Point:
 
 
 def _point_key(point: Sequence[float]) -> tuple[Any, ...]:
-    """Identity of a free vertex: its position to within the kernel tolerance."""
-    return ("at",) + tuple(round(c / _TOLERANCE) for c in point)
+    """Identity of a free vertex: its position, rounded well below the kernel
+    tolerance so that the ends of meeting edges agree."""
+    return ("at",) + tuple(round(c, 9) + 0.0 for c in point)
 
 
 def _unit(a: Sequence[float]) -> Point:
@@ -688,7 +689,11 @@ class SmlibCoreKernel(Kernel):
         return shape
 
     def is_same(self, a: SmHandle, b: SmHandle) -> bool:
-        return a.key() == b.key()
+        if a.key() == b.key():
+            return True
+        if a.point is not None and b.point is not None:  # free vertices: by position
+            return math.dist(a.point, b.point) < _TOLERANCE
+        return False
 
     def is_equal(self, a: SmHandle, b: SmHandle) -> bool:
         return a.key() == b.key() and a.flip == b.flip
@@ -1282,16 +1287,25 @@ class SmlibCoreKernel(Kernel):
     def location_of(self, shape: SmHandle) -> TopLoc_Location:
         return shape.location
 
-    def _bake(self, shape: SmHandle, trsf: gp_Trsf) -> SmHandle:
-        """A moved copy of ``shape``: the geometry transformed, the placement remembered."""
+    def _bake(
+        self,
+        shape: SmHandle,
+        trsf: gp_Trsf,
+        copies: dict[int, tuple[Any, Any]] | None = None,
+    ) -> SmHandle:
+        """A moved copy of ``shape``: the geometry transformed, the placement
+        remembered. ``copies`` maps a body's address to its moved copy and
+        forward map, so that the members of one container share one copy."""
         if trsf.Form() == 0 and trsf.TranslationPart().Modulus() == 0:  # gp_Identity
             return shape
+        if copies is None:
+            copies = {}
         placement = self._placement_of_trsf(trsf)
         new_location = TopLoc_Location(trsf).Multiplied(shape.location)
         if shape.kind in (TopoKind.WIRE, TopoKind.COMPOUND):
             return SmHandle(
                 shape.kind,
-                members=[self._bake(m, trsf) for m in shape.members],
+                members=[self._bake(m, trsf, copies) for m in shape.members],
                 flip=shape.flip,
                 location=new_location,
                 partner=shape.partner,
@@ -1316,8 +1330,12 @@ class SmlibCoreKernel(Kernel):
                 partner=shape.partner,
             )
         brep = self._body(shape)
-        copy, forward = self._copy_body(brep)
-        _check(copy.Transform(placement, None, 1), "transform")
+        if brep.address in copies:
+            copy, forward = copies[brep.address]
+        else:
+            copy, forward = self._copy_body(brep)
+            _check(copy.Transform(placement, None, 1), "transform")
+            copies[brep.address] = (copy, forward)
         entity = (
             copy
             if shape.kind in (TopoKind.SOLID, TopoKind.SHELL)
@@ -1552,9 +1570,26 @@ class SmlibCoreKernel(Kernel):
             )
         )
 
+    def _as_nurbs(self, curve: Any) -> Any:
+        """A plain NURBS rebuilt from a curve's control polygon and knots: the
+        sweeps walk the NURBS data directly, which the analytic curves and
+        their trimmed copies do not always carry in a form they accept."""
+        status, poles, weights = curve.GetControlPolygon([], [])
+        _check(status, "control polygon")
+        status, knots = curve.GetKnotsAll([])
+        _check(status, "knots")
+        points = [(p.x, p.y, p.z) for p in poles]
+        rational = bool(curve.IsRational()) and len(weights) == len(points)
+        return self._nurbs(
+            points,
+            [float(k) for k in knots],
+            int(curve.GetDegree()),
+            [float(w) for w in weights] if rational else None,
+        )
+
     def _joined_curve(self, wire: SmHandle) -> Any:
-        """One curve running along a wire."""
-        curves = self._loop_curves(wire)
+        """One NURBS curve running along a wire."""
+        curves = [self._as_nurbs(c) for c in self._loop_curves(wire)]
         if len(curves) == 1:
             return curves[0]
         status, joined = self.sc.SmBSplineCurve.CreateByJoining(self.context, curves, None)
@@ -1579,13 +1614,13 @@ class SmlibCoreKernel(Kernel):
         path_wire = path if path.kind is TopoKind.WIRE else SmHandle(TopoKind.WIRE, members=[path])
         if profile.kind is TopoKind.FACE:
             wires = self.sub_shape_uses(profile, TopoKind.WIRE)
-            curves = [c for w in wires for c in self._loop_curves(w)]
+            curves = [self._as_nurbs(c) for w in wires for c in self._loop_curves(w)]
             closed = True
         else:
             profile_wire = (
                 profile if profile.kind is TopoKind.WIRE else SmHandle(TopoKind.WIRE, members=[profile])
             )
-            curves = self._loop_curves(profile_wire)
+            curves = [self._as_nurbs(c) for c in self._loop_curves(profile_wire)]
             closed = self.is_closed(profile_wire)
         spine = self._joined_curve(path_wire)
         options = self.sc.SmSweepOptions()
@@ -1690,7 +1725,14 @@ class SmlibCoreKernel(Kernel):
         remove_internal_edges: bool = False,
     ) -> SmHandle:
         if thicken:
-            raise NotImplementedError("smlib: thickening")
+            # a planar face is thickened by extruding it along its normal;
+            # other surfaces would need offset faces with side walls
+            if shape.kind is TopoKind.FACE and self.planar_surface(shape) is not None:
+                _, normal = SmSurfaceView(self, shape).normal(
+                    *SmSurfaceView(self, shape)._mid()  # pylint: disable=protected-access
+                )
+                return self.extrude(shape, tuple(amount * c for c in normal))  # type: ignore[arg-type]
+            raise NotImplementedError("smlib: thickening of curved faces")
         record = _Record()
         body = self._tracked_copy(shape, record)
         status, result = self.sc.SmOffsetExecutive.OffsetBrep(
