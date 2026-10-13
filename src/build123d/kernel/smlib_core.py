@@ -2256,16 +2256,20 @@ class SmlibCoreKernel(Kernel):
     def _finish_record(self, record: _Record, result: Any) -> None:
         """Drop from the record the copies that did not survive."""
         results = result if isinstance(result, list) else [result]
-        alive = {
-            e.address
-            for r in results
+        # per kind: a freed entity's address can be reused by one of another
+        # kind, which must not pass for the old one
+        alive: dict[TopoKind, set[int]] = {
+            kind: {e.address for r in results for e in self._entities(r, kind)}
             for kind in (TopoKind.VERTEX, TopoKind.EDGE, TopoKind.FACE)
-            for e in self._entities(r, kind)
         }
-        alive.update(r.address for r in results)
+        bodies = {r.address for r in results}
         for key, became in list(record.modified.items()):
             survivors = [
-                h for h in became if h.entity is None or h.entity.address in alive
+                h
+                for h in became
+                if h.entity is None
+                or h.entity.address in alive.get(h.kind, bodies)
+                or (h.kind in (TopoKind.SOLID, TopoKind.SHELL) and h.entity.address in bodies)
             ]
             if survivors:
                 record.modified[key] = survivors
@@ -4590,11 +4594,19 @@ class SmlibCoreKernel(Kernel):
             # a planar face is thickened by extruding it along its normal;
             # other sheets by the kernel's shelling with nothing opened,
             # which offsets the faces and walls up their rims
-            if shape.kind is TopoKind.FACE and self.planar_surface(shape) is not None:
-                _, normal = SmSurfaceView(self, shape).normal(
-                    *SmSurfaceView(self, shape)._mid()  # pylint: disable=protected-access
+            faces = self.sub_shapes(shape, TopoKind.FACE) if shape.kind is TopoKind.SHELL else [shape]
+            if (
+                shape.kind in (TopoKind.FACE, TopoKind.SHELL)
+                and len(faces) == 1
+                and self.planar_surface(faces[0]) is not None
+            ):
+                # (the kernel's shelling of a lone planar sheet crashes for
+                # a negative amount)
+                face = faces[0]
+                _, normal = SmSurfaceView(self, face).normal(
+                    *SmSurfaceView(self, face)._mid()  # pylint: disable=protected-access
                 )
-                return self.extrude(shape, tuple(amount * c for c in normal))  # type: ignore[arg-type]
+                return self.extrude(face, tuple(amount * c for c in normal))  # type: ignore[arg-type]
             if shape.kind is TopoKind.FACE:
                 sheet, _ = self._copy_body(self._sheet_of(shape))
             else:
@@ -5507,9 +5519,11 @@ class SmlibCoreKernel(Kernel):
 
     def _sheet_of(self, face: SmHandle) -> Any:
         """A body holding a copy of this one face (cached per face)."""
+        # not cached: a dead face's address (and, through pybind's instance
+        # registry, its Python wrapper) can be reused by another face
         key = face.entity.address
-        sheet = self._sheets.get(key)
-        if sheet is None or sheet[0] is not face.entity:
+        sheet = None
+        if True:
             body = self._new_brep()
             outcome = face.entity.GetBrep().CopyFaces([face.entity], body, None, 0, None)
             status = outcome[0] if isinstance(outcome, tuple) else outcome
@@ -5712,9 +5726,7 @@ class SmlibCoreKernel(Kernel):
 
     def mesh(self, shape: SmHandle, tolerance: float, angular_tolerance: float) -> None:
         for brep in self._breps_of(shape):
-            known = self._meshes.get(brep.address)
-            if known is not None and known[1] <= tolerance:
-                continue
+            # always meshed afresh: an address may belong to a new body
             degrees = math.degrees(angular_tolerance)
             result = brep.ConvertToPolyBrep(
                 tolerance, degrees, degrees, 0.0, 0.0, 0, 0, 0, 0, None, None
