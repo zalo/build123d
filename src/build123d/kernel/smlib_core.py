@@ -3395,6 +3395,8 @@ class SmlibCoreKernel(Kernel):
         return distance, [(on_a, on_b)]
 
     def point_in_solid(self, solid: SmHandle, point: Point, tolerance: float) -> bool:
+        if solid.kind is TopoKind.COMPOUND:
+            return any(self.point_in_solid(m, point, tolerance) for m in solid.members)
         zone = self.sc.SmZoneTol3d(tolerance)
         classification = self.sc.SmPointClassification(zone, None)
         _check(
