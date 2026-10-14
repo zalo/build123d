@@ -58,13 +58,13 @@ import copy
 from collections.abc import Iterable, Iterator, Sequence
 from itertools import combinations
 from os import PathLike, fspath
+from typing import cast as tcast
 from typing import ClassVar
 from typing_extensions import Self
 
 from bd_materials import FinishedMaterial
 
-import OCP.TopAbs as ta
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Fuse
+
 from OCP.Font import Font_SystemFont
 from OCP.gp import gp_Ax3
 from OCP.Graphic3d import (
@@ -76,17 +76,16 @@ from OCP.Graphic3d import (
     Graphic3d_VTA_TOP,
     Graphic3d_VTA_TOPFIRSTLINE,
 )
-from OCP.GProp import GProp_GProps
 from OCP.NCollection import NCollection_String
 from OCP.StdPrs import StdPrs_BRepTextBuilder as Font_BRepTextBuilder, StdPrs_BRepFont
-from OCP.TopAbs import TopAbs_ShapeEnum
+
 from OCP.TopoDS import (
-    TopoDS,
-    TopoDS_Builder,
     TopoDS_Compound,
-    TopoDS_Iterator,
 )
+
+
 from anytree import PreOrderIter
+from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.build_enums import Align, CenterOf, FontStyle, Select, TextAlign, Unit
 from build123d.geometry import (
     TOLERANCE,
@@ -226,7 +225,11 @@ class Compound(Mixin3D[TopoDS_Compound]):
         Returns:
             Edge: extruded shape
         """
-        return Compound(TopoDS.Compound(_extrude_topods_shape(obj.wrapped, direction)))
+        return Compound(
+            tcast(
+                TopoDS_Compound, downcast(_extrude_topods_shape(obj.wrapped, direction))
+            )
+        )
 
     @staticmethod
     def resolve_font(
@@ -390,14 +393,17 @@ class Compound(Mixin3D[TopoDS_Compound]):
             brep_font.SetCompositeCurveMode(False)
 
         text_flat = Compound(
-            TopoDS.Compound(
-                builder.Perform(
-                    brep_font,
-                    NCollection_String(txt),
-                    gp_Ax3(),
-                    horiz_align,
-                    vert_align,
-                )
+            tcast(
+                TopoDS_Compound,
+                downcast(
+                    builder.Perform(
+                        brep_font,
+                        NCollection_String(txt),
+                        gp_Ax3(),
+                        horiz_align,
+                        vert_align,
+                    )
+                ),
             )
         )
 
@@ -524,10 +530,10 @@ class Compound(Mixin3D[TopoDS_Compound]):
         if len(summands) <= 1:
             result: Shape = Shape.make_composite(summands[0:1], self._dim)
         else:
-            fuse_op = BRepAlgoAPI_Fuse()
-            fuse_op.SetFuzzyValue(TOLERANCE)
             self.copy_attributes_to(summands[0], ["wrapped", "_NodeMixin__children"])
-            result = self._bool_op(summands[:1], summands[1:], fuse_op)
+            result = self._bool_op(
+                summands[:1], summands[1:], BoolOp.FUSE, fuzzy=TOLERANCE
+            )
             # the fuse ran self's first piece against all the rest; for the
             # record, everything of self was there before and `other` was brought in
             if result._history is not None:
@@ -555,7 +561,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
         Check if empty.
         """
 
-        return not self.is_empty and TopoDS_Iterator(self.wrapped).More()
+        return not self.is_empty and bool(kernel.direct_children(self.wrapped))
 
     def __iter__(self) -> Iterator[Shape]:
         """
@@ -563,11 +569,8 @@ class Compound(Mixin3D[TopoDS_Compound]):
 
         """
 
-        iterator = TopoDS_Iterator(self.wrapped)
-
-        while iterator.More():
-            yield Compound.cast(iterator.Value())
-            iterator.Next()
+        for child in kernel.direct_children(self.wrapped):
+            yield Compound.cast(child)
 
     def __len__(self) -> int:
         """Return the number of subshapes"""
@@ -616,13 +619,12 @@ class Compound(Mixin3D[TopoDS_Compound]):
         if center_of == CenterOf.GEOMETRY:
             raise ValueError("Center of GEOMETRY is not supported for this object")
         if center_of == CenterOf.MASS:
-            properties = GProp_GProps()
-            calc_function = Shape.shape_properties_LUT[unwrapped_shapetype(self)]
-            if calc_function:
-                calc_function(self.wrapped, properties)
-                middle = Vector(properties.CentreOfMass())
-            else:
-                raise NotImplementedError
+            middle = Vector(
+                kernel.center_of_mass(
+                    self.wrapped,
+                    unwrapped_shapetype(self),
+                )
+            )
         else:  # center_of == CenterOf.BOUNDING_BOX:
             middle = self.bounding_box().center()
         return middle
@@ -639,9 +641,11 @@ class Compound(Mixin3D[TopoDS_Compound]):
         """compounds - all the compounds in this Shape"""
         if self.is_empty:
             return ShapeList()
-        if isinstance(self.wrapped, TopoDS_Compound):
+        if kernel.is_kind(self.wrapped, TopoKind.COMPOUND):
             # pylint: disable=not-an-iterable
-            sub_compounds = [c for c in self if isinstance(c.wrapped, TopoDS_Compound)]
+            sub_compounds = [
+                c for c in self if kernel.is_kind(c.wrapped, TopoKind.COMPOUND)
+            ]
             sub_compounds.append(self)
         else:
             sub_compounds = []
@@ -671,7 +675,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
         # moved() would deep-copy the whole assembly for every part.
         children: list[Shape] = self._parts()
         placed: list[Shape] = [
-            Shape.cast(part.wrapped.Located(part.global_location.wrapped))
+            Shape.cast(kernel.located(part.wrapped, part.global_location.wrapped))
             for part in children
         ]
         if include_parent:
@@ -732,23 +736,19 @@ class Compound(Mixin3D[TopoDS_Compound]):
         """
 
         type_map = {
-            Vertex: TopAbs_ShapeEnum.TopAbs_VERTEX,
-            Edge: TopAbs_ShapeEnum.TopAbs_EDGE,
-            Face: TopAbs_ShapeEnum.TopAbs_FACE,
-            Shell: TopAbs_ShapeEnum.TopAbs_SHELL,
-            Solid: TopAbs_ShapeEnum.TopAbs_SOLID,
-            Wire: TopAbs_ShapeEnum.TopAbs_WIRE,
-            Compound: TopAbs_ShapeEnum.TopAbs_COMPOUND,
+            Vertex: TopoKind.VERTEX,
+            Edge: TopoKind.EDGE,
+            Face: TopoKind.FACE,
+            Shell: TopoKind.SHELL,
+            Solid: TopoKind.SOLID,
+            Wire: TopoKind.WIRE,
+            Compound: TopoKind.COMPOUND,
         }
         results = []
         for comp in self.compounds():
-            iterator = TopoDS_Iterator()
-            iterator.Initialize(comp.wrapped)
-            while iterator.More():
-                child = iterator.Value()
-                if child.ShapeType() == type_map[obj_type]:
+            for child in kernel.direct_children(comp.wrapped):
+                if kernel.kind(child) is type_map[obj_type]:
                     results.append(obj_type(downcast(child)))  # type: ignore
-                iterator.Next()
 
         return results
 
@@ -792,7 +792,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
         elements: list[Shape] = []
         for child in self.children:
             placed = copy.deepcopy(child, dict(outside))
-            placed.wrapped = downcast(child.wrapped.Moved(base.wrapped))
+            placed.wrapped = kernel.moved(child.wrapped, base.wrapped)
             elements.append(placed)
         return elements
 
@@ -1007,8 +1007,7 @@ class Compound(Mixin3D[TopoDS_Compound]):
         Args:
           shape: Shape:
         """
-        comp_builder = TopoDS_Builder()
-        comp_builder.Remove(self.wrapped, shape.wrapped)
+        kernel.remove_from_compound(self.wrapped, shape.wrapped)
         return self
 
 
@@ -1079,5 +1078,5 @@ Shape.register_composite_factory(2, Sketch)
 Shape.register_composite_factory(3, Part)
 
 
-Shape.register_shape_constructor(ta.TopAbs_COMPOUND, Compound)
-Shape.register_shape_constructor(ta.TopAbs_COMPSOLID, Compound)
+Shape.register_shape_constructor(TopoKind.COMPOUND, Compound)
+Shape.register_shape_constructor(TopoKind.COMPSOLID, Compound)

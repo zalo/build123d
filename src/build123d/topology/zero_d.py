@@ -55,22 +55,14 @@ from __future__ import annotations
 
 import itertools
 
+from typing import cast as tcast
 from typing import ClassVar, overload, TYPE_CHECKING
 
 from collections.abc import Iterable
 
-import OCP.TopAbs as ta
-from OCP.BRep import BRep_Tool
-from OCP.BRepAdaptor import BRepAdaptor_Curve2d
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
-from OCP.BRepTools import BRepTools
-from OCP.IntTools import IntTools_FClass2d
-from OCP.TopExp import TopExp, TopExp_Explorer
-from OCP.collections import (
-    IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher,
-)
-from OCP.TopoDS import TopoDS, TopoDS_Face, TopoDS_Vertex, TopoDS_Edge
-from OCP.gp import gp_Pnt, gp_Pnt2d, gp_Vec2d
+
+from OCP.TopoDS import TopoDS_Face, TopoDS_Vertex, TopoDS_Edge
+
 from build123d.geometry import (
     TOLERANCE,
     Matrix,
@@ -80,8 +72,9 @@ from build123d.geometry import (
     Axis,
     Plane,
 )
+from build123d.kernel import TopoKind, kernel
 from build123d.build_enums import Convexity, Keep, Select, Unit
-from .kernel import list_shapes
+
 from .shape_core import Shape, ShapeList, TrimmingTool, downcast, find_same_topods
 
 if TYPE_CHECKING:  # pragma: no cover
@@ -131,7 +124,7 @@ class Vertex(Shape[TopoDS_Vertex]):
             raise ValueError(f"Unexpected argument(s): {', '.join(kwargs.keys())}")
 
         if args:
-            if isinstance(args[0], TopoDS_Vertex):
+            if kernel.is_handle(args[0]):
                 ocp_vx = args[0]
             elif isinstance(args[0], Iterable):
                 v = args[0]
@@ -141,11 +134,7 @@ class Vertex(Shape[TopoDS_Vertex]):
         if v is not None:
             x, y, z = itertools.islice(itertools.chain(v, [0, 0, 0]), 3)
 
-        ocp_vx = (
-            downcast(BRepBuilderAPI_MakeVertex(gp_Pnt(x, y, z)).Vertex())
-            if ocp_vx is None
-            else ocp_vx
-        )
+        ocp_vx = downcast(kernel.make_vertex((x, y, z))) if ocp_vx is None else ocp_vx
 
         super().__init__(ocp_vx)
 
@@ -203,8 +192,8 @@ class Vertex(Shape[TopoDS_Vertex]):
     def _owning_face(self) -> TopoDS_Face | None:
         """The innermost face this vertex was selected through, if any."""
         for step in reversed(self.topo_path):
-            if not step.is_empty and step.wrapped.ShapeType() == ta.TopAbs_FACE:
-                return TopoDS.Face(step.wrapped)
+            if not step.is_empty and kernel.is_kind(step.wrapped, TopoKind.FACE):
+                return tcast(TopoDS_Face, downcast(step.wrapped))
         return None
 
     def _only_face(self) -> TopoDS_Face | None:
@@ -221,16 +210,13 @@ class Vertex(Shape[TopoDS_Vertex]):
         if parent is None or parent.is_empty or parent.solids() or parent.shells():
             return None
         holding = []
-        explorer = TopExp_Explorer(parent.wrapped, ta.TopAbs_FACE)
-        while explorer.More():
-            face = TopoDS.Face(explorer.Current())
-            vertices = TopExp_Explorer(face, ta.TopAbs_VERTEX)
-            while vertices.More():
-                if vertices.Current().IsSame(self.wrapped):
-                    holding.append(face)
-                    break
-                vertices.Next()
-            explorer.Next()
+        for topods_face in kernel.sub_shapes(parent.wrapped, TopoKind.FACE):
+            face = tcast(TopoDS_Face, downcast(topods_face))
+            if any(
+                kernel.is_same(vertex, self.wrapped)
+                for vertex in kernel.sub_shapes(face, TopoKind.VERTEX)
+            ):
+                holding.append(face)
         if len(holding) > 1:
             raise ValueError(
                 f"this vertex is a corner of {len(holding)} faces of the "
@@ -246,31 +232,22 @@ class Vertex(Shape[TopoDS_Vertex]):
         dimensions so that a corner on a curved face reads the same as one on
         a flat face.
         """
-        here = BRep_Tool.Parameters_s(self.wrapped, face)
+        here = kernel.vertex_uv_on_face(self.wrapped, face)
         seen: list[TopoDS_Edge] = []
         directions: list[tuple[float, float]] = []
-        explorer = TopExp_Explorer(face, ta.TopAbs_EDGE)
-        while explorer.More():
-            edge = TopoDS.Edge(explorer.Current())
-            explorer.Next()
-            if any(edge.IsSame(other) for other in seen):
+        for topods_edge in kernel.sub_shape_uses(face, TopoKind.EDGE):
+            edge = tcast(TopoDS_Edge, downcast(topods_edge))
+            if any(kernel.is_same(edge, other) for other in seen):
                 continue  # a seam edge is met once per side
             seen.append(edge)
-            curve = BRepAdaptor_Curve2d(edge, face)
-            for param, sign in (
-                (curve.FirstParameter(), 1.0),
-                (curve.LastParameter(), -1.0),
+            for (end_u, end_v), (tangent_u, tangent_v) in kernel.edge_uv_ends_on_face(
+                edge, face
             ):
-                end = curve.Value(param)
-                if (end.X() - here.X()) ** 2 + (end.Y() - here.Y()) ** 2 > TOLERANCE:
+                if (end_u - here[0]) ** 2 + (end_v - here[1]) ** 2 > TOLERANCE:
                     continue
-                point, tangent = gp_Pnt2d(), gp_Vec2d()
-                curve.D1(param, point, tangent)
-                length = (tangent.X() ** 2 + tangent.Y() ** 2) ** 0.5
+                length = (tangent_u**2 + tangent_v**2) ** 0.5
                 if length > 0:
-                    directions.append(
-                        (sign * tangent.X() / length, sign * tangent.Y() / length)
-                    )
+                    directions.append((tangent_u / length, tangent_v / length))
         return directions
 
     def _corner_convexity(self, face: TopoDS_Face) -> Convexity:
@@ -292,11 +269,11 @@ class Vertex(Shape[TopoDS_Vertex]):
         if span < TOLERANCE:
             return Convexity.SMOOTH  # the boundary runs straight through
 
-        u_min, u_max, v_min, v_max = BRepTools.UVBounds_s(face)
+        u_min, u_max, v_min, v_max = kernel.surface_of(face).uv_bounds()
         step = 1e-4 * ((u_max - u_min) ** 2 + (v_max - v_min) ** 2) ** 0.5 / span
-        here = BRep_Tool.Parameters_s(self.wrapped, face)
-        probe = gp_Pnt2d(here.X() + bisector[0] * step, here.Y() + bisector[1] * step)
-        inside = IntTools_FClass2d(face, TOLERANCE).Perform(probe) == ta.TopAbs_IN
+        here = kernel.vertex_uv_on_face(self.wrapped, face)
+        probe = (here[0] + bisector[0] * step, here[1] + bisector[1] * step)
+        inside = kernel.uv_in_face(face, probe, TOLERANCE)
         return Convexity.CONVEX if inside else Convexity.CONCAVE
 
     def _crease_convexity(self) -> Convexity:
@@ -307,21 +284,15 @@ class Vertex(Shape[TopoDS_Vertex]):
                 "this vertex was not selected from a shape, so there is nothing "
                 "to classify it against - take it from a face or solid"
             )
-        vertex_edge_map = (
-            IndexedDataMap_TopoDS_Shape_List_TopoDS_Shape_TopTools_ShapeMapHasher()
+        vertex_edge_map = kernel.ancestors(
+            parent.wrapped, TopoKind.VERTEX, TopoKind.EDGE
         )
-        TopExp.MapShapesAndAncestors_s(
-            parent.wrapped, ta.TopAbs_VERTEX, ta.TopAbs_EDGE, vertex_edge_map
-        )
-        own = find_same_topods(
-            self.wrapped,
-            (vertex_edge_map.FindKey(i + 1) for i in range(vertex_edge_map.Extent())),
-        )
+        own = find_same_topods(self.wrapped, vertex_edge_map.keys())
         if own is None:
             raise ValueError("this vertex is not part of its topo_parent")
 
         kinds: set[Convexity] = set()
-        for topods_edge in list_shapes(vertex_edge_map.FindFromKey(own)):
+        for topods_edge in vertex_edge_map.get(own):
             edge = Shape.cast(topods_edge)
             edge.topo_path = self.topo_path
             kinds.add(edge.convexity)
@@ -333,25 +304,25 @@ class Vertex(Shape[TopoDS_Vertex]):
         return Convexity.SADDLE
 
     @property
-    def _point(self) -> gp_Pnt:
+    def _point(self) -> tuple[float, float, float]:
         """The kernel point, including the current Location"""
         self._needs_geometry("position")
-        return BRep_Tool.Pnt_s(self.wrapped)
+        return kernel.vertex_point(self.wrapped)
 
     @property
     def X(self) -> float:
         """The X coordinate of this Vertex, including its current Location."""
-        return self._point.X()
+        return self._point[0]
 
     @property
     def Y(self) -> float:
         """The Y coordinate of this Vertex, including its current Location."""
-        return self._point.Y()
+        return self._point[1]
 
     @property
     def Z(self) -> float:
         """The Z coordinate of this Vertex, including its current Location."""
-        return self._point.Z()
+        return self._point[2]
 
     # ---- Class Methods ----
 
@@ -522,30 +493,23 @@ def topo_explore_common_vertex(
     edge1: Edge | TopoDS_Edge, edge2: Edge | TopoDS_Edge
 ) -> Vertex:
     """Given two edges, find the common vertex; the empty Vertex if there is none"""
-    topods_edge1 = edge1 if isinstance(edge1, TopoDS_Edge) else edge1.wrapped
-    topods_edge2 = edge2 if isinstance(edge2, TopoDS_Edge) else edge2.wrapped
+    topods_edge1 = edge1 if kernel.is_handle(edge1) else tcast("Edge", edge1).wrapped
+    topods_edge2 = edge2 if kernel.is_handle(edge2) else tcast("Edge", edge2).wrapped
 
     # Explore vertices of the first edge
-    vert_exp = TopExp_Explorer(topods_edge1, ta.TopAbs_VERTEX)
-    while vert_exp.More():
-        vertex1 = vert_exp.Current()
-
+    for vertex1 in kernel.sub_shapes(topods_edge1, TopoKind.VERTEX):
         # Explore vertices of the second edge
-        explorer2 = TopExp_Explorer(topods_edge2, ta.TopAbs_VERTEX)
-        while explorer2.More():
-            vertex2 = explorer2.Current()
-
+        for vertex2 in kernel.sub_shapes(topods_edge2, TopoKind.VERTEX):
             # Check if the vertices are the same
-            if vertex1.IsSame(vertex2):
-                return Vertex(TopoDS.Vertex(vertex1))  # Common vertex found
-
-            explorer2.Next()
-        vert_exp.Next()
+            if kernel.is_same(vertex1, vertex2):
+                return Vertex(
+                    tcast(TopoDS_Vertex, downcast(vertex1))
+                )  # Common vertex found
 
     return Vertex()  # No common vertex found
 
 
-Shape.register_shape_constructor(ta.TopAbs_VERTEX, Vertex)
+Shape.register_shape_constructor(TopoKind.VERTEX, Vertex)
 Shape.register_geometry_constructor(Vector, Vertex)
 Shape.register_geometry_constructor(
     Location, lambda location: Vertex(location.position)

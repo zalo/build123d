@@ -1765,9 +1765,7 @@ class TestFaceValidation(unittest.TestCase):
 
     def test_surface_from_points_reports_a_failed_approximation(self):
         points = [[Vector(x, y, 0) for x in range(3)] for y in range(3)]
-        with patch(
-            "build123d.topology.two_d.GeomAPI_PointsToBSplineSurface"
-        ) as builder:
+        with patch("build123d.kernel.occt.GeomAPI_PointsToBSplineSurface") as builder:
             builder.return_value.IsDone.return_value = False
             with self.assertRaisesRegex(ValueError, "B-spline approximation failed"):
                 Face.make_surface_from_array_of_points(points)
@@ -1897,7 +1895,7 @@ class TestSurfaceHoles(unittest.TestCase):
 
     def test_make_holes_reports_a_failure(self):
         with patch(
-            "build123d.topology.two_d.BRepBuilderAPI_MakeFace",
+            "build123d.kernel.occt.BRepBuilderAPI_MakeFace",
             return_value=self._failing_make_face(),
         ):
             with self.assertRaisesRegex(RuntimeError, "Error adding interior hole"):
@@ -1905,7 +1903,7 @@ class TestSurfaceHoles(unittest.TestCase):
 
     def test_add_surface_holes_reports_a_failure(self):
         with patch(
-            "build123d.topology.two_d.BRepBuilderAPI_MakeFace",
+            "build123d.kernel.occt.BRepBuilderAPI_MakeFace",
             return_value=self._failing_make_face(),
         ):
             with self.assertRaisesRegex(RuntimeError, "Error adding interior hole"):

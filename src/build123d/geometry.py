@@ -40,8 +40,8 @@ import itertools
 import json
 import logging
 import warnings
-from collections.abc import Callable, Iterable, Iterator, Sequence
-from math import copysign, degrees, log10, pi, prod, radians
+from collections.abc import Iterable, Iterator, Sequence
+from math import acos, asin, copysign, degrees, log10, pi, prod, radians, sqrt
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -55,16 +55,17 @@ from typing import (
 )
 
 import numpy as np
+from sys import float_info
+
+from build123d.kernel import TopoKind, kernel
 import webcolors  # type: ignore
 from typing_extensions import deprecated
 from OCP.Bnd import Bnd_Box, Bnd_OBB
 from OCP.BRep import BRep_Tool
 from OCP.BRepBndLib import BRepBndLib
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace, BRepBuilderAPI_Transform
-from OCP.BRepGProp import BRepGProp, BRepGProp_Face  # used for mass calculation
-from OCP.BRepTools import BRepTools
-from OCP.Geom import Geom_BoundedSurface, Geom_ElementarySurface, Geom_Line, Geom_Plane
-from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_IntSS, GeomAPI_ProjectPointOnSurf
+
+from OCP.Geom import Geom_Line, Geom_Plane
+from OCP.GeomAPI import GeomAPI_IntCS, GeomAPI_IntSS
 from OCP.gp import (
     gp_Ax1,
     gp_Ax2,
@@ -83,11 +84,10 @@ from OCP.gp import (
 )
 
 # properties used to store mass calculation result
-from OCP.GProp import GProp_GProps
 from OCP.Quantity import Quantity_Color, Quantity_ColorRGBA, Quantity_TypeOfColor
-from OCP.TopAbs import TopAbs_ShapeEnum
+
 from OCP.TopLoc import TopLoc_Location
-from OCP.TopoDS import TopoDS, TopoDS_Edge, TopoDS_Face, TopoDS_Shape, TopoDS_Vertex
+from OCP.TopoDS import TopoDS_Face, TopoDS_Shape, TopoDS_Vertex
 
 from build123d.build_enums import Align, Align2D, Align3D, Extrinsic, Intrinsic
 
@@ -161,6 +161,9 @@ def _parse_intersect_args(*args, **kwargs):
     return axis, plane, vector, location, shape
 
 
+_GP_RESOLUTION = float_info.min  # gp::Resolution(), the kernel's null-vector threshold
+
+
 class Vector:
     """Create a 3-dimensional vector
 
@@ -185,7 +188,8 @@ class Vector:
     # auto-converting array-like objects (objects with __len__() and indexing) into NumPy
     # arrays during certain arithmetic operations.
 
-    _wrapped: gp_Vec
+    _xyz: np.ndarray
+    _gp: gp_Vec | None  # the OCCT object, built on first use and dropped on edits
     _dim = 0
 
     @overload
@@ -214,7 +218,7 @@ class Vector:
 
     def __init__(self, *args, **kwargs):
         self.vector_index = 0
-        x, y, z, ocp_vec = 0, 0, 0, None
+        x, y, z, xyz = 0.0, 0.0, 0.0, None
 
         unknown_args = ", ".join(set(kwargs.keys()).difference(["v", "X", "Y", "Z"]))
         if unknown_args:
@@ -228,12 +232,12 @@ class Vector:
             first_arg = args[0] if args else None
             first_arg = kwargs.get("v", first_arg)  # override with kwarg
             if isinstance(first_arg, Vector):
-                ocp_vec = gp_Vec(first_arg.wrapped.XYZ())
+                xyz = first_arg._xyz.copy()
             elif hasattr(first_arg, "wrapped") and isinstance(
                 first_arg.wrapped, TopoDS_Vertex
             ):
                 geom_point = BRep_Tool.Pnt_s(first_arg.wrapped)
-                ocp_vec = gp_Vec(geom_point.XYZ())
+                xyz = np.array((geom_point.X(), geom_point.Y(), geom_point.Z()))
             elif isinstance(first_arg, (tuple, Iterable)):
                 try:
                     values = [float(value) for value in first_arg]
@@ -241,19 +245,25 @@ class Vector:
                     raise TypeError("Expected floats") from exc
                 if len(values) < 3:
                     values += [0.0] * (3 - len(values))
-                ocp_vec = gp_Vec(*values[0:3])
-            elif isinstance(first_arg, (gp_Vec, gp_Pnt, gp_Dir)):
-                ocp_vec = gp_Vec(first_arg.XYZ())
-            elif isinstance(first_arg, gp_XYZ):
-                ocp_vec = gp_Vec(first_arg)
+                xyz = np.array(values[0:3], dtype=float)
+            elif isinstance(first_arg, (gp_Vec, gp_Pnt, gp_Dir, gp_XYZ)):
+                xyz = np.array((first_arg.X(), first_arg.Y(), first_arg.Z()))
             else:
                 raise TypeError("Expected floats, OCC gp_, or iterable")
         x = kwargs.get("X", x)
         y = kwargs.get("Y", y)
         z = kwargs.get("Z", z)
-        ocp_vec = gp_Vec(x, y, z) if ocp_vec is None else ocp_vec
+        self._xyz = np.array((x, y, z), dtype=float) if xyz is None else xyz
+        self._gp = None
 
-        self._wrapped = ocp_vec
+    @classmethod
+    def _from_xyz(cls, xyz: np.ndarray) -> Vector:
+        """A Vector around an existing float64 array (no validation, no copy)."""
+        result = cls.__new__(cls)
+        result.vector_index = 0
+        result._xyz = xyz
+        result._gp = None
+        return result
 
     def __iter__(self):
         return iter((self.X, self.Y, self.Z))
@@ -261,57 +271,75 @@ class Vector:
     @property
     def X(self) -> float:
         """Get x value"""
-        return self.wrapped.X()
+        return float(self._xyz[0])
 
     @X.setter
     def X(self, value: float) -> None:
         """Set x value"""
-        self.wrapped.SetX(value)
+        self._xyz[0] = value
+        self._gp = None
 
     @property
     def Y(self) -> float:
         """Get y value"""
-        return self.wrapped.Y()
+        return float(self._xyz[1])
 
     @Y.setter
     def Y(self, value: float) -> None:
         """Set y value"""
-        self.wrapped.SetY(value)
+        self._xyz[1] = value
+        self._gp = None
 
     @property
     def Z(self) -> float:
         """Get z value"""
-        return self.wrapped.Z()
+        return float(self._xyz[2])
 
     @Z.setter
     def Z(self, value: float) -> None:
         """Set z value"""
-        self.wrapped.SetZ(value)
+        self._xyz[2] = value
+        self._gp = None
 
     @property
     def wrapped(self) -> gp_Vec:
-        """OCCT object"""
-        return self._wrapped
+        """OCCT object for the stored coordinates.
+
+        Built on first access and kept until a coordinate is set. It is the
+        kernel's own mutable type: callers that modify it in place do not
+        change this Vector, as they would not have changed a copy.
+        """
+        if self._gp is None:
+            self._gp = gp_Vec(*self._xyz.tolist())
+        return self._gp
 
     @property
     def length(self) -> float:
         """Vector length"""
-        return self.wrapped.Magnitude()
+        x, y, z = self._xyz.tolist()
+        return sqrt(x * x + y * y + z * z)  # gp_XYZ::Modulus, same operation order
 
     def cross(self, vec: Vector) -> Vector:
         """Mathematical cross function"""
-        return Vector(self.wrapped.Crossed(vec.wrapped))
+        x1, y1, z1 = self._xyz.tolist()
+        x2, y2, z2 = vec._xyz.tolist()
+        # gp_XYZ::Crossed, term for term
+        return Vector._from_xyz(
+            np.array((y1 * z2 - z1 * y2, z1 * x2 - x1 * z2, x1 * y2 - y1 * x2))
+        )
 
     def dot(self, vec: Vector) -> float:
         """Mathematical dot function"""
-        return self.wrapped.Dot(vec.wrapped)
+        x1, y1, z1 = self._xyz.tolist()
+        x2, y2, z2 = vec._xyz.tolist()
+        return x1 * x2 + y1 * y2 + z1 * z2  # gp_XYZ::Dot, same summation order
 
     def sub(self, vec: VectorLike) -> Vector:
         """Mathematical subtraction function"""
         if isinstance(vec, Vector):
-            result = Vector(self.wrapped.Subtracted(vec.wrapped))
+            result = Vector._from_xyz(self._xyz - vec._xyz)
         elif isinstance(vec, tuple):
-            result = Vector(self.wrapped.Subtracted(Vector(vec).wrapped))
+            result = Vector._from_xyz(self._xyz - Vector(vec)._xyz)
         else:
             raise ValueError("Only Vectors or tuples can be subtracted from Vectors")
 
@@ -324,9 +352,9 @@ class Vector:
     def add(self, vec: VectorLike) -> Vector:
         """Mathematical addition function"""
         if isinstance(vec, Vector):
-            result = Vector(self.wrapped.Added(vec.wrapped))
+            result = Vector._from_xyz(self._xyz + vec._xyz)
         elif isinstance(vec, tuple):
-            result = Vector(self.wrapped.Added(Vector(vec).wrapped))
+            result = Vector._from_xyz(self._xyz + Vector(vec)._xyz)
         else:
             raise ValueError("Only Vectors or tuples can be added to Vectors")
 
@@ -343,7 +371,7 @@ class Vector:
 
     def multiply(self, scale: float) -> Vector:
         """Mathematical multiply function"""
-        return Vector(self.wrapped.Multiplied(scale))
+        return Vector._from_xyz(self._xyz * float(scale))
 
     def __mul__(self, scale: float) -> Vector:
         """Mathematical multiply operator *"""
@@ -359,7 +387,46 @@ class Vector:
 
     def normalized(self) -> Vector:
         """Scale to length of 1"""
-        return Vector(self.wrapped.Normalized())
+        length = self.length
+        if length <= _GP_RESOLUTION:
+            return Vector(self.wrapped.Normalized())  # raises as the kernel does
+        # gp_Vec::Normalized divides each coordinate by the modulus
+        x, y, z = self._xyz.tolist()
+        return Vector._from_xyz(np.array((x / length, y / length, z / length)))
+
+    def _as_direction(self) -> tuple[float, float, float]:
+        """Unit coordinates computed exactly as ``gp_Dir(gp_XYZ)`` does.
+
+        A vector whose squared modulus is already one is used as is; any other
+        is divided by the square root of its squared modulus. Raises through
+        the kernel for a null vector so the exception type is unchanged.
+        """
+        x, y, z = self._xyz.tolist()
+        square_modulus = x * x + y * y + z * z
+        if 1.0 - _GP_RESOLUTION <= square_modulus <= 1.0 + _GP_RESOLUTION:
+            return (x, y, z)
+        modulus = sqrt(square_modulus)
+        if modulus <= _GP_RESOLUTION:
+            self.wrapped.Angle(
+                gp_Vec(1.0, 0.0, 0.0)
+            )  # raises gp_VectorWithNullMagnitude
+        return (x / modulus, y / modulus, z / modulus)
+
+    @staticmethod
+    def _dir_angle(
+        this: tuple[float, float, float], other: tuple[float, float, float]
+    ) -> tuple[float, tuple[float, float, float]]:
+        """``gp_Dir::Angle`` between two unit vectors, radians, plus their cross."""
+        x1, y1, z1 = this
+        x2, y2, z2 = other
+        cosinus = x1 * x2 + y1 * y2 + z1 * z2
+        cross = (y1 * z2 - z1 * y2, z1 * x2 - x1 * z2, x1 * y2 - y1 * x2)
+        if -0.70710678118655 < cosinus < 0.70710678118655:
+            return acos(cosinus), cross
+        sinus = sqrt(cross[0] * cross[0] + cross[1] * cross[1] + cross[2] * cross[2])
+        if cosinus < 0.0:
+            return pi - asin(sinus), cross
+        return asin(sinus), cross
 
     def reverse(self) -> Vector:
         """Return a vector with the same magnitude but pointing in the opposite direction"""
@@ -379,7 +446,8 @@ class Vector:
 
     def get_angle(self, vec: Vector) -> float:
         """Unsigned angle between vectors"""
-        return self.wrapped.Angle(vec.wrapped) * RAD2DEG
+        angle, _ = Vector._dir_angle(self._as_direction(), vec._as_direction())
+        return angle * RAD2DEG
 
     def get_signed_angle(self, vec: Vector, normal: Vector | None = None) -> float:
         """Signed Angle Between Vectors
@@ -394,11 +462,14 @@ class Vector:
         Returns:
             float: Angle between vectors
         """
-        if normal is None:
-            gp_normal = gp_Vec(0, 0, -1)
-        else:
-            gp_normal = normal.wrapped
-        return self.wrapped.AngleWithRef(vec.wrapped, gp_normal) * RAD2DEG
+        normal = _MINUS_Z if normal is None else normal
+        # gp_Dir::AngleWithRef: the unsigned angle, negated when the cross
+        # product points against the reference
+        angle, cross = Vector._dir_angle(self._as_direction(), vec._as_direction())
+        rx, ry, rz = normal._as_direction()
+        if cross[0] * rx + cross[1] * ry + cross[2] * rz < 0.0:
+            angle = -angle
+        return angle * RAD2DEG
 
     def project_to_line(self, line: Vector) -> Vector:
         """Returns a new vector equal to the projection of this Vector onto the line
@@ -511,11 +582,11 @@ class Vector:
 
     def to_pnt(self) -> gp_Pnt:
         """Convert to OCCT gp_Pnt object"""
-        return gp_Pnt(self.wrapped.XYZ())
+        return gp_Pnt(*self._xyz.tolist())
 
     def to_dir(self) -> gp_Dir:
         """Convert to OCCT gp_Dir object"""
-        return gp_Dir(self.wrapped.XYZ())
+        return gp_Dir(*self._xyz.tolist())
 
     def transform(self, affine_transform: Matrix, is_direction: bool = False) -> Vector:
         """Multiply this vector by a transformation matrix
@@ -614,6 +685,9 @@ VectorLike: Represents a position in space.
 """
 
 
+_MINUS_Z = Vector(0, 0, -1)  # default reference for signed angles
+
+
 class AxisMeta(type):
     """Axis meta class to enable class properties"""
 
@@ -695,7 +769,7 @@ class Axis(metaclass=AxisMeta):
                 gp_ax1 = arg
             elif isinstance(arg, Location):
                 location = arg
-            elif hasattr(arg, "wrapped") and isinstance(arg.wrapped, TopoDS_Edge):
+            elif hasattr(arg, "wrapped") and kernel.is_kind(arg.wrapped, TopoKind.EDGE):
                 edge = arg
             elif isinstance(arg, (Vector, tuple)):
                 origin = arg
@@ -712,17 +786,15 @@ class Axis(metaclass=AxisMeta):
 
         # Handle edge-based construction
         if edge is not None:
-            if not (hasattr(edge, "wrapped") and isinstance(edge.wrapped, TopoDS_Edge)):
+            if not (
+                hasattr(edge, "wrapped") and kernel.is_kind(edge.wrapped, TopoKind.EDGE)
+            ):
                 raise ValueError(f"Invalid edge argument: {edge}")
 
-            topods_edge: TopoDS_Edge = edge.wrapped  # type: ignore[annotation-unchecked]
-            curve = BRep_Tool.Curve_s(topods_edge, float(), float())
-            param_min, _ = BRep_Tool.Range_s(topods_edge)
-            origin_pnt = gp_Pnt()
-            tangent_vec = gp_Vec()
-            curve.D1(param_min, origin_pnt, tangent_vec)
-            origin = Vector(origin_pnt)
-            direction = Vector(gp_Dir(tangent_vec))
+            curve = kernel.curve_of(edge.wrapped)
+            origin_point, tangent = curve.d1(curve.first)
+            origin = Vector(origin_point)
+            direction = Vector(tangent).normalized()
 
         # Convert location to axis
         if location is not None:
@@ -1087,7 +1159,7 @@ class BoundBox:
             topo_arg = getattr(first_arg, "_wrapped", first_arg)
             if bounding_box is None and isinstance(args[0], Bnd_Box):
                 bounding_box = args[0]
-            elif isinstance(topo_arg, TopoDS_Shape) or (
+            elif kernel.is_handle(topo_arg) or (
                 hasattr(first_arg, "_wrapped") and topo_arg is None
             ):
                 shape = first_arg
@@ -1107,21 +1179,17 @@ class BoundBox:
 
         if shape is not None:
             topo_shape = getattr(shape, "_wrapped", shape)
-            if topo_shape is not None and not isinstance(topo_shape, TopoDS_Shape):
+            if topo_shape is not None and not kernel.is_handle(topo_shape):
                 raise TypeError(f"Invalid argument for shape: {topo_shape}")
 
             bounding_box = Bnd_Box()
             if topo_shape is not None:
-                BRepTools.Clean_s(topo_shape)  # Remove mesh which may impact bbox
-
                 tolerance = (
                     TOLERANCE if tolerance is None else tolerance
                 )  # tol = TOLERANCE (by default)
-
-                if optimal:
-                    BRepBndLib.AddOptimal_s(topo_shape, bounding_box)
-                else:
-                    BRepBndLib.Add_s(topo_shape, bounding_box, True)
+                corners = kernel.bounding_box(topo_shape, optimal)
+                if corners is not None:
+                    bounding_box.Update(*corners)
 
         if bounding_box.IsVoid():
             x_min, y_min, z_min, x_max, y_max, z_max = (0.0,) * 6
@@ -3031,13 +3099,8 @@ class Plane(metaclass=PlaneMeta):
 
     @staticmethod
     def get_topods_face_normal(face: TopoDS_Face) -> Vector:
-        """Find the normal at the center of a TopoDS_Face"""
-        gp_pnt = gp_Pnt()
-        normal = gp_Vec()
-        projector = GeomAPI_ProjectPointOnSurf(gp_pnt, BRep_Tool.Surface_s(face))
-        u_val, v_val = projector.LowerDistanceParameters()
-        BRepGProp_Face(face).Normal(u_val, v_val, gp_pnt, normal)
-        return Vector(normal)
+        """Find the normal of a face where its surface passes nearest the origin"""
+        return Vector(kernel.face_frame(face)[2])
 
     @staticmethod
     def _single_arg_as_origin_and_dirs(
@@ -3128,7 +3191,7 @@ class Plane(metaclass=PlaneMeta):
             elif (
                 arg_face is None
                 and hasattr(arg0, "wrapped")
-                and isinstance(arg0.wrapped, TopoDS_Face)
+                and kernel.is_kind(arg0.wrapped, TopoKind.FACE)
             ):
                 arg_face = arg0
                 if arg_x_dir is None and len(args) > 1:
@@ -3173,7 +3236,6 @@ class Plane(metaclass=PlaneMeta):
         y_dir = None
         z_dir = None
         if arg_face:
-            surface = BRep_Tool.Surface_s(arg_face.wrapped)
             if not arg_face.is_planar:
                 raise ValueError("Planes can only be created from planar faces")
             if arg_origin is not None:
@@ -3181,35 +3243,17 @@ class Plane(metaclass=PlaneMeta):
                     "The origin parameter is ignored when creating a Plane from a Face",
                     stacklevel=2,
                 )
-            properties = GProp_GProps()
-            BRepGProp.SurfaceProperties_s(arg_face.wrapped, properties)
-            origin = Vector(properties.CentreOfMass())
-
-            if isinstance(surface, Geom_BoundedSurface):
-                point = gp_Pnt()
-                face_x_dir = gp_Vec()
-                tangent_v = gp_Vec()
-                surface.D1(0.5, 0.5, point, face_x_dir, tangent_v)
-            else:
-                assert isinstance(surface, Geom_ElementarySurface)  # for .Position()
-                face_x_dir = gp_Vec(surface.Position().XDirection())
-
+            face_origin, face_x_dir, face_normal = kernel.face_frame(arg_face.wrapped)
+            origin = Vector(face_origin)
             x_dir = Vector(arg_x_dir) if arg_x_dir else Vector(face_x_dir)
             x_dir = round(Vector(x_dir), 14)
-            z_dir = Plane.get_topods_face_normal(arg_face.wrapped)
-            z_dir = round(Vector(z_dir), 14)
+            z_dir = round(Vector(face_normal), 14)
         elif arg_location:
-            topo_face = BRepBuilderAPI_MakeFace(
-                Plane.XY.wrapped, -1.0, 1.0, -1.0, 1.0
-            ).Face()
-            topo_face.Move(arg_location.wrapped)
+            # the XY plane carried to the location: its axes are the location's
+            transformation = arg_location.wrapped.Transformation()
             origin = arg_location.position
-            surface = BRep_Tool.Surface_s(topo_face)
-            assert isinstance(surface, Geom_ElementarySurface)  # for .Position()
-            x_dir = Vector(surface.Position().XDirection())
-            x_dir = round(Vector(x_dir), 14)
-            z_dir = Plane.get_topods_face_normal(topo_face)
-            z_dir = round(Vector(z_dir), 14)
+            x_dir = round(Vector(gp_Dir(1, 0, 0).Transformed(transformation)), 14)
+            z_dir = round(Vector(gp_Dir(0, 0, 1).Transformed(transformation)), 14)
         elif arg_axis:
             origin = arg_axis.position
             x_dir = Vector(arg_x_dir) if arg_x_dir is not None else None
@@ -3433,9 +3477,10 @@ class Plane(metaclass=PlaneMeta):
             Plane: plane with new origin
 
         """
-        if hasattr(locator, "wrapped") and isinstance(locator.wrapped, TopoDS_Vertex):
-            geom_point = BRep_Tool.Pnt_s(locator.wrapped)
-            new_origin = Vector(geom_point.X(), geom_point.Y(), geom_point.Z())
+        if hasattr(locator, "wrapped") and kernel.is_kind(
+            locator.wrapped, TopoKind.VERTEX
+        ):
+            new_origin = Vector(kernel.vertex_point(locator.wrapped))
             if not self.contains(new_origin):
                 raise ValueError(f"{locator} is not located within plane")
         elif isinstance(locator, tuple) and len(locator) == 2:
@@ -3594,30 +3639,11 @@ class Plane(metaclass=PlaneMeta):
                 gp_Pnt(*local_top_right),
             )
             return BoundBox(local_bbox)
-        if hasattr(obj, "wrapped") and isinstance(obj.wrapped, TopoDS_Shape):  # Shapes
-            # return_value = obj.transform_shape(transform_matrix)
-            downcast_lut: dict[
-                TopAbs_ShapeEnum, Callable[[TopoDS_Shape], TopoDS_Shape]
-            ] = {
-                TopAbs_ShapeEnum.TopAbs_VERTEX: TopoDS.Vertex,
-                TopAbs_ShapeEnum.TopAbs_EDGE: TopoDS.Edge,
-                TopAbs_ShapeEnum.TopAbs_WIRE: TopoDS.Wire,
-                TopAbs_ShapeEnum.TopAbs_FACE: TopoDS.Face,
-                TopAbs_ShapeEnum.TopAbs_SHELL: TopoDS.Shell,
-                TopAbs_ShapeEnum.TopAbs_SOLID: TopoDS.Solid,
-                TopAbs_ShapeEnum.TopAbs_COMPOUND: TopoDS.Compound,
-            }
+        if hasattr(obj, "wrapped") and kernel.is_handle(obj.wrapped):  # Shapes
             assert obj.wrapped is not None
-            try:
-                f_downcast = downcast_lut[obj.wrapped.ShapeType()]
-            except KeyError as exc:
-                raise ValueError(f"Unknown object type {obj}") from exc
-
             new_shape: Shape = copy_module.deepcopy(obj, None)  # type: ignore[arg-type]
-            new_shape.wrapped = f_downcast(
-                BRepBuilderAPI_Transform(
-                    obj.wrapped, transform_matrix.wrapped.Trsf()
-                ).Shape()
+            new_shape.wrapped, _ = kernel.transformed(
+                obj.wrapped, transform_matrix.wrapped.Trsf(), copy=False
             )
             return new_shape
         raise ValueError(

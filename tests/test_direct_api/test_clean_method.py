@@ -38,7 +38,7 @@ class TestCleanMethod(unittest.TestCase):
         self.solid = Solid()
         self.solid.wrapped = MagicMock()  # Simulate a valid `wrapped` object
 
-    @patch("build123d.topology.shape_core.ShapeUpgrade_UnifySameDomain")
+    @patch("build123d.kernel.occt.ShapeUpgrade_UnifySameDomain")
     def test_clean_warning_on_exception(self, mock_shape_upgrade):
         # Mock the upgrader
         mock_upgrader = mock_shape_upgrade.return_value

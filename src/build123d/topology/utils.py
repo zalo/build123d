@@ -54,35 +54,21 @@ from __future__ import annotations
 
 from math import radians, sin, cos, isclose
 from typing import Any, TYPE_CHECKING
+from typing import cast as tcast
 
 from collections.abc import Iterable
 
-from OCP.BRep import BRep_Builder, BRep_Tool
-from OCP.BRepAdaptor import BRepAdaptor_Curve
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut
-from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeFace
-from OCP.BRepClass3d import BRepClass3d_SolidClassifier
-from OCP.BRepGProp import BRepGProp, BRepGProp_Face
-from OCP.BRepTools import BRepTools
-from OCP.BRepLib import BRepLib_FindSurface
-from OCP.BRepOffsetAPI import BRepOffsetAPI_ThruSections
-from OCP.BRepPrimAPI import BRepPrimAPI_MakePrism
-from OCP.GProp import GProp_GProps
-from OCP.gp import gp_Pnt, gp_Vec
-from OCP.ShapeFix import ShapeFix_Face, ShapeFix_Shape
-from OCP.TopAbs import TopAbs_Orientation, TopAbs_ShapeEnum
-from OCP.TopExp import TopExp_Explorer
-from OCP.collections import List_TopoDS_Shape
+
 from OCP.TopoDS import (
-    TopoDS,
-    TopoDS_Compound,
     TopoDS_Face,
     TopoDS_Shape,
     TopoDS_Shell,
-    TopoDS_Vertex,
     TopoDS_Edge,
     TopoDS_Wire,
 )
+
+
+from build123d.kernel import BoolOp, TopoKind, kernel
 from build123d.geometry import TOLERANCE, BoundBox, Vector, VectorLike
 
 from .shape_core import (
@@ -103,29 +89,25 @@ if TYPE_CHECKING:  # pragma: no cover
 def _topods_face_position(face: TopoDS_Face, u: float, v: float) -> Vector:
     """The point of a face at normalized (u, v), each from 0 to 1 across the
     face's own parameter range."""
-    u_min, u_max, v_min, v_max = BRepTools.UVBounds_s(face)
-    surface = BRep_Tool.Surface_s(face)
+    surface = kernel.surface_of(face)
+    u_min, u_max, v_min, v_max = surface.uv_bounds()
     return Vector(
-        surface.Value(u_min + u * (u_max - u_min), v_min + v * (v_max - v_min))
+        surface.value(u_min + u * (u_max - u_min), v_min + v * (v_max - v_min))
     )
 
 
 def _topods_face_normal(face: TopoDS_Face, u: float = 0.5, v: float = 0.5) -> Vector:
     """The unit normal of a face at normalized (u, v), with the face's own
     orientation: reversed faces point the other way from their surface."""
-    u_min, u_max, v_min, v_max = BRepTools.UVBounds_s(face)
-    point, normal = gp_Pnt(), gp_Vec()
-    BRepGProp_Face(face).Normal(
-        u_min + u * (u_max - u_min), v_min + v * (v_max - v_min), point, normal
-    )
+    surface = kernel.surface_of(face)
+    u_min, u_max, v_min, v_max = surface.uv_bounds()
+    _, normal = surface.normal(u_min + u * (u_max - u_min), v_min + v * (v_max - v_min))
     return Vector(normal).normalized()
 
 
 def _topods_face_center(face: TopoDS_Face) -> Vector:
     """The centre of mass of a face's area."""
-    properties = GProp_GProps()
-    BRepGProp.SurfaceProperties_s(face, properties)
-    return Vector(properties.CentreOfMass())
+    return Vector(kernel.center_of_mass(face, TopoKind.FACE))
 
 
 def _topods_point_on_face(
@@ -133,9 +115,7 @@ def _topods_point_on_face(
 ) -> bool:
     """Whether a point lies on a face, its boundary included, within a
     tolerance."""
-    classifier = BRepClass3d_SolidClassifier(face)
-    classifier.Perform(gp_Pnt(*Vector(point)), tolerance)
-    return classifier.IsOnAFace()
+    return kernel.point_on_face(face, tuple(Vector(point)), tolerance)
 
 
 def _make_topods_shell(faces: Iterable[TopoDS_Face]) -> TopoDS_Shell:
@@ -149,15 +129,11 @@ def _make_topods_shell(faces: Iterable[TopoDS_Face]) -> TopoDS_Shell:
     if not faces:
         raise ValueError("a shell needs at least one face")
     if len(faces) == 1:
-        shell = TopoDS_Shell()
-        builder = BRep_Builder()
-        builder.MakeShell(shell)
-        builder.Add(shell, faces[0])
-        return shell
+        return tcast(TopoDS_Shell, kernel.make_shell(faces))
     sewn = _sew_topods_faces(faces)
-    if not isinstance(sewn, TopoDS_Shell):
+    if not kernel.is_kind(sewn, TopoKind.SHELL):
         raise ValueError("the faces do not sew into one connected shell")
-    return sewn
+    return tcast(TopoDS_Shell, sewn)
 
 
 def _topods_material_side(face: TopoDS_Face, edge: TopoDS_Edge) -> Vector:
@@ -173,22 +149,20 @@ def _topods_material_side(face: TopoDS_Face, edge: TopoDS_Edge) -> Vector:
         ValueError: the edge is not an edge of the face
     """
     occurrence = None
-    explorer = TopExp_Explorer(face, TopAbs_ShapeEnum.TopAbs_EDGE)
-    while explorer.More():
-        if explorer.Current().IsSame(edge):
-            occurrence = TopoDS.Edge(explorer.Current())
+    for use in kernel.sub_shape_uses(face, TopoKind.EDGE):
+        if kernel.is_same(use, edge):
+            occurrence = tcast(TopoDS_Edge, downcast(use))
             break
-        if occurrence is None and explorer.Current().IsPartner(edge):
-            occurrence = TopoDS.Edge(explorer.Current())
-        explorer.Next()
+        if occurrence is None and kernel.is_partner(use, edge):
+            occurrence = tcast(TopoDS_Edge, downcast(use))
     if occurrence is None:
         raise ValueError("the edge is not an edge of the face")
-    curve = BRepAdaptor_Curve(occurrence)
-    point, tangent = gp_Pnt(), gp_Vec()
-    curve.D1((curve.FirstParameter() + curve.LastParameter()) / 2, point, tangent)
-    if occurrence.Orientation() == TopAbs_Orientation.TopAbs_REVERSED:
-        tangent.Reverse()
-    return _topods_face_normal_at(face, point).cross(Vector(tangent).normalized())
+    curve = kernel.curve_of(occurrence)
+    point, tangent_xyz = curve.d1((curve.first + curve.last) / 2)
+    tangent = Vector(tangent_xyz)
+    if kernel.is_reversed(occurrence):
+        tangent = -tangent
+    return _topods_face_normal_at(face, point).cross(tangent.normalized())
 
 
 def _extrude_topods_shape(obj: TopoDS_Shape, direction: VectorLike) -> TopoDS_Shape:
@@ -213,21 +187,18 @@ def _extrude_topods_shape(obj: TopoDS_Shape, direction: VectorLike) -> TopoDS_Sh
     """
     direction = Vector(direction)
 
-    if obj is None or not isinstance(
-        obj,
-        (TopoDS_Vertex, TopoDS_Edge, TopoDS_Wire, TopoDS_Face, TopoDS_Shell),
+    if obj is None or kernel.kind(obj) in (
+        TopoKind.COMPOUND,
+        TopoKind.COMPSOLID,
+        TopoKind.SOLID,
     ):
         raise ValueError(f"extrude not supported for {type(obj)}")
 
-    prism_builder = BRepPrimAPI_MakePrism(obj, direction.wrapped)
-    extrusion = downcast(prism_builder.Shape())
-    shape_type = extrusion.ShapeType()
-    if shape_type == TopAbs_ShapeEnum.TopAbs_COMPSOLID:
-        solids = []
-        explorer = TopExp_Explorer(extrusion, TopAbs_ShapeEnum.TopAbs_SOLID)
-        while explorer.More():
-            solids.append(downcast(explorer.Current()))
-            explorer.Next()
+    extrusion = kernel.extrude(obj, tuple(direction))
+    if kernel.is_kind(extrusion, TopoKind.COMPSOLID):
+        solids = [
+            downcast(solid) for solid in kernel.sub_shapes(extrusion, TopoKind.SOLID)
+        ]
         extrusion = _make_topods_compound_from_shapes(solids)
     return extrusion
 
@@ -256,15 +227,15 @@ def _make_loft(
     objs = list(objs)  # To determine its length
     if len(objs) < 2:
         raise ValueError("More than one wire is required")
-    vertices = [obj for obj in objs if isinstance(obj.wrapped, TopoDS_Vertex)]
+    vertices = [obj for obj in objs if kernel.is_kind(obj.wrapped, TopoKind.VERTEX)]
     vertex_count = len(vertices)
 
     if vertex_count > 2:
         raise ValueError("Only two vertices are allowed")
 
     if vertex_count == 1 and not (
-        isinstance(objs[0].wrapped, TopoDS_Vertex)
-        or isinstance(objs[-1].wrapped, TopoDS_Vertex)
+        kernel.is_kind(objs[0].wrapped, TopoKind.VERTEX)
+        or kernel.is_kind(objs[-1].wrapped, TopoKind.VERTEX)
     ):
         raise ValueError(
             "The vertex must be either at the beginning or end of the list"
@@ -276,24 +247,14 @@ def _make_loft(
                 "You can't have only 2 vertices to loft; try adding some wires"
             )
         if not (
-            isinstance(objs[0].wrapped, TopoDS_Vertex)
-            and isinstance(objs[-1].wrapped, TopoDS_Vertex)
+            kernel.is_kind(objs[0].wrapped, TopoKind.VERTEX)
+            and kernel.is_kind(objs[-1].wrapped, TopoKind.VERTEX)
         ):
             raise ValueError(
                 "The vertices must be at the beginning and end of the list"
             )
 
-    loft_builder = BRepOffsetAPI_ThruSections(filled, ruled)
-
-    for obj in objs:
-        if isinstance(obj.wrapped, TopoDS_Vertex):
-            loft_builder.AddVertex(obj.wrapped)
-        elif isinstance(obj.wrapped, TopoDS_Wire):
-            loft_builder.AddWire(obj.wrapped)
-
-    loft_builder.Build()
-
-    return loft_builder.Shape()
+    return kernel.loft([obj.wrapped for obj in objs], filled, ruled)
 
 
 def _make_topods_face_from_wires(
@@ -316,44 +277,7 @@ def _make_topods_face_from_wires(
     Returns:
         TopoDS_Face: planar face potentially with holes
     """
-    if inner_wires and not BRep_Tool.IsClosed_s(outer_wire):
-        raise ValueError("Cannot build face(s): outer wire is not closed")
-    inner_wires = list(inner_wires) if inner_wires else []
-
-    # check if wires are coplanar
-    verification_compound = _make_topods_compound_from_shapes(
-        [outer_wire] + inner_wires
-    )
-    if not BRepLib_FindSurface(verification_compound, OnlyPlane=True).Found():
-        raise ValueError("Cannot build face(s): wires not planar")
-
-    # fix outer wire
-    sf_s = ShapeFix_Shape(outer_wire)
-    sf_s.Perform()
-    topo_wire = TopoDS.Wire(sf_s.Shape())
-
-    face_builder = BRepBuilderAPI_MakeFace(topo_wire, True)
-
-    for inner_wire in inner_wires:
-        if not BRep_Tool.IsClosed_s(inner_wire):
-            raise ValueError("Cannot build face(s): inner wire is not closed")
-        sf_s = ShapeFix_Shape(inner_wire)
-        sf_s.Perform()
-        fixed_inner_wire = TopoDS.Wire(sf_s.Shape())
-        face_builder.Add(fixed_inner_wire)
-
-    face_builder.Build()
-
-    if not face_builder.IsDone():
-        raise ValueError(f"Cannot build face(s): {face_builder.Error()}")
-
-    face = face_builder.Face()
-
-    sf_f = ShapeFix_Face(face)
-    sf_f.FixOrientation()
-    sf_f.Perform()
-
-    return TopoDS.Face(sf_f.Result())
+    return kernel.make_planar_face(outer_wire, list(inner_wires) if inner_wires else [])
 
 
 def delta(shapes_one: Iterable[Shape], shapes_two: Iterable[Shape]) -> list[Shape]:
@@ -410,31 +334,24 @@ def new_edges(*objects: Shape, combined: Shape) -> ShapeList[Edge]:
         ShapeList[Edge]: new edges
     """
     # Create a list of combined object edges
-    combined_topo_edges = List_TopoDS_Shape()
-    for edge in combined.edges():
-        if not edge.is_empty:
-            combined_topo_edges.Append(edge.wrapped)
+    combined_topo_edges = [
+        edge.wrapped for edge in combined.edges() if not edge.is_empty
+    ]
 
     # Create a list of original object edges
-    original_topo_edges = List_TopoDS_Shape()
-    for edge in [e for obj in objects for e in obj.edges()]:
-        if not edge.is_empty:
-            original_topo_edges.Append(edge.wrapped)
+    original_topo_edges = [
+        edge.wrapped
+        for edge in [e for obj in objects for e in obj.edges()]
+        if not edge.is_empty
+    ]
 
     # Cut the original edges from the combined edges
-    operation = BRepAlgoAPI_Cut()
-    operation.SetArguments(combined_topo_edges)
-    operation.SetTools(original_topo_edges)
-    operation.SetRunParallel(True)
-    operation.Build()
-
+    cut_result, _ = kernel.boolean(BoolOp.CUT, combined_topo_edges, original_topo_edges)
     edges = []
-    explorer = TopExp_Explorer(operation.Shape(), TopAbs_ShapeEnum.TopAbs_EDGE)
-    while explorer.More():
-        found_edge = combined.__class__.cast(downcast(explorer.Current()))
+    for topods_edge in kernel.sub_shapes(cut_result, TopoKind.EDGE):
+        found_edge = combined.__class__.cast(downcast(topods_edge))
         found_edge.topo_parent = combined
         edges.append(found_edge)
-        explorer.Next()
 
     return ShapeList(edges)
 
@@ -455,9 +372,9 @@ def tuplify(obj: Any, dim: int) -> tuple | None:
     return result
 
 
-def unwrapped_shapetype(obj: Shape) -> TopAbs_ShapeEnum:
-    """Return Shape's TopAbs_ShapeEnum"""
-    if isinstance(obj.wrapped, TopoDS_Compound):
+def unwrapped_shapetype(obj: Shape) -> TopoKind:
+    """The kind of a Shape, or of its members when it is a compound of one kind"""
+    if kernel.is_kind(obj.wrapped, TopoKind.COMPOUND):
         shapetypes = {shapetype(o.wrapped) for o in obj}
         if len(shapetypes) == 1:
             result = shapetypes.pop()

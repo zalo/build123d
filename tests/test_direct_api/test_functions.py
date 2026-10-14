@@ -48,7 +48,7 @@ from build123d.topology.utils import (
     _make_topods_face_from_wires,
     unwrapped_shapetype,
 )
-from OCP.TopAbs import TopAbs_ShapeEnum
+from build123d.kernel import TopoKind
 
 
 class TestFunctions(unittest.TestCase):
@@ -133,7 +133,7 @@ class TestMakeTopodsFaceFromWires(unittest.TestCase):
         face_builder.IsDone.return_value = False
         face_builder.Error.return_value = 3
         with patch(
-            "build123d.topology.utils.BRepBuilderAPI_MakeFace",
+            "build123d.kernel.occt.BRepBuilderAPI_MakeFace",
             return_value=face_builder,
         ):
             with self.assertRaisesRegex(ValueError, "Cannot build face"):
@@ -142,19 +142,15 @@ class TestMakeTopodsFaceFromWires(unittest.TestCase):
 
 class TestUnwrappedShapetype(unittest.TestCase):
     def test_single_shape(self):
-        self.assertEqual(
-            unwrapped_shapetype(Box(1, 1, 1).solid()), TopAbs_ShapeEnum.TopAbs_SOLID
-        )
+        self.assertEqual(unwrapped_shapetype(Box(1, 1, 1).solid()), TopoKind.SOLID)
 
     def test_uniform_compound(self):
         compound = Compound([Box(1, 1, 1).solid(), Box(2, 2, 2).solid()])
-        self.assertEqual(unwrapped_shapetype(compound), TopAbs_ShapeEnum.TopAbs_SOLID)
+        self.assertEqual(unwrapped_shapetype(compound), TopoKind.SOLID)
 
     def test_mixed_compound(self):
         compound = Compound([Box(1, 1, 1).solid(), Edge.make_line((5, 0), (6, 0))])
-        self.assertEqual(
-            unwrapped_shapetype(compound), TopAbs_ShapeEnum.TopAbs_COMPOUND
-        )
+        self.assertEqual(unwrapped_shapetype(compound), TopoKind.COMPOUND)
 
 
 if __name__ == "__main__":

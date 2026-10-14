@@ -255,9 +255,7 @@ class TestEdge(unittest.TestCase):
     def test_make_spline_failure(self):
         builder = MagicMock()
         builder.IsDone.return_value = False
-        with patch(
-            "build123d.topology.one_d.GeomAPI_Interpolate", return_value=builder
-        ):
+        with patch("build123d.kernel.occt.GeomAPI_Interpolate", return_value=builder):
             with self.assertRaisesRegex(ValueError, "B-spline interpolation failed"):
                 Edge.make_spline([(0, 0), (1, 1), (2, 0)])
 
@@ -265,7 +263,7 @@ class TestEdge(unittest.TestCase):
         builder = MagicMock()
         builder.IsDone.return_value = False
         with patch(
-            "build123d.topology.one_d.GeomAPI_PointsToBSpline", return_value=builder
+            "build123d.kernel.occt.GeomAPI_PointsToBSpline", return_value=builder
         ):
             with self.assertRaisesRegex(ValueError, "B-spline approximation failed"):
                 Edge.make_spline_approx([(0, 0), (1, 1), (2, 0)])
@@ -644,7 +642,7 @@ class TestEdgeParamAt(unittest.TestCase):
         projector.LowerDistanceParameter.return_value = 0.0
         edge = Edge.make_line((0, 0), (10, 0))
         with patch(
-            "build123d.topology.one_d.GeomAPI_ProjectPointOnCurve",
+            "build123d.kernel.occt.GeomAPI_ProjectPointOnCurve",
             return_value=projector,
         ):
             self.assertAlmostEqual(edge.param_at_point((7, 0, 0)), 0.7, 6)
@@ -658,7 +656,7 @@ class TestEdgeParamAt(unittest.TestCase):
         edge = Edge.make_line((0, 0), (10, 0))
         with (
             patch(
-                "build123d.topology.one_d.GeomAPI_ProjectPointOnCurve",
+                "build123d.kernel.occt.GeomAPI_ProjectPointOnCurve",
                 return_value=projector,
             ),
             patch("build123d.topology.one_d.minimize_scalar", return_value=result),

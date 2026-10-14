@@ -161,7 +161,7 @@ class TestShapeHistory(unittest.TestCase):
         self.assertFalse(
             ShapeHistory.from_relocation(
                 self.box.wrapped, self.box.wrapped
-            ).wrapped.HasModified()
+            ).has_modified()
         )
 
     def test_merge_returns_self_and_tolerates_none(self):

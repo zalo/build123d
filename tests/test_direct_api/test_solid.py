@@ -48,7 +48,7 @@ from build123d.topology import (
     Vertex,
     Wire,
 )
-import build123d
+from build123d.kernel import occt as kernel_occt
 from OCP.BRepOffsetAPI import BRepOffsetAPI_DraftAngle
 from OCP.StdFail import StdFail_NotDone
 from OCP.TopAbs import TopAbs_Orientation
@@ -393,7 +393,7 @@ class TestSolidThicken(unittest.TestCase):
         offset_builder = MagicMock()
         offset_builder.Shape.side_effect = StdFail_NotDone("not done")
         with patch(
-            "build123d.topology.three_d.BRepOffset_MakeOffset",
+            "build123d.kernel.occt.BRepOffset_MakeOffset",
             return_value=offset_builder,
         ):
             with self.assertRaisesRegex(RuntimeError, "Error applying thicken"):
@@ -406,7 +406,7 @@ class TestSolidThicken(unittest.TestCase):
         builder.Shape.return_value = TopoDS_Shape()
         box = Solid.make_box(1, 1, 1)
         with patch(
-            "build123d.topology.three_d.BRepOffsetAPI_MakeThickSolid",
+            "build123d.kernel.occt.BRepOffsetAPI_MakeThickSolid",
             return_value=builder,
         ):
             with self.assertRaisesRegex(RuntimeError, "offset Error"):
@@ -414,7 +414,7 @@ class TestSolidThicken(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "hollow Error"):
                 box.hollow([], -0.1)
         with patch(
-            "build123d.topology.three_d.BRepOffset_MakeOffset",
+            "build123d.kernel.occt.BRepOffset_MakeOffset",
             return_value=builder,
         ):
             with self.assertRaisesRegex(RuntimeError, "Error applying thicken"):
@@ -444,7 +444,7 @@ class TestSolidDraft(unittest.TestCase):
             torus.draft([torus.faces()[0]], self.neutral_plane, 5)
         self.assertIn("unsupported geometry type", str(cm.exception))
 
-    @patch("build123d.topology.three_d.BRepOffsetAPI_DraftAngle")
+    @patch("build123d.kernel.occt.BRepOffsetAPI_DraftAngle")
     def test_adddone_failure_raises_draftangleerror(self, mock_draft_api):
         """Test that failure of AddDone() raises DraftAngleError"""
         mock_builder = MagicMock()
@@ -459,7 +459,7 @@ class TestSolidDraft(unittest.TestCase):
         self.assertIn("Draft could not be added", str(cm.exception))
 
     @patch.object(
-        build123d.topology.three_d.BRepOffsetAPI_DraftAngle,
+        kernel_occt.BRepOffsetAPI_DraftAngle,
         "Build",
         side_effect=StdFail_NotDone,
     )

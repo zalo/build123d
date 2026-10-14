@@ -33,7 +33,7 @@ from random import uniform
 from unittest.mock import PropertyMock, patch
 
 import numpy as np
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Cut, BRepAlgoAPI_Fuse
+from build123d.kernel import BoolOp, kernel
 from anytree import PreOrderIter
 from build123d.build_enums import CenterOf, GeomType, Keep, Transition
 from build123d.geometry import (
@@ -408,7 +408,7 @@ class TestShape(unittest.TestCase):
         box2 = Solid.make_box(1, 1, 1, Plane((2, 0, 0)))
         zero = Solid()
 
-        result = box1._bool_op((box1, box2), (zero,), BRepAlgoAPI_Cut())
+        result = box1._bool_op((box1, box2), (zero,), BoolOp.CUT)
         self.assertTrue(isinstance(result, Part))
         self.assertTrue(result.is_valid)
         self.assertEqual(len(result.solids()), 2)
@@ -419,7 +419,7 @@ class TestShape(unittest.TestCase):
         box2 = Solid.make_box(1, 1, 1, Plane((2, 0, 0)))
         zero = Solid()
 
-        result = box1._bool_op((box1, box2), (zero,), BRepAlgoAPI_Fuse())
+        result = box1._bool_op((box1, box2), (zero,), BoolOp.FUSE)
         self.assertTrue(isinstance(result, Part))
         self.assertTrue(result.is_valid)
         self.assertEqual(len(result.solids()), 2)
@@ -430,7 +430,7 @@ class TestShape(unittest.TestCase):
         box2 = Solid.make_box(1, 1, 1, Plane((2, 0, 0)))
         zero = Solid()
 
-        result = box1._bool_op((zero,), (box1, box2), BRepAlgoAPI_Fuse())
+        result = box1._bool_op((zero,), (box1, box2), BoolOp.FUSE)
         self.assertTrue(isinstance(result, Part))
         self.assertTrue(result.is_valid)
         self.assertEqual(len(result.solids()), 2)
@@ -763,12 +763,12 @@ class TestShape(unittest.TestCase):
         root_2o2 = math.sqrt(2) / 2
         self.assertAlmostEqual(rotated_line @ 0, (1 - root_2o2, -root_2o2))
         self.assertAlmostEqual(rotated_line @ 1, (1, 0))
-        self.assertTrue(line.wrapped.IsPartner(rotated_line.wrapped))
+        self.assertTrue(kernel.is_partner(line.wrapped, rotated_line.wrapped))
 
         rotated_line = line.rotate(Axis((1, 0, 0), (0, 0, 1)), 45, transform=True)
         self.assertAlmostEqual(rotated_line @ 0, (1 - root_2o2, -root_2o2))
         self.assertAlmostEqual(rotated_line @ 1, (1, 0))
-        self.assertFalse(line.wrapped.IsPartner(rotated_line.wrapped))
+        self.assertFalse(kernel.is_partner(line.wrapped, rotated_line.wrapped))
 
         rotated_empty = Edge().rotate(Axis((1, 0, 0), (0, 0, 1)), 45)
         self.assertTrue(rotated_empty.is_empty)
@@ -778,12 +778,12 @@ class TestShape(unittest.TestCase):
         translated_line = line.translate((0, 1, 0))
         self.assertAlmostEqual(translated_line @ 0, (0, 1, 0))
         self.assertAlmostEqual(translated_line @ 1, (1, 1, 0))
-        self.assertTrue(line.wrapped.IsPartner(translated_line.wrapped))
+        self.assertTrue(kernel.is_partner(line.wrapped, translated_line.wrapped))
 
         translated_line = line.translate((0, 1, 0), transform=True)
         self.assertAlmostEqual(translated_line @ 0, (0, 1, 0))
         self.assertAlmostEqual(translated_line @ 1, (1, 1, 0))
-        self.assertFalse(line.wrapped.IsPartner(translated_line.wrapped))
+        self.assertFalse(kernel.is_partner(line.wrapped, translated_line.wrapped))
 
         translated_empty = Edge().translate((0, 1, 0))
         self.assertTrue(translated_empty.is_empty)
@@ -890,19 +890,9 @@ class TestShapeCast(unittest.TestCase):
             Shape.shape_constructors.update(registered)
 
     def test_registry_covers_every_wrapped_type(self):
-        import OCP.TopAbs as ta
+        from build123d.kernel import TopoKind
 
-        expected = {
-            ta.TopAbs_VERTEX,
-            ta.TopAbs_EDGE,
-            ta.TopAbs_WIRE,
-            ta.TopAbs_FACE,
-            ta.TopAbs_SHELL,
-            ta.TopAbs_SOLID,
-            ta.TopAbs_COMPOUND,
-            ta.TopAbs_COMPSOLID,
-        }
-        self.assertEqual(set(Shape.shape_constructors), expected)
+        self.assertEqual(set(Shape.shape_constructors), set(TopoKind))
 
 
 class TestTransformShape(unittest.TestCase):

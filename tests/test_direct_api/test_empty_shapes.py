@@ -30,7 +30,6 @@ import pickle
 import tempfile
 import unittest
 
-from OCP.BRepAlgoAPI import BRepAlgoAPI_Common
 from OCP.TopoDS import TopoDS_Compound
 
 from build123d.build_enums import Keep, Mode
@@ -38,6 +37,7 @@ from build123d.build_line import BuildLine
 from build123d.build_part import BuildPart
 from build123d.build_sketch import BuildSketch
 from build123d.geometry import Axis, Location, Plane, Pos, Vector
+from build123d.kernel import BoolOp
 from build123d.objects_part import Box
 from build123d.objects_sketch import Rectangle
 from build123d.operations_generic import (
@@ -322,12 +322,8 @@ class TestEmptyShapeAlgebra(unittest.TestCase):
         # intersect() never reaches the kernel with an empty operand, but the
         # generic boolean does the same on its own
         face = Face.make_rect(1, 1)
-        self.assertEqual(
-            face._bool_op_list((face,), (Face(),), BRepAlgoAPI_Common()), []
-        )
-        self.assertEqual(
-            face._bool_op_list((Face(),), (face,), BRepAlgoAPI_Common()), []
-        )
+        self.assertEqual(face._bool_op_list((face,), (Face(),), BoolOp.COMMON), [])
+        self.assertEqual(face._bool_op_list((Face(),), (face,), BoolOp.COMMON), [])
 
     def test_intersect_finds_nothing_as_an_empty_list(self):
         box = Solid.make_box(1, 1, 1)

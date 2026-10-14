@@ -168,7 +168,7 @@ class TestMixin1D(unittest.TestCase):
     def test_positions_deflection_failure(self):
         e = Edge.make_circle(1.0)
 
-        with patch("build123d.topology.one_d.GCPnts_UniformDeflection") as MockDefl:
+        with patch("build123d.kernel.occt.GCPnts_UniformDeflection") as MockDefl:
             instance = MockDefl.return_value
             instance.IsDone.return_value = False
             instance.NbPoints.return_value = 0
@@ -476,7 +476,7 @@ class TestMixin1D(unittest.TestCase):
 
     def test_offset_2d_builder_failure(self):
         """Verify that OCCT offset failures are reported before reading Shape()."""
-        with patch("build123d.topology.one_d.BRepOffsetAPI_MakeOffset") as builder:
+        with patch("build123d.kernel.occt.BRepOffsetAPI_MakeOffset") as builder:
             offset_builder = builder.return_value
             offset_builder.IsDone.return_value = False
             offset_builder.Shape.side_effect = ValueError("Null TopoDS_Shape object")
