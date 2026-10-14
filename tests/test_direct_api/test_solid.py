@@ -406,7 +406,7 @@ class TestSolidThicken(unittest.TestCase):
         builder.Shape.return_value = TopoDS_Shape()
         box = Solid.make_box(1, 1, 1)
         with patch(
-            "build123d.topology.three_d.BRepOffsetAPI_MakeThickSolid",
+            "build123d.kernel.occt.BRepOffsetAPI_MakeThickSolid",
             return_value=builder,
         ):
             with self.assertRaisesRegex(RuntimeError, "offset Error"):
@@ -414,7 +414,7 @@ class TestSolidThicken(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "hollow Error"):
                 box.hollow([], -0.1)
         with patch(
-            "build123d.topology.three_d.BRepOffset_MakeOffset",
+            "build123d.kernel.occt.BRepOffset_MakeOffset",
             return_value=builder,
         ):
             with self.assertRaisesRegex(RuntimeError, "Error applying thicken"):
