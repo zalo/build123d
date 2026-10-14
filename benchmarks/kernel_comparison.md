@@ -1,6 +1,6 @@
 # Kernel speed comparison: OCCT vs SMLib (smcore backend)
 
-Measured with `benchmarks/bench_kernels.py` on 2026-10-13 (fourth run, commit 4c5201cc), branch `kernel-smlib`,
+Measured with `benchmarks/bench_kernels.py` on 2026-10-13 (fifth run, after commit 396e2dba), branch `kernel-smlib`,
 same machine, 7 repeats per operation, median wall time in milliseconds. Each
 operation runs through the build123d API with the kernel selected by
 `BUILD123D_KERNEL` (`occt`, or `smcore` for the SMLib backend over the
@@ -16,43 +16,46 @@ count rounded to 4 places).
 
 | Operation | OCCT ms | SMLib ms | SMLib / OCCT | Same result |
 |---|---:|---:|---:|---|
-| box | 0.10 | 1.42 | 14.19 | yes |
-| sphere | 0.07 | 1.14 | 15.60 | yes |
-| cylinder | 0.07 | 2.48 | 33.54 | yes |
-| box volume | 0.08 | 0.32 | 3.83 | yes |
-| sphere volume | 0.07 | 17.26 | 230.15 | yes |
-| sphere area | 0.07 | 16.53 | 236.14 | yes |
-| box bounding box | 0.01 | 0.02 | 1.07 | yes |
-| box faces/edges/vertices | 0.18 | 0.10 | 0.55 | yes |
-| fuse box+cylinder | 4.70 | 4.70 | 1.00 | yes |
-| cut box-cylinder | 3.43 | 7.30 | 2.13 | yes |
-| common box&sphere | 4.64 | 7.65 | 1.65 | no (1748.8199 vs 1748.82) |
-| cut box-sphere | 4.74 | 8.24 | 1.74 | no (4251.1801 vs 4251.18) |
-| fuse 8 boxes | 45.64 | 21.58 | 0.47 | yes |
-| fillet box edges | 10.84 | 15.25 | 1.41 | yes |
-| chamfer box edges | 11.32 | 10.27 | 0.91 | yes |
-| fillet cylinder edges | 2.53 | 5.36 | 2.12 | yes |
-| sketch fuse rect+circle | 1.37 | 2.89 | 2.11 | yes |
-| sketch cut rect-circle | 0.97 | 2.04 | 2.10 | yes |
-| rect fillet 2d | 10.40 | 10.23 | 0.98 | yes |
-| rect offset 2d | 1.76 | 3.86 | 2.19 | yes |
-| polygon face | 0.21 | 0.39 | 1.86 | yes |
-| extrude | 0.29 | 2.17 | 7.50 | yes |
-| revolve | 0.38 | 2.94 | 7.85 | yes |
-| loft | 2.73 | 26.00 | 9.53 | no (3961.4835 vs 3966.3515) |
-| sweep | 1.61 | 39.43 | 24.55 | no (383.1496 vs 383.1497) |
-| helix | 0.09 | 0.08 | 0.87 | yes |
-| spline | 0.03 | 0.06 | 1.97 | yes |
-| offset solid | 6.29 | 28.53 | 4.53 | yes |
-| split box | 2.40 | 7.70 | 3.20 | yes |
-| shell box | 4.68 | 4.47 | 0.96 | yes |
-| tessellate sphere | 41.69 | 112.03 | 2.69 | yes |
-| distance box-sphere | 0.53 | 0.74 | 1.39 | yes |
-| point in solid | 0.04 | 0.01 | 0.24 | yes |
-| edge positions | 0.61 | 11.36 | 18.56 | yes |
-| face normal | 0.05 | 0.03 | 0.52 | yes |
-| deepcopy | 0.07 | 0.03 | 0.45 | yes |
-| move/rotate | 0.07 | 0.10 | 1.36 | yes |
+| box | 0.10 | 1.35 | 14.18 | yes |
+| sphere | 0.07 | 1.11 | 14.96 | yes |
+| cylinder | 0.07 | 2.38 | 34.00 | yes |
+| box volume | 0.08 | 0.32 | 4.25 | yes |
+| sphere volume | 0.07 | 15.52 | 218.63 | yes |
+| sphere area | 0.07 | 15.50 | 234.79 | yes |
+| box bounding box | 0.01 | 0.01 | 1.07 | yes |
+| box faces/edges/vertices | 0.17 | 0.09 | 0.52 | yes |
+| fuse box+cylinder | 3.14 | 2.58 | 0.82 | yes |
+| cut box-cylinder | 2.44 | 2.94 | 1.21 | yes |
+| common box&sphere | 3.02 | 5.29 | 1.75 | no (1748.8199 vs 1748.82) |
+| cut box-sphere | 3.18 | 5.60 | 1.76 | no (4251.1801 vs 4251.18) |
+| cut box-sphere no history | 3.12 | 5.55 | 1.78 | no (4251.1801 vs 4251.18) |
+| cut box-sphere no history no clean | 2.95 | 4.70 | 1.59 | no (4251.1801 vs 4251.18) |
+| fuse box+cylinder no history | 2.97 | 2.40 | 0.81 | yes |
+| fuse 8 boxes | 35.19 | 11.94 | 0.34 | yes |
+| fillet box edges | 10.08 | 14.58 | 1.45 | yes |
+| chamfer box edges | 10.89 | 10.13 | 0.93 | yes |
+| fillet cylinder edges | 2.50 | 5.27 | 2.11 | yes |
+| sketch fuse rect+circle | 1.52 | 2.08 | 1.37 | yes |
+| sketch cut rect-circle | 0.77 | 1.08 | 1.41 | yes |
+| rect fillet 2d | 8.98 | 9.13 | 1.02 | yes |
+| rect offset 2d | 1.57 | 3.75 | 2.40 | yes |
+| polygon face | 0.19 | 0.38 | 2.01 | yes |
+| extrude | 0.25 | 2.06 | 8.22 | yes |
+| revolve | 0.33 | 2.79 | 8.60 | yes |
+| loft | 2.40 | 24.85 | 10.34 | no (3961.4835 vs 3966.3515) |
+| sweep | 1.39 | 38.84 | 27.90 | no (383.1496 vs 383.1497) |
+| helix | 0.08 | 0.08 | 0.93 | yes |
+| spline | 0.03 | 0.05 | 1.82 | yes |
+| offset solid | 5.31 | 27.27 | 5.13 | yes |
+| split box | 1.44 | 5.80 | 4.02 | yes |
+| shell box | 2.81 | 4.32 | 1.54 | yes |
+| tessellate sphere | 37.97 | 100.75 | 2.65 | yes |
+| distance box-sphere | 0.47 | 0.67 | 1.44 | yes |
+| point in solid | 0.04 | 0.01 | 0.27 | yes |
+| edge positions | 0.55 | 10.37 | 18.92 | yes |
+| face normal | 0.04 | 0.03 | 0.57 | yes |
+| deepcopy | 0.06 | 0.03 | 0.47 | yes |
+| move/rotate | 0.07 | 0.10 | 1.39 | yes |
 
 ## Against smlibpy (another Python layer over the same SMLib kernel)
 
@@ -123,6 +126,44 @@ How to read it:
 - Its spline is a different curve type (length 22.36 against 23.84 for the
   interpolating spline), so that row compares construction cost only.
 
+## Where the time of a boolean goes, and the history switch
+
+A stage-by-stage timing of `box - sphere` on the SMLib backend (fourth run
+code, then the fifth):
+
+| Stage | Fourth run ms | Fifth run ms |
+|---|---:|---:|
+| kernel merge (`SmMerge.ManifoldBoolean`) | 5.0 | 4.5 |
+| bounding boxes of the operands and the result | 1.4 | 0.02 |
+| record of what each input face, edge and vertex became | 1.0 | 0.2 |
+| copies of the operands (the merge consumes its inputs) | 0.15 | 0.15 |
+| clean (`unify_same_domain`) | 0.7 | 0.7 |
+| whole operation through build123d | 7.9 | 5.7 |
+
+- The bounding boxes were the tight ones, which SMLib computes afresh for
+  every body (0.4 ms for a sphere, 1 ms for a cylinder, 2.3 ms for a
+  filleted box); they only decide which bodies may touch, so the loose
+  control-polygon box (microseconds) does now.
+- The record was built by geometry: every input face, edge and vertex was
+  dropped onto every result entity. The kernel can carry it instead: an
+  `SmLongAttribute` on each entity of the working copy survives the merge,
+  is copied onto both pieces of a split entity and kept on a trimmed one,
+  and a new entity carries none. Reading the tags off the result is one
+  pass. Inputs left without a tagged survivor (a face merged into a
+  coplanar one keeps one tag only) still go through the geometric match.
+- `SkipHistory` (next to `SkipClean` in `build123d.topology`) switches the
+  record off for the booleans inside it: results then carry no history,
+  `Select.LAST`/`Select.NEW` raise on them, and a builder answers by
+  identity (everything not there before is new). With the tags it saves
+  about 0.2 ms per boolean on SMLib and nothing on OCCT, whose algorithms
+  keep their history whether or not it is read. Together with `SkipClean`
+  the SMLib cut of a box by a cylinder drops from 3.3 ms to 1.8 ms, under
+  OCCT's 2.6 ms; the remaining time is the kernel merge.
+- Invalidating the operands instead of copying them would save the 0.15 ms
+  of the copies and leave the Python objects holding consumed bodies (the
+  kernel frees them), which is how the earlier worker crashes came about;
+  it is not worth a switch.
+
 ## Reading the numbers
 
 - Fourth run: primitives and extrusions got slower (box 0.4 to 1.4 ms, extrude
@@ -142,9 +183,11 @@ How to read it:
   at the accuracy the tests need; a body with trimmed pole-bearing patches
   still falls back to that integrator (~300 ms for a box with all edges
   filleted).
-- Booleans are 1.3-2.5x slower one at a time but fusing many disjoint bodies
-  is 2x faster (bodies that do not touch are kept apart and merged only with
-  what they overlap).
+- Booleans with a sphere are 1.8x slower, box with cylinder on par (fuse) to
+  1.2x (cut); fusing many bodies is 3x faster (bodies that do not touch are
+  kept apart and merged only with what they overlap). The fifth run took the
+  bounding boxes and the geometric history matching out of every boolean,
+  see the section above; the rest is the kernel merge and the clean.
 - Fillets and chamfers are on par; 2D fillets, offsets, polygon faces,
   traversal, copying and point classification are faster on SMLib.
 - Sweeps, revolves, solid offsets and splits are 2-28x slower; the sweep
@@ -162,4 +205,5 @@ How to read it:
 | 2026-10-13 (first run) | baseline after the transform/boolean-history work | fillet 12 box edges 3.0 s, sphere volume 148 ms, offset solid 117 ms |
 | 2026-10-13 (second run) | cheap face hashing, face-wise mass properties, inside-out check, length cache | fillet 15 ms, sphere volume 4 ms, offset 27 ms |
 | 2026-10-13 (third run) | pole-graded quadrature, uv-loop integration, cornered sweeps | sphere volume 16 ms (exact to 1e-11), chamfer on par, split 5 ms |
+| 2026-10-13 (fifth run) | loose bounding boxes for the touch test, boolean history from kernel attributes instead of geometry matching, `SkipHistory` switch | cut box-sphere 8.2 to 5.6 ms, cut box-cylinder 7.3 to 2.9 ms, fuse 8 boxes 21.6 to 11.9 ms (3x faster than OCCT) |
 | 2026-10-13 (fourth run) | OCCT-style planar frames (faces reframed on explicit planes), NURBS line segments, compatible-wire lofts, mitred sweeps, clean merging faces and edges | box 1.4 ms and extrude 2.2 ms (reframing cost), sketch booleans 2x slower, loft 26 ms through the compatible path, fuse box+cylinder on par |

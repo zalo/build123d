@@ -2040,7 +2040,9 @@ class OcctKernel(_OcctGeometry, Kernel):
         *,
         glue: bool = False,
         fuzzy: float | None = None,
+        history: bool = True,  # pylint: disable=unused-argument
     ) -> tuple[TopoDS_Shape, Any]:
+        # the algorithm keeps its history whether or not it is read
         operation: Any = _BOOLEAN_ALGORITHMS[op]()  # Set* live on the subclasses
         if glue:
             operation.SetGlue(BOPAlgo_GlueEnum.BOPAlgo_GlueShift)

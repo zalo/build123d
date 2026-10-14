@@ -15,10 +15,16 @@ suite and from direct probes of the two kernels.
   0.01 ms against OCCT's 0.04 ms, and the topology solvers (point, curve and
   body against body) were reliable across every pairing tried. The one solver
   mode that refuses curves lying on each other has a sampled fallback.
-- **Fusing many bodies.** Fusing 8 boxes onto a plate runs 2x faster than
-  OCCT (16 ms vs 35 ms), and ring compounds of 20 boxes fuse correctly once
+- **Fusing many bodies.** Fusing 8 boxes onto a plate runs 3x faster than
+  OCCT (12 ms vs 35 ms), and ring compounds of 20 boxes fuse correctly once
   bodies that do not touch are kept apart. The merge is quick on simple
   operands.
+- **Attributes that ride through operations.** An `SmLongAttribute` put on a
+  face, edge or vertex survives copies and merges: a trimmed entity keeps
+  it, a split one passes it to both pieces, a new one has none. That is a
+  boolean history for the price of one pass over the result, where the
+  backend used to match every input against every result entity by
+  geometry.
 - **Imprint and non-manifold merge.** `SM_BO_IMPRINT` gives a crash-free
   section tool and `SM_BO_MERGE` a general splitter: splitting a solid by any
   closed sheet falls out of the region structure. OCCT needs

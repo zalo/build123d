@@ -13,6 +13,7 @@ import time
 
 from build123d import *  # noqa: F401,F403
 from build123d.kernel import kernel
+from build123d.topology import SkipClean, SkipHistory
 
 REPEATS = int(sys.argv[1]) if len(sys.argv) > 1 else 7
 
@@ -41,6 +42,16 @@ def vol(s):
     return round(s.volume, 4)
 
 
+def no_history(fn, clean=True):
+    """``fn()`` with the record of the operation switched off (and the
+    clean, when ``clean`` is False)."""
+    with SkipHistory():
+        if clean:
+            return fn()
+        with SkipClean():
+            return fn()
+
+
 def area(s):
     return round(s.area, 4)
 
@@ -64,6 +75,9 @@ def main():
     bench("cut box-cylinder", lambda: box - cyl, vol)
     bench("common box&sphere", lambda: box & sphere, vol)
     bench("cut box-sphere", lambda: box - sphere, vol)
+    bench("cut box-sphere no history", lambda: no_history(lambda: box - sphere), vol)
+    bench("cut box-sphere no history no clean", lambda: no_history(lambda: box - sphere, clean=False), vol)
+    bench("fuse box+cylinder no history", lambda: no_history(lambda: box + cyl), vol)
     bench("fuse 8 boxes", lambda: Compound(GridLocations(8, 8, 2, 4) * Box(10, 10, 10)) + Box(60, 60, 2), vol)
 
     bench("fillet box edges", lambda: fillet(box.edges(), 2), vol)

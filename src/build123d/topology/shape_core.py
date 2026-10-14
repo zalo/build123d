@@ -2656,22 +2656,26 @@ class Shape(NodeMixin, Generic[TOPODS]):
                 )
 
         # An empty record means every input sub-shape came through untouched,
-        # which is what the shortcuts above produce
-        history = ShapeHistory(before=before, brought=brought)
+        # which is what the shortcuts above produce. Inside SkipHistory no
+        # record is kept at all: the result does not know how it was made.
+        track = SkipHistory.record
+        history = ShapeHistory(before=before, brought=brought) if track else None
         if topo_result is None:
             topo_result, record = kernel.boolean(
-                operation, before, brought, glue=glue, fuzzy=fuzzy
+                operation, before, brought, glue=glue, fuzzy=fuzzy, history=track
             )
             if kernel.is_null(topo_result):
                 raise ValueError("Null TopoDS_Shape object")
-            history = ShapeHistory(record, before, brought)
+            if track:
+                history = ShapeHistory(record, before, brought)
 
         # Clean
         if SkipClean.clean:
             # see Shape.clean: OCP gives OCCT failures no common base class
             try:
                 topo_result, record = kernel.unify_same_domain(topo_result)
-                history.merge(ShapeHistory(record))
+                if history is not None:
+                    history.merge(ShapeHistory(record))
             except Exception:  # pylint: disable=broad-exception-caught
                 warnings.warn("Boolean operation unable to clean", stacklevel=2)
 
@@ -3802,6 +3806,30 @@ class SkipClean:
 
     def __exit__(self, exception_type, exception_value, traceback):
         SkipClean.clean = True
+
+
+class SkipHistory:
+    """Skip the record of what a boolean operation did to its inputs.
+
+    Results made inside this context carry no history, so ``Select.LAST``
+    and ``Select.NEW`` cannot be asked of them (``Select.ALL`` works as
+    ever) and in a builder every sub-shape not identical to one from before
+    counts as new. A kernel that has to work to keep the record (SMLib
+    matches every input face, edge and vertex against the result by
+    geometry, which costs about as much as a simple merge) skips that work;
+    on OCCT, where the algorithm keeps its history anyway, only the Python
+    bookkeeping is saved. Also usable as a global switch:
+    ``SkipHistory.record = False``.
+    """
+
+    record = True
+    # ---- Instance Methods ----
+
+    def __enter__(self):
+        SkipHistory.record = False
+
+    def __exit__(self, exception_type, exception_value, traceback):
+        SkipHistory.record = True
 
 
 def _faces_of(result: Shape | Iterable[Shape] | None) -> ShapeList[Face]:

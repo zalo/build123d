@@ -1246,12 +1246,16 @@ class Kernel(KernelGeometry):
         *,
         glue: bool = False,
         fuzzy: float | None = None,
+        history: bool = True,
     ) -> tuple[Handle, Any]:
         """Run ``op`` with ``tools`` against ``args``.
 
         Returns the result and the backend's record of what the operation
         generated and modified (opaque; consumed by ``topology.history``).
         ``glue`` speeds up shapes that only touch; ``fuzzy`` is a merge tolerance.
+        With ``history`` False the caller will not read the record, and a
+        backend that has to work to keep one may hand back an empty record
+        instead (``SkipHistory`` asks for this).
         """
 
     # ---- operation records ----------------------------------------------------

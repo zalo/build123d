@@ -318,6 +318,7 @@ def _first_last(items: list) -> list:
 
 
 _PLANE_MARGIN = 1.0  # a plane's domain reaches this many face extents beyond it
+_HISTORY_TAG = 0x6B31  # id of the attribute that names an input sub-shape on its copy
 _partner_ids = itertools.count(1)
 _DROPPED = object()  # marks an offset edge used up at a corner
 
@@ -406,6 +407,7 @@ class _Record:
         self.modified: dict[Hashable, list[SmHandle]] = {}
         self.removed: set[Hashable] = set()
         self.result: SmHandle | None = None
+        self.tags: list[SmHandle] = []  # input sub-shapes by the tag their copies carry
 
 
 class SmCurveView(CurveView):
@@ -2234,22 +2236,28 @@ class SmlibCoreKernel(Kernel):
             return [SmHandle(TopoKind.SHELL, brep)]
         raise ValueError(f"booleans need solids, got a {shape.kind.name}")
 
-    def _tracked_copy(self, shape: SmHandle, record: _Record) -> Any:
+    def _tracked_copy(self, shape: SmHandle, record: _Record, tag: bool = False) -> Any:
         """A working copy of a body whose entities are recorded as what the
-        input's entities became."""
+        input's entities became.
+
+        With ``tag`` every face, edge and vertex of the copy also carries an
+        attribute naming its input sub-shape: the kernel copies attributes
+        onto the pieces an entity is split into and keeps them on the
+        entities it trims, so a merge result says itself where each of its
+        entities came from (see :meth:`_record_by_tags`)."""
         if shape.kind is TopoKind.COMPOUND:
             bodies = self._bodies(shape)
             if len(bodies) != 1:
                 raise NotImplementedError(
                     "smlib: operations on compounds of several bodies"
                 )
-            inner = self._tracked_copy(bodies[0], record)
+            inner = self._tracked_copy(bodies[0], record, tag)
             record.modified[shape.key()] = record.modified[bodies[0].key()]
             return inner
         if shape.kind is TopoKind.FACE:
             # a face is worked on through its sheet body
             sheet = SmHandle(TopoKind.SHELL, shape.entity.GetBrep(), partner=shape.partner)
-            inner = self._tracked_copy(sheet, record)
+            inner = self._tracked_copy(sheet, record, tag)
             record.modified[shape.key()] = record.modified.get(shape.key(), record.modified[sheet.key()])
             return inner
         if shape.kind is TopoKind.SHELL and shape.entity.IsManifoldSolid():
@@ -2268,10 +2276,51 @@ class SmlibCoreKernel(Kernel):
                     record.modified[sub.key()] = [
                         SmHandle(kind, mapped, partner=sub.partner)
                     ]
+                    if tag:
+                        self._tag(mapped, len(record.tags))
+                        record.tags.append(sub)
         record.modified[shape.key()] = [
             SmHandle(shape.kind, copy, partner=shape.partner)
         ]
         return copy
+
+    def _tag(self, entity: Any, value: int) -> None:
+        """Name ``entity`` with ``value`` for :meth:`_record_by_tags` (the
+        tag of an earlier operation, copied along, is reused)."""
+        attribute = entity.FindAttribute(_HISTORY_TAG)
+        if attribute is None:
+            # the kernel owns the attribute from here on and frees it with
+            # the entity's last user (the bindings never delete)
+            entity.AddAttribute(self.sc.SmLongAttribute(_HISTORY_TAG, value))
+        else:
+            attribute.SetValue(value)
+
+    def _record_by_tags(self, record: _Record, results: Sequence[Any]) -> None:
+        """Record what each tagged input sub-shape became by the tags the
+        result's entities carry. A tagged input no entity names went, on
+        the kernel's word; an entity merged into another's (two coplanar
+        faces fused into one keep one tag) counts as that other's."""
+        became: dict[int, list[SmHandle]] = {}
+        for kind in (TopoKind.FACE, TopoKind.EDGE, TopoKind.VERTEX):
+            for result in results:
+                for entity in self._entities(result, kind):
+                    attribute = entity.FindAttribute(_HISTORY_TAG)
+                    if attribute is None:
+                        continue  # made by the operation
+                    value = attribute.GetValue()
+                    if not 0 <= value < len(record.tags) or record.tags[value].kind is not kind:
+                        continue  # a tag from before, on an entity that was not re-tagged
+                    became.setdefault(value, []).append(
+                        SmHandle(kind, entity, partner=record.tags[value].partner)
+                    )
+        for value, sub in enumerate(record.tags):
+            survivors = became.get(value)
+            if survivors:
+                record.modified[sub.key()] = survivors
+                record.removed.discard(sub.key())
+            else:
+                record.modified.pop(sub.key(), None)
+                record.removed.add(sub.key())
 
     def _finish_record(self, record: _Record, result: Any) -> None:
         """Drop from the record the copies that did not survive."""
@@ -2305,6 +2354,7 @@ class SmlibCoreKernel(Kernel):
         *,
         glue: bool = False,
         fuzzy: float | None = None,
+        history: bool = True,
     ) -> tuple[SmHandle, Any]:
         ops = {
             BoolOp.FUSE: self.sc.SM_BO_UNION,
@@ -2382,10 +2432,10 @@ class SmlibCoreKernel(Kernel):
                 record.modified[edge.key()] = became
             return SmHandle(TopoKind.COMPOUND, members=pieces), record
         arg_bodies = [
-            self._tracked_copy(b, record) for a in args for b in self._bodies(a)
+            self._tracked_copy(b, record, history) for a in args for b in self._bodies(a)
         ]
         tool_bodies = [
-            self._tracked_copy(b, record) for t in tools for b in self._bodies(t)
+            self._tracked_copy(b, record, history) for t in tools for b in self._bodies(t)
         ]
         if not arg_bodies:
             raise ValueError("a boolean needs at least one argument body")
@@ -2429,8 +2479,16 @@ class SmlibCoreKernel(Kernel):
                             )
                 results = common
         results = [r for r in results if self._entities(r, TopoKind.FACE)]
-        self._finish_record(record, results)
-        self._record_by_geometry(record, [*args, *tools], results)
+        if history:
+            self._finish_record(record, results)
+            # the tags on the result say where its entities came from
+            self._record_by_tags(record, results)
+        else:
+            # the matching of input faces, edges and vertices against the
+            # result costs about as much as a simple merge itself; nobody
+            # will read the record, so it stays empty (the copies that went
+            # into the merge are consumed and must not be handed out)
+            record = _Record()
         if all(s.kind is TopoKind.FACE for s in (*args, *tools)):
             # faces combine into faces; a sheet of one face is that face
             faces = [f for r in results for f in self._entities(r, TopoKind.FACE)]
@@ -2522,12 +2580,17 @@ class SmlibCoreKernel(Kernel):
 
     def _box_of(self, brep: Any, fresh: bool = False) -> tuple[Point, Point]:
         """The box of a body, cached by address during a boolean; a body
-        just made is measured afresh as its address may be a dead body's."""
+        just made is measured afresh as its address may be a dead body's.
+
+        This is the loose box (the control-polygon box of the surfaces, which
+        contains the body): it only decides which bodies may touch, and it
+        costs microseconds where the tight box of a sphere or a filleted box
+        costs a millisecond or two, more than the record of a boolean."""
         known = None if fresh else self._boxes.get(brep.address)
         if known is not None:
             return known
         extent = self.sc.SmExtent3d()
-        _check(brep.CalculateTightBoundingBox(extent), "bounding box")
+        _check(brep.CalculateBoundingBox(extent, 0, 0, 0), "bounding box")
         box = (
             tuple(extent.GetMin(i) for i in range(3)),
             tuple(extent.GetMax(i) for i in range(3)),
