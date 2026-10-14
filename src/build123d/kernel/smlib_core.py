@@ -4583,6 +4583,11 @@ class SmlibCoreKernel(Kernel):
         self, shape: SmHandle, edges: Sequence[SmHandle], radius: float
     ) -> tuple[SmHandle, Any]:
         record = _Record()
+        # a seam (an edge a face uses twice) has nothing to blend: OCCT's
+        # fillet leaves such edges alone
+        edges = [e for e in edges if not self._is_seam_edge(e)]
+        if not edges:
+            return shape, record
         body = self._tracked_copy(shape, record)
         working_edges = [record.modified[e.key()][0].entity for e in edges]
         executive = self.sc.SmFilletExecutive(self.context, body)
@@ -4605,6 +4610,15 @@ class SmlibCoreKernel(Kernel):
             "fillet parameters",
         )
         _check(executive.DoFillet(), "fillet")
+        # past the geometric limit the executive still reports success but
+        # hands back a body that is no solid (or one turned inside out)
+        if shape.kind is TopoKind.SOLID:
+            area_before = self._mass(self._body(shape))[0]
+            area, volume, _ = self._mass(body)
+            # a blend always shortens the surface it replaces: a result with
+            # more area than the input is the blends running into each other
+            if not body.IsManifoldSolid() or volume <= 0 or area > area_before * (1 + 1e-9) + _TOLERANCE:
+                raise RuntimeError("SMLib fillet failed: the blends run into each other")
         self._finish_record(record, body)
         return self._solid_handle(body), record
 
@@ -6836,7 +6850,24 @@ class SmlibCoreKernel(Kernel):
             raise RuntimeError("the outer loop does not bound one face")
         whole = SmHandle(TopoKind.FACE, faces[0])
         return self.add_holes(whole, kept) if kept else whole
-    is_seam = _unsupported("is_seam")
+    def is_seam(self, edge: SmHandle, face: SmHandle) -> bool:
+        if edge.entity is None or face.entity is None:
+            return False
+        edgeuses = edge.entity.GetEdgeuses([])
+        if isinstance(edgeuses, tuple):
+            edgeuses = edgeuses[-1]
+        uses = sum(
+            1 for use in edgeuses
+            if use.GetFace() is not None and use.GetFace().address == face.entity.address
+        )
+        return uses >= 4  # two uses per face use, so twice on both sides
+
+    def _is_seam_edge(self, edge: SmHandle) -> bool:
+        """Whether an edge is a seam of some face (used twice by it)."""
+        if edge.entity is None:
+            return False
+        faces = list({f.address: f for f in edge.entity.GetFaces([], None)}.values())
+        return any(self.is_seam(edge, SmHandle(TopoKind.FACE, f)) for f in faces)
     to_splines = _unsupported("to_splines")
     def edge_in_plane(self, edge: SmHandle, normal: Point, tolerance: float) -> bool:
         # the geometry is baked, so the normal given against the edge's
