@@ -4100,11 +4100,18 @@ class SmlibCoreKernel(Kernel):
             )
         counts = [len(loop) for loop in loops]
         curves = [c for loop in loops for c in loop]
-        return self._primitive(
-            lambda c: c.CreateSkinPrimitive(
-                counts, curves, 0.0, 1 if ruled else 3, 1 if solid else 0, [], [], []
+        try:
+            return self._primitive(
+                lambda c: c.CreateSkinPrimitive(
+                    counts, curves, 0.0, 1 if ruled else 3, 1 if solid else 0, [], [], []
+                )
             )
-        )
+        except RuntimeError:
+            # the skin primitive refuses some section sets the edge-wise
+            # build (split alike, aligned, skinned between rails) takes
+            return self._loft_edgewise(
+                self._compatible_loop_curves(wires), wires, solid, ruled
+            )
 
     def _loft_edgewise(
         self,
