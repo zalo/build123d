@@ -1089,6 +1089,11 @@ class Kernel(KernelGeometry):
         """A hash consistent with :meth:`is_same`."""
 
     @abstractmethod
+    def share_geometry(self, copy: Handle, original: Handle) -> None:
+        """Make ``copy`` share ``original``'s underlying geometry (OCCT's
+        TShape), keeping its own placement."""
+
+    @abstractmethod
     def copy_deep(self, shape: Handle) -> Handle:
         """An independent copy of ``shape`` and all of its geometry."""
 

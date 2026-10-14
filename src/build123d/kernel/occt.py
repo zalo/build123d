@@ -1861,6 +1861,9 @@ class OcctKernel(_OcctGeometry, Kernel):
     def hash_key(self, shape: TopoDS_Shape) -> Hashable:
         return hash(shape)
 
+    def share_geometry(self, copy: TopoDS_Shape, original: TopoDS_Shape) -> None:
+        copy.TShape(original.TShape())
+
     def copy_deep(self, shape: TopoDS_Shape) -> TopoDS_Shape:
         return self.downcast(BRepBuilderAPI_Copy(shape).Shape())
 

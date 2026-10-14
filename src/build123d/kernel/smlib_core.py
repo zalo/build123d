@@ -1642,6 +1642,14 @@ class SmlibCoreKernel(Kernel):
             pass  # a face the kernel cannot measure keeps its own identity
         return shape.key()
 
+    def share_geometry(self, copy: SmHandle, original: SmHandle) -> None:
+        copy.entity = original.entity
+        copy.members = original.members
+        copy.point = original.point
+        copy.curve = original.curve
+        copy.interval = original.interval
+        copy.partner = original.partner
+
     def copy_deep(self, shape: SmHandle) -> SmHandle:
         if shape.kind in (TopoKind.SOLID, TopoKind.SHELL):
             copy, _ = self._copy_body(shape.entity)
@@ -1889,13 +1897,24 @@ class SmlibCoreKernel(Kernel):
             if not shape.members:
                 return False
             # closed when every end of an edge meets the end of another,
-            # whatever order the edges are held in
-            counts: dict[tuple[Any, ...], int] = {}
-            for edge in shape.members:
-                for vertex in self.edge_vertices(edge):
-                    key = _point_key(self.vertex_point(vertex), 6)
-                    counts[key] = counts.get(key, 0) + 1
-            return bool(counts) and all(n % 2 == 0 for n in counts.values())
+            # whatever order the edges are held in; ends meet within the
+            # kernel tolerance (a split point and an arc end computed apart
+            # differ in the last digits)
+            points = [
+                self.vertex_point(vertex)
+                for edge in shape.members
+                for vertex in self.edge_vertices(edge)
+            ]
+            if not points:
+                return False
+            for i, point in enumerate(points):
+                mates = sum(
+                    1 for j, other in enumerate(points)
+                    if j != i and math.dist(point, other) <= 10 * _TOLERANCE
+                )
+                if mates % 2 == 0:
+                    return False
+            return True
         if shape.kind is TopoKind.SOLID:
             return True
         if shape.kind is TopoKind.SHELL:
@@ -2839,6 +2858,11 @@ class SmlibCoreKernel(Kernel):
         )
 
         tool_faces = [f for t in tools for f in ([t] if t.kind is TopoKind.FACE else self.sub_shapes(t, TopoKind.FACE))]
+        tool_planes = []
+        for f in tool_faces:
+            plane = SmSurfaceView(self, f).plane()
+            if plane is not None:
+                tool_planes.append((plane[0], plane[1]))
 
         def inside(point: Point) -> bool:
             if bodies:
@@ -2875,11 +2899,26 @@ class SmlibCoreKernel(Kernel):
                         )
                     )
                     crossings.extend(other.value(t) for t in (other.first, other.last))
-                cuts = set()
+                cuts: list[float] = []
                 for point in crossings:
                     param, distance = view.drop_point(point)
-                    if distance <= _TOLERANCE:
-                        cuts.add(round(param, 9))
+                    if distance > _TOLERANCE:
+                        continue
+                    # a crossing with a plane is sharpened to machine
+                    # precision (the solver's is a few 1e-9), so that pieces
+                    # meet what else is built from the same plane exactly
+                    for origin, normal in tool_planes:
+                        for _ in range(3):
+                            at, tangent = view.d1(param)
+                            gap = _dot([a - o for a, o in zip(at, origin)], normal)
+                            slope = _dot(tangent, normal)
+                            if abs(gap) > _TOLERANCE or abs(slope) < 1e-12:
+                                break
+                            param -= gap / slope
+                        if abs(_dot([a - o for a, o in zip(view.value(param), origin)], normal)) <= _TOLERANCE:
+                            break
+                    if all(abs(param - known) > 1e-9 for known in cuts):
+                        cuts.append(param)
                 bounds = sorted({view.first, view.last, *cuts})
                 for t0, t1 in zip(bounds, bounds[1:]):
                     if t1 - t0 <= _TOLERANCE:
@@ -6070,7 +6109,11 @@ class SmlibCoreKernel(Kernel):
                             return 1
                     return 2
 
-                candidate, at_tail, flipped, _ = min(options, key=leads_on)
+                # growing at the tail first keeps the first edge first, the
+                # way OCCT's wire builder orders a loop
+                candidate, at_tail, flipped, _ = min(
+                    options, key=lambda option: (leads_on(option), not option[1])
+                )
                 piece = candidate.with_flip(not candidate.flip) if flipped else candidate
                 if at_tail:
                     chain.append(piece)

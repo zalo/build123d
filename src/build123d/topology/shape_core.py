@@ -1100,7 +1100,7 @@ class Shape(NodeMixin, Generic[TOPODS]):
         """
         reference = copy.deepcopy(self)
         if not self.is_empty:
-            reference.wrapped.TShape(self.wrapped.TShape())
+            kernel.share_geometry(reference.wrapped, self.wrapped)
         return reference
 
     def __deepcopy__(self, memo) -> Self:
